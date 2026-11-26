@@ -4,35 +4,39 @@ import json
 import time
 
 from app import hh_browser as hh
-from app.browserbase import Browserbase
 from app.diagnostics import resource_warning
+from app.local_browser import LocalBrowser
+from app.login_view import SESSION_SECONDS, LoginView
 from app.services import ServiceError, clean_text
 from app.vacancies import filter_reason, search_links, vacancy_id
 
 
 class BrowserWorkflow:
-    def __init__(self, config, db, client):
+    def __init__(self, config, db):
         self.config = config
         self.db = db
-        self.provider = Browserbase(client, config, db)
+        self.provider = LocalBrowser(config)
+        self.view = LoginView(config)
         self.lock = asyncio.Lock()
         self.login_task = None
         self.login_done = None
 
     @property
     def available(self):
-        return self.config.browser_engine == "browserbase"
+        return self.config.browser_engine == "chromium"
 
     def require_browser(self):
-        if not (self.available and self.config.browserbase_key):
-            raise ServiceError(
-                "Укажите BROWSER_ENGINE=browserbase и BROWSERBASE_API_KEY в Bothost."
-            )
+        if not self.available:
+            raise ServiceError("Укажите BROWSER_ENGINE=chromium в Bothost.")
+        self.provider.check_installation()
         if warning := resource_warning(self.config.data_dir):
             raise ServiceError(warning)
 
     async def start_login(self):
         self.require_browser()
+        await self.view.start()
+        if not self.view.runner:
+            raise ServiceError("Настройте LOGIN_PUBLIC_URL и HTTPS-домен в Bothost.")
         if self.login_task and not self.login_task.done():
             raise ServiceError("Окно входа уже открыто. Завершите вход или отмените его.")
         if self.lock.locked():
@@ -54,11 +58,14 @@ class BrowserWorkflow:
     async def login(self, ready, done):
         async with self.lock:
             try:
-                async with self.provider.session(240, interactive=True) as (session_id, page):
+                async with self.provider.session(225, interactive=True) as (_, page):
                     await hh.open_page(page, hh.HH + "/account/login", login_allowed=True)
-                    ready.set_result(await self.provider.live(session_id))
-                    async with asyncio.timeout(195):
-                        await done.wait()
+                    try:
+                        ready.set_result(self.view.issue(page))
+                        async with asyncio.timeout(SESSION_SECONDS):
+                            await done.wait()
+                    finally:
+                        await self.view.revoke()
                     return await hh.authorized_resumes(page)
             except TimeoutError:
                 error = ServiceError("Срок ссылки истёк. Откройте новое окно входа.")
@@ -93,6 +100,7 @@ class BrowserWorkflow:
             self.login_task.cancel()
             await asyncio.gather(self.login_task, return_exceptions=True)
             self.login_task = None
+        await self.view.revoke()
 
     async def import_resume(self, identifier):
         self.require_browser()

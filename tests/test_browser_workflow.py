@@ -1,60 +1,15 @@
 import asyncio
-import json
 import shutil
-from datetime import datetime
 from types import SimpleNamespace
 
-import httpx
 import pytest
 from playwright.async_api import async_playwright
 
 from app import hh_browser
-from app.browserbase import Browserbase
 from app.database import Database
-from app.services import ServiceError
 
 RESUME = "1a2b3c4d5e6f7a8b"
 VACANCY = "1200"
-
-
-def test_browserbase_http_contract(tmp_path):
-    from zoneinfo import ZoneInfo
-
-    db = Database(tmp_path)
-    calls = []
-
-    def respond(req):
-        calls.append((req.method, req.url.path, req.headers["X-BB-API-Key"]))
-        if req.url.path == "/v1/contexts":
-            return httpx.Response(201, json={"id": "test-context"})
-        if req.url.path == "/v1/sessions/123/debug":
-            return httpx.Response(
-                200,
-                json={
-                    "debuggerFullscreenUrl": "https://www.browserbase.com/devtools/test",
-                },
-            )
-        if req.url.path == "/v1/sessions/123":
-            assert json.loads(req.content) == {"status": "REQUEST_RELEASE"}
-            return httpx.Response(200, json={"id": "123"})
-        raise AssertionError(req.url.path)
-
-    async def run():
-        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-            config = SimpleNamespace(
-                browserbase_key="fake", zone=ZoneInfo("Europe/Moscow"), browser_month_seconds=240
-            )
-            provider = Browserbase(client, config, db)
-            assert await provider.context() == await provider.context() == "test-context"
-            assert await provider.live("123") == "https://www.browserbase.com/devtools/test"
-            await provider.close("123")
-            provider.reserve(240)
-            with pytest.raises(ServiceError, match="бюджет"):
-                provider.reserve(60)
-            assert db.get("browser_budget")["month"] == datetime.now(config.zone).strftime("%Y-%m")
-
-    asyncio.run(run())
-    assert len(calls) == 3
 
 
 def test_persistent_attempt_recovery_and_reconciliation(tmp_path):
@@ -151,8 +106,8 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
     monkeypatch.setenv("TELEGRAM_TOKEN", "12345:synthetic")
     monkeypatch.setenv("OWNER_ID", "12345")
     monkeypatch.setenv("GROQ_API_KEY", "fake")
-    monkeypatch.setenv("BROWSERBASE_API_KEY", "fake")
-    monkeypatch.setenv("BROWSER_ENGINE", "browserbase")
+    monkeypatch.setenv("BROWSER_ENGINE", "chromium")
+    monkeypatch.setenv("CHROMIUM_PATH", "/bin/sh")
     monkeypatch.setenv("PERSISTENT_STORAGE", "true")
     monkeypatch.setenv("AUTO_SEND", "true")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
@@ -203,14 +158,13 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
         messages.append(text)
 
     async def run():
-        async with httpx.AsyncClient() as client:
-            flow = BrowserWorkflow(config, db, client)
-            monkeypatch.setattr(flow.provider, "session", session)
-            monkeypatch.setattr(hh_browser, "authorized_resumes", resumes)
-            monkeypatch.setattr(hh_browser, "apply", apply)
-            flow.start_search(send=True)
-            await flow.tick(SimpleNamespace(send_message=message), config.defaults, "2026-11-26")
-            await flow.tick(SimpleNamespace(send_message=message), config.defaults, "2026-11-26")
+        flow = BrowserWorkflow(config, db)
+        monkeypatch.setattr(flow.provider, "session", session)
+        monkeypatch.setattr(hh_browser, "authorized_resumes", resumes)
+        monkeypatch.setattr(hh_browser, "apply", apply)
+        flow.start_search(send=True)
+        await flow.tick(SimpleNamespace(send_message=message), config.defaults, "2026-11-26")
+        await flow.tick(SimpleNamespace(send_message=message), config.defaults, "2026-11-26")
 
     asyncio.run(run())
     assert sends == [VACANCY]

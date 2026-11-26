@@ -12,6 +12,7 @@ from app.config import Config
 from app.database import Database
 from app.resume import MAX_FILE, read_upload
 from app.scheduler import Scheduler
+from app.services import ServiceError
 from app.telegram_ui import COMMANDS, TelegramUI
 
 log = logging.getLogger(__name__)
@@ -23,6 +24,11 @@ def build(config, db, client, *, telegram_request=None):
 
     async def startup(app):
         db.recover_browser_applications()
+        if scheduler.browser.available:
+            try:
+                await scheduler.browser.view.start()
+            except ServiceError as exc:
+                log.warning("%s", exc)
         await app.bot.set_my_commands(list(COMMANDS.items()))
         path = Path("resume.txt")
         if not db.get("resume") and path.is_file() and path.stat().st_size <= MAX_FILE:
@@ -36,6 +42,7 @@ def build(config, db, client, *, telegram_request=None):
     async def shutdown(app):
         await scheduler.shutdown()
         await scheduler.browser.cancel_login()
+        await scheduler.browser.view.shutdown()
         if ui.diagnostic_task:
             ui.diagnostic_task.cancel()
             await asyncio.gather(ui.diagnostic_task, return_exceptions=True)

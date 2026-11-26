@@ -13,7 +13,7 @@ from app.config import Config, setting
 from app.database import Database
 from app.resume import read_upload
 from app.scheduler import Scheduler, local_day
-from app.services import Groq, ServiceError, browserbase_projects, clean_text, validate
+from app.services import Groq, ServiceError, clean_text, validate
 from app.telegram_ui import TelegramUI, allowed
 from app.vacancies import filter_reason, parse_vacancy, search_links, vacancy_id
 
@@ -39,7 +39,6 @@ def config(monkeypatch, tmp_path):
     monkeypatch.setenv("OWNER_ID", "12345")
     monkeypatch.setenv("TELEGRAM_TOKEN", "12345:synthetic")
     monkeypatch.setenv("GROQ_API_KEY", "test-value")
-    monkeypatch.setenv("BROWSERBASE_API_KEY", "test-value")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     return Config.load()
 
@@ -155,8 +154,6 @@ def test_clients_and_scheduler(config):
 
     def response(req):
         calls.append(req.url.path)
-        if req.url.path == "/v1/projects":
-            return httpx.Response(200, json=[{"id": "test-project"}])
         if req.url.path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": config.model}]})
         assert b"hh.ru" not in req.content
@@ -168,7 +165,6 @@ def test_clients_and_scheduler(config):
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
             await Groq(client, config).check()
-            assert await browserbase_projects(client, config) == 1
             scheduler = Scheduler(config, db, client)
             telegram = SimpleNamespace(send_message=send)
             await scheduler.tick(telegram)

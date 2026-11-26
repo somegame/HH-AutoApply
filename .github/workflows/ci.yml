@@ -19,3 +19,38 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: python -m pytest -q
+      - name: Build container with Chromium
+        if: github.event_name == 'pull_request'
+        run: docker build -t hh-autoapply:ci .
+      - name: Start Chromium in the container
+        if: github.event_name == 'pull_request'
+        run: |
+          docker run --rm --network none -i hh-autoapply:ci python - <<'PY'
+          import asyncio
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from types import SimpleNamespace
+
+          from app.local_browser import LocalBrowser
+          from app.login_view import LoginView
+
+          async def smoke():
+              with TemporaryDirectory() as data:
+                  config = SimpleNamespace(
+                      data_dir=Path(data),
+                      chromium_path="/usr/bin/chromium-headless-shell",
+                      login_public_url="https://bot.example.test",
+                      web_port=0,
+                  )
+                  view = LoginView(config)
+                  await view.start()
+                  try:
+                      async with LocalBrowser(config).session(interactive=True) as (_, page):
+                          await page.set_content("<h1>Chromium smoke test</h1>")
+                          assert await page.get_by_role("heading").inner_text() == "Chromium smoke test"
+                          assert (await page.screenshot(type="jpeg")).startswith(b"\xff\xd8")
+                  finally:
+                      await view.shutdown()
+
+          asyncio.run(smoke())
+          PY
