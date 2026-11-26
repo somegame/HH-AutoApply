@@ -36,6 +36,7 @@ RESULT = {
 @pytest.fixture
 def config(monkeypatch, tmp_path):
     monkeypatch.setattr("app.config.load_dotenv", lambda **_: None)
+    monkeypatch.setenv("BROWSER_ENGINE", "manual")
     monkeypatch.setenv("OWNER_ID", "12345")
     monkeypatch.setenv("TELEGRAM_TOKEN", "12345:synthetic")
     monkeypatch.setenv("GROQ_API_KEY", "test-value")
@@ -48,6 +49,9 @@ def test_config(config, monkeypatch):
     assert config.defaults["score"] == 80
     with pytest.raises(ValueError, match="1 до 100"):
         setting("limit", "101")
+    monkeypatch.setenv("BROWSER_ENGINE", "browserbase")
+    monkeypatch.setenv("PORT", "0")
+    assert Config.load().browser_engine == "manual"
     monkeypatch.delenv("OWNER_ID")
     with pytest.raises(ValueError, match="OWNER_ID"):
         Config.load()

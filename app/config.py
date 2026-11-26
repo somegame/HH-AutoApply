@@ -146,12 +146,14 @@ class Config:
             if engine == "chromium"
             else ""
         )
-        try:
-            port = int(env.get("PORT", "8000"))
-        except ValueError:
-            raise ValueError("PORT должен быть целым числом.") from None
-        if not 1 <= port <= 65535:
-            raise ValueError("PORT должен быть от 1 до 65535.")
+        port = 8000
+        if login_url:
+            try:
+                port = int(env.get("PORT", "").strip() or "8000")
+            except ValueError:
+                raise ValueError("PORT должен быть целым числом.") from None
+            if not 1 <= port <= 65535:
+                raise ValueError("PORT должен быть от 1 до 65535.")
         return cls(
             token,
             int(owner),
