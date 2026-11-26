@@ -85,6 +85,7 @@ class LoginView:
                 web.get("/", self.health),
                 web.get("/health", self.health),
                 web.get("/hh-login", self.index),
+                web.get("/mini/hh-login", self.embedded_index),
                 web.get("/hh-login.js", self.script),
                 web.get("/hh-login.css", self.style),
                 web.get("/hh-login/frame", self.frame),
@@ -180,6 +181,16 @@ class LoginView:
 
     async def index(self, _):
         return await self.asset("index.html", "text/html")
+
+    async def embedded_index(self, _):
+        headers = dict(HEADERS)
+        headers.pop("X-Frame-Options")
+        headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+            "frame-ancestors 'none'", "frame-ancestors 'self' https://web.telegram.org"
+        )
+        return web.Response(
+            body=(STATIC / "index.html").read_bytes(), content_type="text/html", headers=headers
+        )
 
     async def script(self, _):
         return await self.asset("login.js", "application/javascript")

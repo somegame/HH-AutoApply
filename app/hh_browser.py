@@ -16,7 +16,11 @@ SUBMIT = '[data-qa="vacancy-response-popup-submit-button"]'
 LETTER = 'textarea[data-qa="vacancy-response-popup-form-letter-input"]'
 RESPONSE = '[data-qa="vacancy-response-link-view-response"]'
 RESUME_LINK = 'a[href*="/resume/"]'
-RESUME_ID = re.compile(r"/resume/([a-f0-9]{12,64})/?$", re.I)
+RESUME_ID = re.compile(r"/(?:applicant/resumes?/|resume/)([a-f0-9]{12,64})/?$", re.I)
+RESUME_TITLE = '[data-qa="resume-block-title"], [data-qa="resume-title"], h1'
+RESUME_EDIT = (
+    '[data-qa="resume-edit"], [data-qa="resume-edit-button"], a[href^="/applicant/resume/edit"]'
+)
 
 
 class HHAttention(ServiceError):
@@ -82,9 +86,12 @@ async def open_page(page, url, *, login_allowed=False):
 
 async def authorized_resumes(page):
     await open_page(page, HH + "/applicant/resumes")
-    if urlsplit(page.url).path.rstrip("/") != "/applicant/resumes":
+    owned = await owned_resume(page)
+    if owned:
+        return owned
+    if urlsplit(page.url).path.rstrip("/") not in {"/applicant/resumes", "/applicant/resume"}:
         raise HHLoginRequired("HH не открыл личную страницу резюме.")
-    links = page.locator(RESUME_LINK)
+    links = page.locator(f'{RESUME_LINK}, a[href*="/applicant/resumes/"]')
     try:
         await links.first.wait_for(state="visible", timeout=5000)
     except BrowserTimeout:
@@ -104,14 +111,42 @@ async def authorized_resumes(page):
     return items
 
 
-async def read_resume(page, identifier):
+async def owned_resume(page):
+    if not hh_url(page.url):
+        return {}
+    match = RESUME_ID.fullmatch(urlsplit(page.url).path)
+    if not match:
+        return {}
+    await guard(page)
+    edit = page.get_by_role("button", name=re.compile(r"^Редактировать(?: резюме)?$", re.I))
+    edit_link = page.get_by_role("link", name=re.compile(r"^Редактировать(?: резюме)?$", re.I))
+    for control in (page.locator(RESUME_EDIT), edit, edit_link):
+        if await control.first.is_visible():
+            for title in await page.locator(RESUME_TITLE).all():
+                if await title.is_visible() and (name := (await title.inner_text()).strip()):
+                    return {match[1]: name[:90]}
+    return {}
+
+
+async def verify_resume(page, identifier):
+    if not RESUME_ID.fullmatch(f"/resume/{identifier}"):
+        raise HHLoginRequired("Некорректный идентификатор резюме HH.")
+    if identifier not in await owned_resume(page):
+        await open_page(page, f"{HH}/resume/{identifier}")
+    if identifier in await owned_resume(page):
+        return
     if identifier not in await authorized_resumes(page):
         raise HHLoginRequired("Выбранное резюме отсутствует в вашем кабинете HH.")
     await open_page(page, f"{HH}/resume/{identifier}")
+
+
+async def read_resume(page, identifier):
+    await verify_resume(page, identifier)
     sections = page.locator(
         '[data-qa="resume-block-experience"], [data-qa="resume-block-skills"], '
         '[data-qa="resume-block-keyskills"], [data-qa="resume-block-education"], '
-        '[data-qa="resume-block-title"], [data-qa="resume-personal-specialization"]'
+        '[data-qa="resume-block-title"], [data-qa="resume-personal-specialization"], '
+        '[data-qa="resume-block-skills-content"], [data-qa="resume-block-experience-content"]'
     )
     result = []
     for element in await sections.all():

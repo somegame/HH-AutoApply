@@ -326,3 +326,95 @@ def test_temporary_probe_failure_keeps_login_open(tmp_path, monkeypatch):
         verify.assert_awaited_once_with(probe)
 
     asyncio.run(run())
+
+
+def test_mobile_owned_hh_resume_is_bound_without_using_the_resume_list(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from app import hh_browser
+    from app.browser_workflow import BrowserWorkflow
+    from app.database import Database
+
+    executable = (
+        shutil.which("chromium-headless-shell")
+        or shutil.which("chromium")
+        or shutil.which("google-chrome")
+    )
+    if not executable:
+        pytest.skip("Chromium не установлен.")
+
+    async def run():
+        config = SimpleNamespace(
+            data_dir=tmp_path,
+            chromium_path=executable,
+            browser_engine="chromium",
+            login_public_url="https://bot.example.test",
+            web_port=0,
+        )
+        db = Database(tmp_path)
+        workflow = BrowserWorkflow(config, db)
+        monkeypatch.setattr("app.browser_workflow.resource_warning", lambda _: None)
+        provider_session = workflow.provider.session
+        list_visits = []
+
+        async def serve(route):
+            path = urlsplit(route.request.url).path
+            html = "<input autofocus>"
+            if path == "/applicant/resumes":
+                list_visits.append(path)
+                await route.fulfill(status=503)
+                return
+            if path == "/resume/123456789abc":
+                headers = await route.request.all_headers()
+                edit = (
+                    "<button>Редактировать</button>"
+                    if "owned=1" in headers.get("cookie", "")
+                    else ""
+                )
+                html = (
+                    '<h1 data-qa="resume-title">Финансовый менеджер</h1>'
+                    + edit
+                    + '<section data-qa="resume-block-experience">'
+                    + "Финансовое планирование, управление бюджетами, прогнозирование и отчётность."
+                    + "</section><section>Личный телефон и адрес</section>"
+                )
+            await route.fulfill(body=html, content_type="text/html; charset=utf-8")
+
+        @asynccontextmanager
+        async def session(*args, **kwargs):
+            async with provider_session(*args, **kwargs) as (context, page):
+                await context.route("**/*", serve)
+                yield context, page
+
+        monkeypatch.setattr(workflow.provider, "session", session)
+        try:
+            url = await workflow.start_login(in_mini=True)
+            assert urlsplit(url).path == "/mini/hh-login"
+            page = workflow.view.page
+            port = workflow.view.runner.addresses[0][1]
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                embedded = await client.get("/mini/hh-login")
+                assert "frame-ancestors 'self'" in embedded.headers["Content-Security-Policy"]
+                assert "X-Frame-Options" not in embedded.headers
+            await page.goto("https://hh.ru/resume/123456789abc")
+            assert await hh_browser.owned_resume(page) == {}
+            await page.context.add_cookies(
+                [{"name": "owned", "value": "1", "domain": ".hh.ru", "path": "/"}]
+            )
+            await page.goto("https://hh.ru/resume/123456789abc?owner=1")
+            assert await page.get_by_role("button", name="Редактировать").is_visible()
+            result = await asyncio.wait_for(workflow.login_task, 8)
+            assert result == {"123456789abc": "Финансовый менеджер"}
+            assert list_visits == []
+            assert db.get("hh_selected_resume") == {
+                "id": "123456789abc",
+                "name": "Финансовый менеджер",
+            }
+            assert "управление бюджетами" in db.get("resume")
+            assert "Личный телефон" not in db.get("resume")
+            assert not db.get("groq_consent")
+        finally:
+            await workflow.cancel_login()
+            await workflow.view.shutdown()
+
+    asyncio.run(run())

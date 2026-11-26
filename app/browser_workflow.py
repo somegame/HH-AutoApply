@@ -36,7 +36,7 @@ class BrowserWorkflow:
         if warning := resource_warning(self.config.data_dir):
             raise ServiceError(warning)
 
-    async def start_login(self, notify=None):
+    async def start_login(self, notify=None, *, in_mini=False, fresh=False):
         self.require_browser()
         await self.view.start()
         if not self.view.runner:
@@ -46,10 +46,9 @@ class BrowserWorkflow:
         if self.lock.locked():
             raise ServiceError("Браузер занят. Повторите вход чуть позже.")
         self.pause("Открыто новое окно входа. После проверки резюме включите нужный режим.")
-        self.db.set("hh_resume_choices", {})
         loop = asyncio.get_running_loop()
         ready = loop.create_future()
-        self.login_task = asyncio.create_task(self.login(ready, notify))
+        self.login_task = asyncio.create_task(self.login(ready, notify, in_mini, fresh))
         try:
             return await asyncio.shield(ready)
         except BaseException:
@@ -58,20 +57,36 @@ class BrowserWorkflow:
                 await self.cancel_login()
             raise
 
-    async def login(self, ready, notify):
+    async def login(self, ready, notify, in_mini, fresh):
         async with self.lock:
             status = "failed"
             try:
-                async with self.provider.session(SESSION_SECONDS + 45, interactive=True) as (
+                async with self.provider.session(
+                    SESSION_SECONDS + 45, interactive=True, guest=fresh
+                ) as (
                     context,
                     page,
                 ):
                     await hh.open_page(page, hh.HH + "/account/login", login_allowed=True)
-                    ready.set_result(await self.view.issue(page))
+                    url = await self.view.issue(page)
+                    ready.set_result(
+                        url.replace("/hh-login#", "/mini/hh-login#", 1) if in_mini else url
+                    )
                     async with asyncio.timeout(SESSION_SECONDS):
                         result = await self.wait_for_account(context, page)
                     await self.provider.save(context)
-                self.db.set("hh_resume_choices", result)
+                    self.db.set_many({"hh_resume_choices": result, "hh_needs_login": False})
+                    selected = self.db.get("hh_selected_resume", {})
+                    if selected and selected.get("id") not in result:
+                        self.db.set_many({"hh_selected_resume": {}, "groq_consent": False})
+                    if in_mini and len(result) == 1:
+                        identifier, name = next(iter(result.items()))
+                        try:
+                            async with asyncio.timeout(15):
+                                resume = clean_text(await hh.read_resume(page, identifier))
+                                self.bind_resume(identifier, name, resume)
+                        except (ServiceError, PlaywrightError, TimeoutError):
+                            pass
                 status = "done"
             except TimeoutError:
                 result = ServiceError("Срок ссылки истёк. Откройте новое окно входа.")
@@ -110,6 +125,14 @@ class BrowserWorkflow:
             await hh.guard(page, login_allowed=True)
             if await waiting_for_sms(page):
                 continue
+            try:
+                if owned := await hh.owned_resume(page):
+                    return owned
+            except PlaywrightError:
+                if page.is_closed():
+                    raise ServiceError(
+                        "Chromium закрыл вкладку HH. Откройте окно входа заново."
+                    ) from None
             path = urlsplit(page.url).path
             login_path = any(part in path for part in ("/login", "/oauth", "/auth", "/account"))
             if not requested and (login_path or page.url == last_checked):
@@ -166,19 +189,25 @@ class BrowserWorkflow:
         async with self.lock:
             async with self.provider.session() as (_, page):
                 resume = clean_text(await hh.read_resume(page, identifier))
+        self.bind_resume(identifier, choices[identifier], resume)
+        return choices[identifier]
+
+    def bind_resume(self, identifier, name, resume):
         if len(resume.strip()) < 60:
             raise ServiceError("В резюме недостаточно профессионального текста для анализа.")
-        selected = {"id": identifier, "name": choices[identifier]}
+        unchanged = (
+            self.db.get("hh_selected_resume", {}).get("id") == identifier
+            and self.db.get("resume") == resume
+        )
         self.db.set_many(
             {
                 "resume": resume,
-                "hh_selected_resume": selected,
-                "groq_consent": False,
+                "hh_selected_resume": {"id": identifier, "name": name},
+                "groq_consent": unchanged and self.db.get("groq_consent", False),
                 "browser_auto_enabled": False,
                 "browser_search": False,
             }
         )
-        return selected["name"]
 
     def readiness(self):
         self.require_browser()
@@ -237,9 +266,7 @@ class BrowserWorkflow:
             self.db.set("next_browser_search", now + settings["interval"] * 60)
         async with self.lock:
             async with self.provider.session() as (_, page):
-                resumes = await hh.authorized_resumes(page)
-                if selected["id"] not in resumes:
-                    raise hh.HHLoginRequired("Выбранное резюме больше не доступно на HH.")
+                await hh.verify_resume(page, selected["id"])
                 if row:
                     await self.send_one(bot, page, row, selected, settings, day)
                     if self.db.get("browser_search"):
@@ -291,7 +318,11 @@ class BrowserWorkflow:
             raise ServiceError("Браузер занят. Попробуйте позже.")
         async with self.lock:
             async with self.provider.session() as (_, page):
-                await hh.authorized_resumes(page)
+                selected = self.db.get("hh_selected_resume", {})
+                if selected:
+                    await hh.verify_resume(page, selected["id"])
+                else:
+                    await hh.authorized_resumes(page)
                 await hh.open_page(page, f"{hh.HH}/vacancy/{identifier}")
                 if vacancy_id(page.url) == identifier and await hh.already_applied(page):
                     self.db.complete_browser_application(identifier, "sent", previous="unknown")
@@ -300,8 +331,8 @@ class BrowserWorkflow:
 
     async def submit_selected(self, bot, row, day):
         selected = self.readiness()
-        if not (self.config.auto_send and self.config.persistent):
-            raise ServiceError("Для отправки через Chromium нужны AUTO_SEND и постоянный Volume.")
+        if not self.config.persistent:
+            raise ServiceError("Для отправки через HH подключите постоянное хранилище Bothost.")
         details = json.loads(row["details"])
         if (
             details.get("source") not in {"browser", "mini_hh"}
@@ -314,9 +345,7 @@ class BrowserWorkflow:
         revision = self.pause_revision
         async with self.lock:
             async with self.provider.session(45) as (_, page):
-                resumes = await hh.authorized_resumes(page)
-                if selected["id"] not in resumes:
-                    raise hh.HHLoginRequired("Выбранное резюме недоступно. Проверьте вход.")
+                await hh.verify_resume(page, selected["id"])
                 await self.send_one(
                     bot,
                     page,
@@ -373,7 +402,8 @@ class BrowserWorkflow:
             result = await hh.apply(page, identifier, resume["id"], row["letter"], reserve)
         except hh.HHQuestions as exc:
             self.db.transition(identifier, allowed_states, "questions")
-            await bot.send_message(self.config.owner, f"Вакансия {identifier}. {exc}")
+            if not manual:
+                await bot.send_message(self.config.owner, f"Вакансия {identifier}. {exc}")
             return
         except BaseException:
             if reserved:
@@ -386,9 +416,9 @@ class BrowserWorkflow:
             self.db.transition(identifier, allowed_states, "duplicate")
         elif manual and result == "limit":
             raise ServiceError("Отправка отменена. Проверьте статус отклика и дневной лимит.")
-        if result in {"sent", "unknown"}:
-            if result == "unknown":
-                self.pause("HH не подтвердил отправку. Проверьте результат перед возобновлением.")
+        if result == "unknown":
+            self.pause("HH не подтвердил отправку. Проверьте результат перед возобновлением.")
+        if not manual and result in {"sent", "unknown"}:
             message = (
                 "Отклик подтверждён на HH."
                 if result == "sent"

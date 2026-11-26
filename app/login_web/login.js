@@ -19,7 +19,7 @@ let timer;
 let gesture;
 
 const closed = {
-  done: "Вход подтверждён. Закройте это окно — бот пришлёт список резюме в Telegram.",
+  done: "Вход подтверждён. Можно закрыть окно и вернуться к поиску работы.",
   failed: "Вход не завершился. Откройте новую ссылку в Telegram.",
   blocked: "HH остановил вход. Причина будет в Telegram.",
   expired: "Ссылка истекла. Откройте новую ссылку в Telegram.",
@@ -134,7 +134,10 @@ async function refresh() {
       if (response.status === 401 || response.status === 403) return end(closed.expired);
       if (!response.ok) throw new Error();
       const state = response.headers.get("X-HH-Status");
-      if (closed[state]) return end(closed[state]);
+      if (closed[state]) {
+        if (window.parent !== window) window.parent.postMessage({ hhLogin: state }, location.origin);
+        return end(closed[state]);
+      }
       revision = response.headers.get("X-HH-Revision") || "";
       if (messages[state]) statusLine.textContent = messages[state];
       check.disabled = state === "checking";
