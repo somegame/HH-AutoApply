@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -52,7 +53,7 @@ class LocalBrowser:
         self.check_installation()
         if not interactive and not self.state.is_file():
             raise ServiceError("Сессия HH отсутствует. Войдите из Telegram ещё раз.")
-        state = str(self.state) if not interactive else None
+        state = str(self.state) if self.state.is_file() else None
         async with async_playwright() as driver:
             try:
                 browser = await driver.chromium.launch(
@@ -78,7 +79,9 @@ class LocalBrowser:
                     page = await context.new_page()
                     page.set_default_timeout(3500)
                     yield context, page
-                    if any(hh_domain(cookie["domain"]) for cookie in await context.cookies()):
+                    if not interactive and any(
+                        hh_domain(cookie["domain"]) for cookie in await context.cookies()
+                    ):
                         await self.save(context)
             except PlaywrightError:
                 raise ServiceError(
@@ -93,8 +96,12 @@ class LocalBrowser:
 
 
 def public_login_url(value):
+    value = value.strip()
     if not value:
         return ""
+    label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    if re.fullmatch(rf"(?:{label}\.)+{label}", value):
+        value = f"https://{value}"
     try:
         parsed = urlsplit(value)
         hostname = parsed.hostname
@@ -110,4 +117,6 @@ def public_login_url(value):
             return f"https://{hostname}"
     except ValueError:
         pass
-    raise ValueError("LOGIN_PUBLIC_URL должен быть HTTPS-адресом бота без пути и параметров.")
+    raise ValueError(
+        "LOGIN_PUBLIC_URL должен содержать домен бота или HTTPS-адрес без пути и параметров."
+    )

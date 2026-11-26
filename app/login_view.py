@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import json
+import re
 import secrets
 import time
 from pathlib import Path
@@ -10,7 +13,8 @@ from app.hh_browser import guard
 from app.services import ServiceError
 
 STATIC = Path(__file__).with_name("login_web")
-SESSION_SECONDS = 180
+SESSION_SECONDS = 480
+WIDTH, HEIGHT = 430, 820
 HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
@@ -21,6 +25,19 @@ HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+FIELDS = """
+() => [...document.querySelectorAll('input')].flatMap(input => {
+  const kinds = ['text', 'tel', 'email', 'password', 'number', 'search'];
+  if (!kinds.includes(input.type) || input.disabled || input.readOnly) return [];
+  const box = input.getBoundingClientRect();
+  const x = Math.max(box.x, 0), y = Math.max(box.y, 0);
+  const w = Math.min(box.right, innerWidth) - x, h = Math.min(box.bottom, innerHeight) - y;
+  if (w < 14 || h < 14 || document.elementFromPoint(x + w / 2, y + h / 2) !== input) return [];
+  input.dataset.hhLoginField ||= crypto.randomUUID().replaceAll('-', '');
+  const code = input.autocomplete === 'one-time-code';
+  return [{ id: input.dataset.hhLoginField, type: input.type, mode: input.inputMode, code, x, y, w, h }];
+}).slice(0, 20)
+"""
 
 
 class LoginView:
@@ -31,6 +48,12 @@ class LoginView:
         self.secret = None
         self.expires = 0
         self.lock = asyncio.Lock()
+        self.cdp = None
+        self.frame_ready = asyncio.Event()
+        self.image = None
+        self.revision = 0
+        self.check = asyncio.Event()
+        self.status = "login"
 
     async def start(self):
         if self.runner or not self.config.login_public_url:
@@ -64,18 +87,67 @@ class LoginView:
             await self.runner.cleanup()
             self.runner = None
 
-    def issue(self, page):
+    async def issue(self, page):
         if not self.runner or not self.config.login_public_url:
             raise ServiceError("Настройте HTTPS-адрес LOGIN_PUBLIC_URL в Bothost.")
         self.page = page
+        self.image = None
+        self.revision = 0
+        self.check.clear()
+        self.status = "login"
+        self.cdp = await page.context.new_cdp_session(page)
+        self.cdp.on("Page.screencastFrame", self.on_frame)
+        try:
+            await self.cdp.send(
+                "Page.startScreencast",
+                {
+                    "format": "jpeg",
+                    "quality": 63,
+                    "maxWidth": WIDTH,
+                    "maxHeight": HEIGHT,
+                },
+            )
+        except (PlaywrightError, asyncio.CancelledError):
+            await self.revoke()
+            raise
         self.secret = secrets.token_urlsafe(32)
         self.expires = time.monotonic() + SESSION_SECONDS
         return self.config.login_public_url + "/hh-login#" + self.secret
 
-    async def revoke(self):
-        self.secret = None
+    async def on_frame(self, event):
+        cdp = self.cdp
+        if not cdp:
+            return
+        self.image = base64.b64decode(event["data"])
+        self.revision += 1
+        self.frame_ready.set()
+        try:
+            await cdp.send("Page.screencastFrameAck", {"sessionId": event["sessionId"]})
+        except PlaywrightError:
+            pass
+
+    def change_status(self, status):
+        if self.status != status:
+            self.status = status
+            self.revision += 1
+            self.frame_ready.set()
+
+    async def revoke(self, status=None):
+        if status:
+            self.change_status(status)
+            self.expires = time.monotonic() + 120
+        else:
+            self.secret = None
         async with self.lock:
             self.page = None
+            cdp, self.cdp = self.cdp, None
+            self.image = None
+            self.frame_ready.set()
+            if cdp:
+                try:
+                    await cdp.detach()
+                except PlaywrightError:
+                    pass
 
     async def health(self, _):
         return web.Response(text="ok", headers=HEADERS)
@@ -94,14 +166,13 @@ class LoginView:
 
     def authorize(self, request):
         origin = request.headers.get("Origin")
-        if origin and origin != self.config.login_public_url:
-            raise web.HTTPForbidden(headers=HEADERS)
-        if request.method == "POST" and origin != self.config.login_public_url:
+        if (origin and origin != self.config.login_public_url) or (
+            request.method == "POST" and origin != self.config.login_public_url
+        ):
             raise web.HTTPForbidden(headers=HEADERS)
         token = request.headers.get("Authorization", "")
         if (
             not self.secret
-            or not self.page
             or time.monotonic() >= self.expires
             or not (
                 token.startswith("Bearer ")
@@ -113,21 +184,36 @@ class LoginView:
 
     async def frame(self, request):
         self.authorize(request)
-        if self.lock.locked():
-            raise web.HTTPTooManyRequests(headers=HEADERS)
-        async with self.lock:
-            self.authorize(request)
+        if request.query.get("after") == str(self.revision):
+            self.frame_ready.clear()
             try:
-                await guard(self.page, login_allowed=True)
-                frame = await self.page.screenshot(type="jpeg", quality=65, timeout=2300)
-            except (ServiceError, PlaywrightError):
-                raise web.HTTPConflict(headers=HEADERS) from None
-        return web.Response(body=frame, content_type="image/jpeg", headers=HEADERS)
+                async with asyncio.timeout(2):
+                    await self.frame_ready.wait()
+            except TimeoutError:
+                pass
+        self.authorize(request)
+        headers = HEADERS | {"X-HH-Status": self.status, "X-HH-Revision": str(self.revision)}
+        if (
+            not self.page
+            or self.status == "blocked"
+            or not self.image
+            or (request.query.get("after") == str(self.revision))
+        ):
+            return web.Response(status=204, headers=headers)
+        page, image = self.page, self.image
+        try:
+            await guard(page, login_allowed=True)
+            fields = await page.evaluate(FIELDS)
+        except (ServiceError, PlaywrightError):
+            return web.Response(status=204, headers=headers)
+        # A completed session must not publish a frame that was already in flight.
+        if page is not self.page or self.status in {"done", "failed", "blocked"}:
+            return web.Response(status=204, headers=HEADERS | {"X-HH-Status": self.status})
+        headers["X-HH-Fields"] = json.dumps(fields, separators=(",", ":"))
+        return web.Response(body=image, content_type="image/jpeg", headers=headers)
 
     async def input(self, request):
         self.authorize(request)
-        if self.lock.locked():
-            raise web.HTTPTooManyRequests(headers=HEADERS)
         try:
             payload = await request.json()
         except (ValueError, UnicodeError):
@@ -136,6 +222,8 @@ class LoginView:
             raise web.HTTPBadRequest(headers=HEADERS)
         async with self.lock:
             self.authorize(request)
+            if not self.page or self.status == "blocked":
+                raise web.HTTPConflict(headers=HEADERS)
             try:
                 await guard(self.page, login_allowed=True)
                 await self.interact(payload)
@@ -151,26 +239,34 @@ class LoginView:
             if (
                 type(x) not in {int, float}
                 or type(y) not in {int, float}
-                or not (0 <= x < 430 and 0 <= y < 820)
+                or not (0 <= x < WIDTH and 0 <= y < HEIGHT)
             ):
                 raise web.HTTPBadRequest(headers=HEADERS)
             await page.mouse.click(x, y)
-        elif kind == "entry":
-            value = event.get("text")
+        elif kind in {"entry", "enter"}:
+            field = event.get("field", "")
+            if not isinstance(field, str) or not re.fullmatch(r"[a-f0-9]{32}", field):
+                raise web.HTTPBadRequest(headers=HEADERS)
+            value = event.get("text", "")
             if (
                 not isinstance(value, str)
-                or not 0 < len(value) <= 300
+                or len(value) > 300
                 or any(ord(char) < 32 for char in value)
             ):
                 raise web.HTTPBadRequest(headers=HEADERS)
-            editable = await page.locator(
-                "input:focus:not([type=button]):not([type=submit]):not([readonly]):not([disabled])"
-            ).count()
-            if editable != 1:
+            locator = page.locator(f'input[data-hh-login-field="{field}"]')
+            if await locator.count() != 1 or not await locator.is_editable():
                 raise web.HTTPUnprocessableEntity(headers=HEADERS)
-            await page.keyboard.press("Control+a")
-            await page.keyboard.insert_text(value)
-        elif kind == "scroll" and event.get("direction") in {"up", "down"}:
-            await page.mouse.wheel(0, -470 if event["direction"] == "up" else 470)
+            await locator.fill(value, timeout=1500)
+            if kind == "enter":
+                await locator.press("Enter", timeout=1500)
+        elif kind == "scroll":
+            delta = event.get("delta")
+            if type(delta) not in {int, float} or not -820 <= delta <= 820:
+                raise web.HTTPBadRequest(headers=HEADERS)
+            await page.mouse.move(WIDTH / 2, HEIGHT / 2)
+            await page.mouse.wheel(0, delta)
+        elif kind == "check":
+            self.check.set()
         else:
             raise web.HTTPBadRequest(headers=HEADERS)
