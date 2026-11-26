@@ -4,17 +4,24 @@ import hmac
 import json
 import shutil
 import time
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import urlencode, urlsplit
 
 import httpx
 import pytest
 from playwright.async_api import async_playwright
 
+from app import hh_browser
+from app.browser_workflow import BrowserWorkflow
 from app.config import Config
 from app.database import Database
 from app.mini_app import MiniApp, verify_init_data
 from app.scheduler import Scheduler
+from app.services import ServiceError
+from app.vacancies import URL_FIELDS
 
 TOKEN = "12345:synthetic"
 OWNER = 43210
@@ -47,8 +54,6 @@ def test_mini_signature_rejects_old_forged_repeated_and_foreign_data():
 
 @pytest.fixture
 def mini_config(tmp_path, monkeypatch):
-    from dataclasses import replace
-
     monkeypatch.setattr("app.config.load_dotenv", lambda **_: None)
     for key, value in {
         "TELEGRAM_TOKEN": TOKEN,
@@ -60,6 +65,45 @@ def mini_config(tmp_path, monkeypatch):
     }.items():
         monkeypatch.setenv(key, value)
     return replace(Config.load(), web_port=0, superjob_key="fake")
+
+
+def test_stop_cancels_confirmed_send_before_reservation(mini_config, monkeypatch):
+    config = replace(mini_config, auto_send=True, persistent=True, groq_key="fake")
+    db = Database(config.data_dir)
+    workflow = BrowserWorkflow(config, db)
+    selected = {"id": "123456789abc", "name": "Резюме"}
+    resume = "Финансовое планирование"
+    db.set_many({"hh_selected_resume": selected, "resume": resume, "groq_consent": True})
+    job = dict.fromkeys(URL_FIELDS, "")
+    job.update(source="mini_hh", region="Москва", salary="от 150 000 ₽")
+    job.update(currency="RUB", salary_max=150000)
+    db.add("123456", job)
+    db.finish_analysis(
+        "123456",
+        "draft",
+        {"score": 100, "resume_hash": hashlib.sha256(resume.encode()).hexdigest()},
+        "Сопроводительное письмо",
+    )
+    monkeypatch.setattr(workflow, "require_browser", lambda: None)
+    monkeypatch.setattr(
+        hh_browser, "authorized_resumes", AsyncMock(return_value={selected["id"]: "Резюме"})
+    )
+
+    @asynccontextmanager
+    async def session(_):
+        yield None, None
+
+    async def apply(_page, _identifier, _resume, _letter, reserve):
+        workflow.pause("Остановлено владельцем.")
+        assert not reserve()
+        return "limit"
+
+    monkeypatch.setattr(workflow.provider, "session", session)
+    monkeypatch.setattr(hh_browser, "apply", apply)
+    with pytest.raises(ServiceError, match="Отправка отменена"):
+        asyncio.run(workflow.submit_selected(None, db.vacancy("123456"), "2026-11-26"))
+    row = db.vacancy("123456")
+    assert row["status"] == "draft" and row["sent_day"] is None
 
 
 def source_response(req):

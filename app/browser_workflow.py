@@ -23,6 +23,7 @@ class BrowserWorkflow:
         self.view = LoginView(config)
         self.lock = asyncio.Lock()
         self.login_task = None
+        self.pause_revision = 0
 
     @property
     def available(self):
@@ -206,6 +207,7 @@ class BrowserWorkflow:
         )
 
     def pause(self, notice):
+        self.pause_revision += 1
         self.db.set_many(
             {
                 "browser_search": False,
@@ -309,19 +311,27 @@ class BrowserWorkflow:
             raise ServiceError("У этой вакансии нет готового отклика для отправки через HH.")
         if self.lock.locked():
             raise ServiceError("Браузер занят другой операцией.")
+        revision = self.pause_revision
         async with self.lock:
             async with self.provider.session(45) as (_, page):
                 resumes = await hh.authorized_resumes(page)
                 if selected["id"] not in resumes:
                     raise hh.HHLoginRequired("Выбранное резюме недоступно. Проверьте вход.")
                 await self.send_one(
-                    bot, page, row, selected, self.db.settings(self.config), day, manual=True
+                    bot,
+                    page,
+                    row,
+                    selected,
+                    self.db.settings(self.config),
+                    day,
+                    manual_revision=revision,
                 )
 
-    async def send_one(self, bot, page, row, resume, settings, day, *, manual=False):
+    async def send_one(self, bot, page, row, resume, settings, day, *, manual_revision=None):
         identifier = row["id"]
         details = json.loads(row["details"])
         result = json.loads(row["result"] or "{}")
+        manual = manual_revision is not None
         allowed_states = ("draft", "approved") if manual else ("approved",)
         effective_settings = settings | details.get("mini_filters", {})
         resume_hash = hashlib.sha256(self.db.get("resume", "").encode()).hexdigest()
@@ -333,6 +343,8 @@ class BrowserWorkflow:
         ):
             self.db.transition(identifier, allowed_states, "deferred")
             return
+        if manual and self.pause_revision != manual_revision:
+            raise ServiceError("Отправка остановлена.")
         reserved = False
 
         def reserve():
@@ -340,6 +352,7 @@ class BrowserWorkflow:
             current = self.db.vacancy(identifier)
             if (
                 (not manual and not self.db.get("browser_auto_enabled"))
+                or (manual and self.pause_revision != manual_revision)
                 or current["letter"] != row["letter"]
                 or self.db.get("hh_selected_resume") != resume
                 or hashlib.sha256(self.db.get("resume", "").encode()).hexdigest() != resume_hash
@@ -371,6 +384,8 @@ class BrowserWorkflow:
             self.db.complete_browser_application(identifier, result)
         elif result == "duplicate":
             self.db.transition(identifier, allowed_states, "duplicate")
+        elif manual and result == "limit":
+            raise ServiceError("Отправка отменена. Проверьте статус отклика и дневной лимит.")
         if result in {"sent", "unknown"}:
             if result == "unknown":
                 self.pause("HH не подтвердил отправку. Проверьте результат перед возобновлением.")
