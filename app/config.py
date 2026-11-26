@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
-VERSION = "5.0.1"
+VERSION = "5.0.2"
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"
