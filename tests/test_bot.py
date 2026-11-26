@@ -337,14 +337,15 @@ def test_iphone_login_continues_and_settings_are_grouped(config):
         assert "закройте браузер" in text
         assert "finish" in {item.callback_data for row in keys for item in row}
         await ui.route(update, "finish")
-        assert "Вы подтвердили" in messages[-1][0]
-        assert messages[-1][1][0][0].callback_data == "upload"
-        db.set("resume", PROFESSIONAL)
-        await ui.route(update, "finish")
-        assert messages[-1][1][0][0].callback_data == "resume"
-        db.set("groq_consent", True)
-        await ui.route(update, "finish")
-        assert messages[-1][1][0][0].callback_data == "search"
+        assert "личный кабинет" in messages[-1][0]
+        assert [row[0].callback_data for row in messages[-1][1]] == ["search", "hh_auto", "start"]
+        assert not db.get("resume")
+        assert not db.get("groq_consent")
+        await ui.route(update, "search")
+        assert "Новые вакансии будет присылать HH" in messages[-1][0]
+        await ui.route(update, "hh_auto")
+        assert "подписку" in messages[-1][0]
+        assert messages[-1][1][0][0].url == "https://hh.ru/"
 
         await ui.route(update, "settings")
         assert all(row[0].callback_data.startswith("settings:") for row in messages[-1][1][:-1])

@@ -15,6 +15,8 @@ from app.services import ServiceError, browserbase_projects
 from app.vacancies import HH, TEMPLATE, parse_vacancy, search_links, terms, vacancy_id
 
 PREVIEW = LinkPreviewOptions(is_disabled=True)
+HH_RESUMES = HH + "/applicant/resumes"
+HH_APPLICATIONS = HH + "/applicant/negotiations"
 SETTINGS_SECTIONS = {
     "search": (
         "🔎 Поиск вакансий",
@@ -77,10 +79,10 @@ def markup(rows):
 def menu():
     return markup(
         [
-            [button("🔎 Поиск", "search"), button("➕ Вакансия", "add")],
-            [button("📨 Отклики", "drafts"), button("📄 Резюме", "resume")],
-            [button("🔑 Вход в HH", "login"), button("⚙️ Настройки", "settings")],
-            [button("⋯ Ещё", "more")],
+            [button("🔎 Подобрать вакансии", "search")],
+            [button("⚡ Автоотклики HH", "hh_auto"), link("📨 Отклики HH", HH_APPLICATIONS)],
+            [button("🔑 Проверить вход", "login"), button("✍️ Анализ вручную", "manual")],
+            [button("⚙️ Настройки", "settings"), button("⋯ Ещё", "more")],
         ]
     )
 
@@ -182,16 +184,53 @@ class TelegramUI:
             keyboard = search_keyboard(settings)
             await self.answer(
                 update,
-                "Откройте поиск на HH и сохраните автопоиск для новых вакансий. "
-                "Затем передайте выбранную вакансию боту.",
-                markup([*keyboard.inline_keyboard[:-1], [controls], keyboard.inline_keyboard[-1]]),
+                "Откройте подходящий запрос и сохраните автопоиск на HH. "
+                "Новые вакансии будет присылать HH. Для этого достаточно аккаунта HH.",
+                markup(
+                    [
+                        *keyboard.inline_keyboard[:-1],
+                        [button("⚡ Автоотклики HH", "hh_auto")],
+                        [controls],
+                        [button("🏠 Меню", "start")],
+                    ]
+                ),
+            )
+        elif kind == "hh_auto":
+            await self.answer(
+                update,
+                "Откройте главную HH и найдите «Автоматические отклики» → «Настройки». "
+                "Проверьте, какое резюме и какие параметры выбраны в HH. "
+                "Если там уже есть кнопка «Отключить», возможность, вероятно, включена. "
+                "Если HH предлагает подписку, проверьте её условия перед подтверждением. "
+                "Результаты смотрите в «Откликах HH».",
+                markup(
+                    [
+                        [link("⚡ Открыть HH", HH + "/")],
+                        [link("📨 Отклики HH", HH_APPLICATIONS)],
+                        [link("ℹ️ Условия HH Pro", HH + "/article/hhpro_offer")],
+                        [button("🏠 Меню", "start")],
+                    ]
+                ),
+            )
+        elif kind == "manual":
+            await self.answer(
+                update,
+                "Здесь можно подготовить письмо к выбранной вакансии. "
+                "Для анализа Groq понадобится текст резюме. "
+                "Подборки и автоотклики HH работают отдельно.",
+                markup(
+                    [
+                        [button("➕ Добавить вакансию", "add"), button("✍️ Черновики", "drafts")],
+                        [button("📄 Резюме для анализа", "resume")],
+                        [button("🏠 Меню", "start")],
+                    ]
+                ),
             )
         elif kind == "help":
             await self.answer(
                 update,
-                "Сохраните автопоиск на HH. Получив вакансию, перенесите "
-                "карточку в бот, проверьте письмо и отправьте отклик в HH. "
-                "После проверки в разделе откликов отметьте его в боте.",
+                "«Подобрать вакансии» открывает автопоиск HH. «Автоотклики HH» ведёт к настройкам HH. "
+                "«Анализ вручную» нужен, если вы хотите подготовить письмо к отдельной вакансии.",
                 menu(),
             )
         elif kind == "run":
@@ -220,31 +259,31 @@ class TelegramUI:
         elif kind in {"login", "mobile"}:
             await self.answer(
                 update,
-                "Откройте HH. Когда увидите свой профиль или резюме, закройте браузер "
-                "кнопкой × и нажмите «Я вошёл». Браузер Telegram не сообщает боту о входе.",
+                "Откройте «Мои резюме на HH». Видите своё резюме или страницу управления "
+                "резюме? Вход выполнен в этом браузере. Если HH просит войти, завершите вход "
+                "на сайте. Затем закройте браузер кнопкой × и нажмите «Продолжить». "
+                "Бот не видит сессию HH.",
                 markup(
                     [
                         [link("🔑 Войти в HH", HH + "/account/login")],
-                        [link("📄 Мои резюме на HH", HH + "/applicant/resumes")],
-                        [button("✅ Я вошёл", "finish")],
+                        [link("📄 Мои резюме на HH", HH_RESUMES)],
+                        [button("➡️ Продолжить", "finish")],
                         [button("🏠 Меню", "start")],
                     ]
                 ),
             )
         elif kind == "finish":
-            if not self.db.get("resume", ""):
-                next_step = button("📄 Загрузить резюме", "upload")
-                instructions = "Добавьте в бот текст резюме для анализа вакансий."
-            elif not self.db.get("groq_consent", False):
-                next_step = button("📄 Настроить анализ резюме", "resume")
-                instructions = "Разрешите анализ профессионального текста в Groq."
-            else:
-                next_step = button("🔎 Открыть поиск", "search")
-                instructions = "Откройте поиск или добавьте выбранную вакансию."
             await self.answer(
                 update,
-                f"✅ Вы подтвердили вход в HH. {instructions}",
-                markup([[next_step], [button("🏠 Меню", "start")]]),
+                "Если HH показал личный кабинет, выберите, что включить на самом HH. "
+                "Ваше резюме уже хранится там.",
+                markup(
+                    [
+                        [button("🔎 Подобрать вакансии", "search")],
+                        [button("⚡ Автоотклики HH", "hh_auto")],
+                        [button("🏠 Меню", "start")],
+                    ]
+                ),
             )
         elif kind in {"groq", "browserbase", "diagnose"}:
             await self.diagnostics(update, kind)
@@ -293,7 +332,16 @@ class TelegramUI:
         if navigation:
             rows.append(navigation)
         rows.append([button("➕ Вакансия", "add"), button("🏠 Меню", "start")])
-        await self.answer(update, "\n".join(info) or "Здесь пока пусто.", markup(rows))
+        await self.answer(
+            update,
+            "\n".join(info)
+            or (
+                "Черновиков пока нет. Фактические отклики смотрите на HH."
+                if kind == "drafts"
+                else "Здесь пока пусто."
+            ),
+            markup(rows),
+        )
 
     async def status(self, update, kind, settings):
         counts, used = self.db.counts(local_day(self.config))
