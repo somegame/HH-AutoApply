@@ -85,19 +85,21 @@ def parse_vacancy(text):
     return identifier, values
 
 
-def search_links(settings):
+def search_links(settings, *, order="publication_time", title_only=False):
     queries = [settings["query"]]
     if settings["use_related"]:
         queries.extend(terms(settings["related"]))
     for query in dict.fromkeys(queries):
         params = {
             "text": query,
-            "currency_code": settings["currency"],
+            "currency_code": {"RUB": "RUR"}.get(settings["currency"], settings["currency"]),
             "salary": settings["salary"],
-            "order_by": "publication_time",
+            "order_by": order,
         }
         if settings["region"].casefold() in {"москва", "moscow", "1"}:
             params["area"] = 1
+        if title_only:
+            params["search_field"] = "name"
         if not settings["unknown_salary"]:
             params["only_with_salary"] = "true"
         yield query, f"{HH}/search/vacancy?{urlencode(params)}"

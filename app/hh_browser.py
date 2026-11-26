@@ -1,4 +1,6 @@
+import asyncio
 import re
+from contextlib import suppress
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from playwright.async_api import TimeoutError as BrowserTimeout
@@ -168,6 +170,14 @@ async def read_vacancy(page, identifier):
     await open_page(page, url)
     if await page.locator('[data-qa="vacancy-archive"]').first.is_visible():
         return None
+    with suppress(BrowserTimeout):
+        await asyncio.gather(
+            *(
+                page.locator(selector).first.wait_for(state="visible", timeout=3000)
+                for selector in (TITLE, COMPANY, DESCRIPTION)
+            )
+        )
+    await guard(page)
     values = dict.fromkeys(URL_FIELDS, "")
     selectors = {
         "title": TITLE,

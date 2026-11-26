@@ -288,3 +288,41 @@ def test_genuine_access_barrier_during_account_check_is_not_retried(tmp_path, mo
         probe.close.assert_awaited_once()
 
     asyncio.run(run())
+
+
+def test_temporary_probe_failure_keeps_login_open(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from playwright.async_api import Error as PlaywrightError
+
+    from app import hh_browser
+    from app.browser_workflow import BrowserWorkflow
+    from app.database import Database
+
+    async def run():
+        workflow = BrowserWorkflow(SimpleNamespace(data_dir=tmp_path), Database(tmp_path))
+        monkeypatch.setattr(hh_browser, "guard", AsyncMock())
+        monkeypatch.setattr("app.browser_workflow.waiting_for_sms", AsyncMock(return_value=False))
+        result = {"123456789abc": "Финансовый менеджер"}
+        verify = AsyncMock(return_value=result)
+        monkeypatch.setattr(hh_browser, "authorized_resumes", verify)
+        probe = SimpleNamespace(close=AsyncMock())
+        page = SimpleNamespace(
+            url="https://hh.ru/applicant/profile",
+            bring_to_front=AsyncMock(),
+            is_closed=lambda: False,
+        )
+        context = SimpleNamespace(
+            new_page=AsyncMock(side_effect=[PlaywrightError("Target closed"), probe])
+        )
+        workflow.view.check.set()
+        task = asyncio.create_task(workflow.wait_for_account(context, page))
+        async with asyncio.timeout(2):
+            while workflow.view.status != "retry":
+                await asyncio.sleep(0.02)
+            assert not task.done()
+            workflow.view.check.set()
+            assert await task == result
+        verify.assert_awaited_once_with(probe)
+
+    asyncio.run(run())

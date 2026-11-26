@@ -4,7 +4,7 @@ import secrets
 import time
 from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, WebAppInfo
 from telegram.error import BadRequest
 
 from app.config import BOOLEANS, FIELDS, OPTIONAL, setting
@@ -33,6 +33,7 @@ SETTINGS_SECTIONS = {
 }
 COMMANDS = {
     "start": "Главное меню",
+    "app": "Открыть приложение поиска",
     "help": "Справка",
     "run": "Поисковые ссылки и напоминания",
     "stop": "Остановить напоминания и анализ",
@@ -177,11 +178,26 @@ class TelegramUI:
                 "run": "cloud_menu",
             }.get(kind, kind)
         settings = self.db.settings(self.config)
-        if kind == "start":
+        if kind in {"start", "chat"}:
             title = "HH AutoApply · помощник соискателя"
             if not self.config.persistent:
                 title += "\nПредупреждение. Постоянство DATA_DIR не подтверждено. Данные могут исчезнуть при обновлении."
-            await self.answer(update, title, menu(self.config.browser_engine == "chromium"))
+            keyboard = menu(self.config.browser_engine == "chromium")
+            if kind == "start" and self.config.login_public_url:
+                keyboard = markup(
+                    [
+                        [self.mini_button()],
+                        [button("⚙️ Настройки", "settings"), button("💬 Меню бота", "chat")],
+                    ]
+                )
+            await self.answer(update, title, keyboard)
+        elif kind == "app":
+            if self.config.login_public_url:
+                await self.answer(
+                    update, "Вакансии, отклики и подключения.", markup([[self.mini_button()]])
+                )
+            else:
+                await self.answer(update, "Для Mini App настройте HTTPS-адрес LOGIN_PUBLIC_URL.")
         elif kind.startswith("cloud_"):
             await self.browser_action(update, kind, value)
         elif kind == "more":
@@ -341,6 +357,12 @@ class TelegramUI:
             "reconcile",
         }:
             await self.vacancy(update, kind, value, settings)
+
+    def mini_button(self):
+        return InlineKeyboardButton(
+            "🔎 Открыть мини-приложение",
+            web_app=WebAppInfo(self.config.login_public_url + "/mini"),
+        )
 
     @staticmethod
     def resume_choices(resumes):

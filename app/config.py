@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 from app.local_browser import public_login_url
 
-VERSION = "5.3.1"
+VERSION = "6.0.0"
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"
@@ -87,6 +87,7 @@ class Config:
     login_public_url: str
     web_port: int
     auto_send: bool
+    superjob_key: str = ""
 
     @classmethod
     def load(cls):
@@ -141,11 +142,7 @@ class Config:
             engine = "manual"
         if engine not in {"manual", "chromium"}:
             raise ValueError("BROWSER_ENGINE должен быть manual или chromium.")
-        login_url = (
-            public_login_url(env.get("LOGIN_PUBLIC_URL", "").strip())
-            if engine == "chromium"
-            else ""
-        )
+        login_url = public_login_url(env.get("LOGIN_PUBLIC_URL", "").strip())
         port = 8000
         if login_url:
             try:
@@ -169,4 +166,5 @@ class Config:
             login_url,
             port,
             env.get("AUTO_SEND", "false").strip().lower() in {"true", "1", "yes"},
+            env.get("SUPERJOB_API_KEY", "").strip(),
         )

@@ -89,6 +89,7 @@ class Scheduler:
         if not (row and self.db.get("processing", True)):
             return
         vacancy = json.loads(row["details"])
+        settings |= vacancy.pop("mini_filters", {})
         reason = filter_reason(vacancy, settings)
         if reason:
             self.db.finish_analysis(row["id"], "filtered", {"reason": reason}, None)
@@ -116,7 +117,7 @@ class Scheduler:
             or (vacancy.get("source") == "browser" and self.db.get("browser_auto_enabled"))
         ):
             status = "approved"
-        if vacancy.get("source") == "browser":
+        if vacancy.get("source") in {"browser", "mini_hh"}:
             result = result | {"resume_hash": hashlib.sha256(resume.encode()).hexdigest()}
         self.db.finish_analysis(row["id"], status, result, result["letter"] if qualifies else None)
         from app.telegram_ui import button, markup

@@ -10,6 +10,7 @@ from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filt
 
 from app.config import Config
 from app.database import Database
+from app.mini_app import MiniApp
 from app.resume import MAX_FILE, read_upload
 from app.scheduler import Scheduler
 from app.services import ServiceError
@@ -24,7 +25,8 @@ def build(config, db, client, *, telegram_request=None):
 
     async def startup(app):
         db.recover_browser_applications()
-        if scheduler.browser.available:
+        if config.login_public_url:
+            scheduler.browser.view.mini_app = MiniApp(config, db, scheduler, client, app.bot)
             try:
                 await scheduler.browser.view.start()
             except ServiceError as exc:
