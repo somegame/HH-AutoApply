@@ -19,18 +19,19 @@ let timer;
 let gesture;
 
 const closed = {
-  done: "Вход подтверждён. Можно закрыть окно и вернуться к поиску работы.",
-  failed: "Вход не завершился. Откройте новую ссылку в Telegram.",
-  blocked: "HH остановил вход. Причина будет в Telegram.",
-  expired: "Ссылка истекла. Откройте новую ссылку в Telegram.",
+  done: "Вход подтверждён. Сессия HH сохранена.",
+  failed: "Вход не завершился. Проверьте статус аккаунта в Telegram.",
+  blocked: "HH остановил вход. Проверьте статус аккаунта в Telegram.",
+  expired: "Время входа истекло. Откройте вход заново из списка аккаунтов.",
 };
 const messages = {
-  login: "Нажмите поле на странице HH и начните вводить.",
-  checking: "Проверяю вход…",
-  retry: "HH пока не подтвердил вход. Продолжайте в этом окне.",
+  login: "Войдите на странице HH. После открытия личного кабинета проверка начнётся автоматически.",
+  checking: "Проверяю вход в аккаунт HH…",
+  retry: "Аккаунт пока не подтверждён. Если вы уже вошли, нажмите «Проверить вход».",
 };
 
-function end(message) {
+function end(state) {
+  if (window.parent !== window) window.parent.postMessage({ hhLogin: state }, location.origin);
   ended = true;
   clearTimeout(timer);
   pending.clear();
@@ -40,7 +41,7 @@ function end(message) {
   screen.removeAttribute("src");
   smsCode.value = "";
   stage.hidden = check.hidden = smsForm.hidden = true;
-  statusLine.textContent = message;
+  statusLine.textContent = closed[state];
 }
 
 function send(event) {
@@ -52,7 +53,7 @@ function send(event) {
         headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify(event),
       });
-      if (response.status === 401 || response.status === 403) end(closed.expired);
+      if (response.status === 401 || response.status === 403) end("expired");
       else if (event.kind === "sms") {
         if (response.ok) {
           smsCode.value = "";
@@ -131,13 +132,10 @@ async function refresh() {
       const response = await fetch(`/hh-login/frame?after=${encodeURIComponent(revision)}`, {
         headers, cache: "no-store",
       });
-      if (response.status === 401 || response.status === 403) return end(closed.expired);
+      if (response.status === 401 || response.status === 403) return end("expired");
       if (!response.ok) throw new Error();
       const state = response.headers.get("X-HH-Status");
-      if (closed[state]) {
-        if (window.parent !== window) window.parent.postMessage({ hhLogin: state }, location.origin);
-        return end(closed[state]);
-      }
+      if (closed[state]) return end(state);
       revision = response.headers.get("X-HH-Revision") || "";
       if (messages[state]) statusLine.textContent = messages[state];
       check.disabled = state === "checking";
@@ -189,6 +187,7 @@ screen.addEventListener("wheel", event => {
 }, { passive: false });
 check.addEventListener("click", () => {
   flush();
+  statusLine.textContent = messages.checking;
   send({ kind: "check" });
 });
 smsCode.addEventListener("input", () => {
@@ -200,5 +199,5 @@ smsForm.addEventListener("submit", event => {
   smsSubmit.disabled = true;
   send({ kind: "sms", text: smsCode.value });
 });
-if (ended) end(closed.expired);
+if (ended) end("expired");
 else refresh();

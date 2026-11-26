@@ -9,7 +9,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from aiohttp import web
 
-from app.config import setting
+from app.config import VERSION, setting
 from app.database import LABELS
 from app.hh_browser import HHLoginRequired
 from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, source_vacancy_id, text
@@ -81,7 +81,7 @@ class MiniApp:
                 web.get("/mini/oauth/superjob", self.superjob_callback),
                 web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
-                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|hh-mode|superjob}",
+                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|hh-mode|hh-resumes|superjob}",
                     self.api,
                 ),
             ]
@@ -154,6 +154,9 @@ class MiniApp:
                 return self.json(await self.import_job(data))
             if command == "hh-mode":
                 return self.json(await self.change_hh_mode(data))
+            if command == "hh-resumes":
+                await self.browser.refresh_resumes()
+                return self.json(self.state())
             if command == "superjob":
                 action = data.get("action")
                 if action == "connect":
@@ -185,6 +188,8 @@ class MiniApp:
                             "mini_hh_progress": "",
                             "hh_resume_choices": {},
                             "hh_selected_resume": {},
+                            "hh_session_verified": False,
+                            "hh_resumes_status": "",
                         }
                     )
                 return self.json(self.state())
@@ -212,6 +217,7 @@ class MiniApp:
         hh_needs_login = self.db.get("hh_needs_login", False)
         hh_login_open = bool(self.browser.login_task and not self.browser.login_task.done())
         return {
+            "version": VERSION,
             "defaults": {key: prefs[key] for key in ("query", "region", "salary")},
             "sources": self.directory(prefs),
             "jobs": [self.saved(row) for row in self.db.page((), 0, size=60)[:60]],
@@ -222,6 +228,8 @@ class MiniApp:
             "hh_resume": hh_resume.get("name", ""),
             "hh_resume_id": hh_resume.get("id", ""),
             "hh_has_session": self.browser.provider.state.is_file() and not hh_needs_login,
+            "hh_connected": self.browser.account_connected,
+            "hh_resumes_status": self.db.get("hh_resumes_status", ""),
             "hh_login_open": hh_login_open,
             "hh_progress": "Срок входа истёк. Подключите HH заново."
             if hh_needs_login and not hh_login_open
@@ -381,10 +389,10 @@ class MiniApp:
         resume = checked(resume.strip())
         values = {"resume": resume, "groq_consent": consent}
         if resume != self.db.get("resume", ""):
-            self.browser.pause("Данные резюме изменены.")
+            self.browser.pause("Данные резюме изменены.", keep_search=True)
             values["hh_selected_resume"] = {}
         if not consent:
-            self.browser.pause("Разрешение на анализ отключено.")
+            self.browser.pause("Разрешение на анализ отключено.", keep_search=True)
         self.db.set_many(values)
         return self.state()
 
@@ -401,6 +409,8 @@ class MiniApp:
                     "mini_hh_progress",
                     "Резюме привязано к профилю."
                     if selected
+                    else "Вход подтверждён. Можно включить поиск."
+                    if not result
                     else "Вход подтверждён. Выберите резюме.",
                 )
 
@@ -413,8 +423,6 @@ class MiniApp:
         if mode == "stop":
             self.browser.pause("Фоновый поиск остановлен владельцем.")
         elif mode == "search" or (mode == "auto" and data.get("confirm") is True):
-            if not self.browser.provider.state.is_file():
-                raise ServiceError("Подключите HH и выберите резюме.")
             self.browser.start_search(send=mode == "auto")
             await self.scheduler.start(self.bot)
         else:

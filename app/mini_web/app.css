@@ -96,6 +96,7 @@ button.primary, button.secondary { min-height: 44px; border-radius: 10px; paddin
 .letter-editor textarea { margin-bottom: 6px; }
 .profile, .extension { padding: 14px; margin-top: 15px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
 .profile { display: grid; gap: 8px; }
+.app-version { margin: 12px 0 0; text-align: end; }
 .extension form { padding: 5px 0; }
 nav { position: fixed; z-index: 2; inset: auto 0 0; margin: 0 auto; max-width: 780px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 7px 10px calc(6px + var(--bottom)); background: var(--surface); border-top: 1px solid var(--line); }
 nav button { min-height: 52px; display: grid; place-content: center; justify-items: center; gap: 5px; background: transparent; color: var(--muted); border: 0; padding: 5px 2px; border-radius: 10px; font-size: .78rem; line-height: 1.1; font-weight: 650; }

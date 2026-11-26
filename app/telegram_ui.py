@@ -372,6 +372,7 @@ class TelegramUI:
                 for identifier, name in list(resumes.items())[:20]
                 if len(identifier) <= 50
             ]
+            or [[button("📄 Загрузить резюме HH", "cloud_resumes")]]
         )
 
     async def browser_action(self, update, kind, value):
@@ -388,14 +389,14 @@ class TelegramUI:
                     else:
                         await update.get_bot().send_message(
                             self.config.owner,
-                            "✅ Вход в HH подтверждён. Выберите резюме.",
+                            "✅ Вход в HH подтверждён. Можно включить поиск.",
                             reply_markup=self.resume_choices(result),
                         )
 
                 url = await browser.start_login(notify)
                 await self.answer(
                     update,
-                    "Войдите в открывшемся окне. Бот проверит вход и пришлёт сюда список резюме. "
+                    "Войдите в открывшемся окне. Бот подтвердит вход и сохранит сессию. "
                     "Ссылка действует восемь минут.",
                     markup(
                         [[link("🔑 Открыть HH", url)], [button("✖️ Закрыть сессию", "cloud_cancel")]]
@@ -408,12 +409,15 @@ class TelegramUI:
                 else:
                     await self.answer(
                         update,
-                        "✅ Вход в HH подтверждён. Выберите резюме.",
+                        "✅ Вход в HH подтверждён. Можно включить поиск.",
                         self.resume_choices(resumes),
                     )
             elif kind == "cloud_cancel":
                 await browser.cancel_login()
                 await self.answer(update, "Окно входа закрыто.", menu(True))
+            elif kind == "cloud_resumes":
+                resumes = await browser.refresh_resumes()
+                await self.answer(update, "Выберите резюме HH.", self.resume_choices(resumes))
             elif kind == "cloud_resume":
                 name = await browser.import_resume(value)
                 await self.answer(
@@ -449,7 +453,7 @@ class TelegramUI:
                     f"{current}\nРезюме: {selected.get('name', 'выберите после входа в HH')}",
                     markup(
                         [
-                            [button("🔎 Найти вакансии и подготовить письма", "cloud_search")],
+                            [button("🔎 Включить фоновый поиск", "cloud_search")],
                             [button("⚡ Настроить автоотклики", "cloud_auto")],
                             [button("⏸ Остановить", "stop")],
                             [button("🔑 Войти в HH", "cloud_login"), button("🏠 Меню", "start")],

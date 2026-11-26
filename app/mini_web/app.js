@@ -8,7 +8,8 @@ let state;
 let selectedTab = "search";
 let selectedFilter = "all";
 let pendingSuperjob = "";
-let finishedHH = false;
+let hhLoginUrl = "";
+let loadingHHResumes = false;
 let profileDirty = false;
 let searches = [];
 
@@ -107,7 +108,7 @@ function statusClass(status) {
 }
 
 function canSend(job) {
-  if (job.source === "hh") return state.hh_send && state.hh_has_session && state.hh_resume && state.consent && state.groq;
+  if (job.source === "hh") return state.hh_send && state.hh_connected && state.hh_resume && state.consent && state.groq;
   if (job.source === "superjob") return state.superjob.send && state.superjob.connected && state.superjob.selected;
   return false;
 }
@@ -236,52 +237,89 @@ function resumePicker(label, resumes, active, use) {
   return group;
 }
 
-async function openHH(fresh = false) {
-  const result = await api("connect", { fresh });
-  finishedHH = false;
-  byId("hh-frame").src = result.url;
+function showHHLogin() {
+  byId("hh-frame").src = hhLoginUrl;
   byId("hh-dialog").showModal();
+}
+
+async function openHH(fresh = false) {
+  hhLoginUrl = (await api("connect", { fresh })).url;
+  showHHLogin();
   await refresh();
 }
 
+async function loadHHResumes() {
+  if (loadingHHResumes) return;
+  loadingHHResumes = true;
+  showFeedback("Загружаю резюме из HH…");
+  try {
+    await api("hh-resumes", {});
+  } finally {
+    loadingHHResumes = false;
+    showFeedback();
+    await refresh().catch(() => {});
+  }
+}
+
 function renderHH(card, operations) {
-  const ready = state.hh_has_session && state.hh_resume;
-  if (ready) card.append(el("p", state.hh_resume, "resume-name"));
-  if (state.hh_progress && !ready) card.append(el("p", state.hh_progress, "muted"));
+  const connected = state.hh_connected;
+  const hasResume = connected && state.hh_resume;
+  if (hasResume) card.append(el("p", state.hh_resume, "resume-name"));
+  if (connected && !hasResume) {
+    card.append(el("p", state.hh_resumes_status || "Можно искать вакансии. Для откликов выберите резюме HH.", "muted"));
+  } else if (connected && state.hh_resumes_status) {
+    card.append(el("p", state.hh_resumes_status, "muted"));
+  }
+  if (!connected && state.hh_progress) card.append(el("p", state.hh_progress, "muted"));
   if (state.hh_running) {
     card.append(el("p", state.hh_auto ? "Автоотклики включены" : "Фоновый поиск включён", "muted"));
-  } else if (state.hh_notice && ready && !state.hh_login_open) {
+    if (!state.hh_login_open) operations.append(action("Найденные вакансии", () => changeTab("jobs")));
+  }
+  if (state.hh_notice && connected && !state.hh_login_open) {
     card.append(el("p", state.hh_notice, "muted"));
   }
-  if (!state.hh_login_open) {
-    if (!ready) operations.append(action("Подключить HH", () => openHH(), true));
-    if (state.hh_has_session) {
-      operations.append(action("Сменить аккаунт", () => openHH(true)));
-      operations.append(action("Отключить", async () => {
-        if (await confirmAction("Закрыть сохранённую сессию HH?")) {
-          await api("disconnect", { confirm: true });
-          await refresh();
-        }
+  if (state.hh_login_open) {
+    if (!byId("hh-dialog").open) {
+      if (hhLoginUrl) operations.append(action("Продолжить вход", showHHLogin, true));
+      operations.append(action("Отменить вход", async () => {
+        await api("cancel", {});
+        hhLoginUrl = "";
+        await refresh();
       }));
     }
-  } else if (!byId("hh-dialog").open) {
-    operations.append(action("Закрыть текущий вход", async () => {
-      await api("cancel", {});
+    return;
+  }
+  if (!connected) operations.append(action("Подключить HH", () => openHH(), true));
+  if (connected && !state.hh_running) {
+    operations.append(action("Включить фоновый поиск", async () => {
+      await api("hh-mode", { mode: "search" });
       await refresh();
+      showFeedback("Фоновый поиск HH включён.");
+    }, true));
+  }
+  if (connected) {
+    const resumeButton = action(hasResume ? "Обновить резюме" : "Загрузить резюме", loadHHResumes);
+    resumeButton.disabled = loadingHHResumes;
+    operations.append(resumeButton);
+  }
+  if (connected || state.hh_has_session) {
+    operations.append(action("Сменить аккаунт", () => openHH(true)));
+    operations.append(action("Отключить", async () => {
+      if (await confirmAction("Закрыть сохранённую сессию HH?")) {
+        await api("disconnect", { confirm: true });
+        hhLoginUrl = "";
+        await refresh();
+      }
     }));
   }
-  if (state.hh_has_session && !state.hh_login_open && Object.keys(state.resumes).length && (!ready || Object.keys(state.resumes).length > 1)) {
+  if (connected && Object.keys(state.resumes).length && (!hasResume || Object.keys(state.resumes).length > 1)) {
     card.append(resumePicker("Выберите резюме HH", state.resumes, state.hh_resume_id, async id => {
       await api("resume", { id });
       profileDirty = false;
       await refresh();
     }));
   }
-  if (ready && state.consent && state.groq && !state.hh_login_open) {
-    if (!state.hh_running) operations.append(action("Включить фоновый поиск", async () => {
-      await api("hh-mode", { mode: "search" });
-      await refresh();
-    }));
+  if (hasResume && state.consent && state.groq) {
     if (state.hh_auto_allowed && !state.hh_auto) operations.append(action("Включить автоотклики", async () => {
       const message = "Разрешить отправлять резюме и письма работодателям HH? Лимит на день: " + state.daily_limit;
       if (await confirmAction(message)) {
@@ -289,7 +327,7 @@ function renderHH(card, operations) {
         await refresh();
       }
     }));
-  } else if (ready && !state.consent) {
+  } else if (hasResume && !state.consent) {
     operations.append(action("Настроить письма", () => byId("profile-form").scrollIntoView({ block: "start" })));
   }
   if (state.hh_running) operations.append(action("Остановить поиск", async () => {
@@ -334,7 +372,7 @@ function renderConnections() {
   for (const source of state.sources) {
     const card = el("article", "", "card");
     const head = el("div", "", "card-header");
-    const linked = (source.id === "hh" && state.hh_has_session && state.hh_resume) ||
+    const linked = (source.id === "hh" && state.hh_connected) ||
       (source.id === "superjob" && state.superjob.connected && !state.superjob.status.startsWith("Нужно снова"));
     head.append(el("h3", source.name), el("span", linked ? "Подключён" : modes[source.mode], linked ? "status good" : "status"));
     card.append(head);
@@ -348,8 +386,9 @@ function renderConnections() {
   }
   byId("connections").replaceChildren(...cards);
   byId("profile-info").textContent = [
-    state.hh_resume ? "Резюме HH уже в профиле." :
-      state.resume ? "Резюме сохранено." : "Подключите HH, чтобы загрузить резюме из аккаунта.",
+    state.hh_connected && state.hh_resume ? "Резюме HH уже в профиле." :
+      state.resume ? "Резюме сохранено." :
+      state.hh_connected ? "Загрузите резюме HH для подготовки писем." : "Подключите HH, чтобы загрузить резюме из аккаунта.",
     !state.groq ? "Для писем нужно настроить Groq." : "",
     !state.persistent ? "Для отправки подключите постоянное хранилище Bothost." : "",
   ].filter(Boolean).join(" ");
@@ -363,6 +402,10 @@ async function refresh(first = false, unchanged = false) {
   const next = await api("state");
   if (unchanged && JSON.stringify(state) === JSON.stringify(next)) return;
   state = next;
+  if (!state.hh_login_open && !byId("hh-dialog").open) hhLoginUrl = "";
+  const version = byId("app-version");
+  version.hidden = !state.version;
+  version.textContent = state.version ? "Версия " + state.version : "";
   if (first) {
     for (const key of ["query", "region", "salary"]) byId(key).value = state.defaults[key];
     for (const source of state.sources) byId("source").append(new Option(source.name, source.id));
@@ -472,10 +515,6 @@ hhDialog.addEventListener("close", async () => {
   hhFrame.removeAttribute("src");
   try {
     await refresh();
-    if (state.hh_login_open && !finishedHH) {
-      await api("cancel", {});
-      await refresh();
-    }
   } catch (error) {
     showError(error.message);
   }
@@ -483,10 +522,11 @@ hhDialog.addEventListener("close", async () => {
 window.addEventListener("message", event => {
   if (event.origin !== location.origin || event.source !== hhFrame.contentWindow) return;
   if (event.data?.hhLogin === "done") {
-    finishedHH = true;
+    hhLoginUrl = "";
     hhDialog.close();
-    showFeedback("Вход в HH подтверждён.");
+    showFeedback("Вход в HH подтверждён. Сессия сохранена.");
   } else if (["blocked", "failed", "expired"].includes(event.data?.hhLogin)) {
+    hhLoginUrl = "";
     refresh(false, true).catch(() => {});
   }
 });

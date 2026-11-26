@@ -224,6 +224,78 @@ def test_search_isolated_sources_owner_actions_and_real_storage(mini_config):
     asyncio.run(run())
 
 
+def test_verified_hh_account_can_search_and_refresh_resumes_in_mini_app(mini_config, monkeypatch):
+    async def run():
+        config = replace(mini_config, browser_engine="chromium", groq_key="")
+        db = Database(config.data_dir)
+        resumes = {"123456789abc": "Финансовый менеджер"}
+        unavailable = hh_browser.HHResumeUnavailable("HH пока не показал список резюме.")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(source_response)) as sources:
+            scheduler = Scheduler(config, db, sources)
+            browser = scheduler.browser
+            view = browser.view
+            bot = SimpleNamespace()
+            view.mini_app = MiniApp(config, db, scheduler, sources, bot)
+            browser.provider.state.write_text('{"cookies":[],"origins":[]}')
+            db.set("hh_session_verified", True)
+            start = AsyncMock()
+            monkeypatch.setattr(scheduler, "start", start)
+            monkeypatch.setattr(browser, "require_browser", lambda: None)
+            monkeypatch.setattr(
+                hh_browser, "authorized_resumes", AsyncMock(side_effect=[unavailable, resumes])
+            )
+
+            @asynccontextmanager
+            async def session(_):
+                yield None, None
+
+            monkeypatch.setattr(browser.provider, "session", session)
+            await view.start()
+            try:
+                port = view.runner.addresses[0][1]
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    route = "/mini/api/hh-resumes"
+                    foreign = {"Authorization": "tma " + signed(int(time.time()), owner=1)}
+                    assert (
+                        await client.post(route, headers=foreign | {"Origin": PUBLIC_URL}, json={})
+                    ).status_code == 401
+
+                    headers = {
+                        "Authorization": "tma " + signed(int(time.time())),
+                        "Origin": PUBLIC_URL,
+                    }
+                    state = (await client.get("/mini/api/state", headers=headers)).json()
+                    assert state["hh_connected"] is True
+                    assert state["hh_resume_id"] == ""
+
+                    search = await client.post(
+                        "/mini/api/hh-mode", headers=headers, json={"mode": "search"}
+                    )
+                    assert search.status_code == 200
+                    assert search.json()["hh_running"] is True
+                    assert search.json()["hh_auto"] is False
+                    start.assert_awaited_once_with(bot)
+
+                    failed = await client.post(route, headers=headers, json={})
+                    assert failed.status_code == 400
+                    assert failed.json()["error"] == str(unavailable)
+                    state = (await client.get("/mini/api/state", headers=headers)).json()
+                    assert state["hh_connected"] is True
+                    assert state["hh_running"] is True
+
+                    updated = await client.post(route, headers=headers, json={})
+                    assert updated.status_code == 200
+                    assert updated.json()["resumes"] == resumes
+                    assert updated.json()["hh_connected"] is True
+                    assert updated.json()["hh_resume_id"] == ""
+            finally:
+                await scheduler.shutdown()
+                await view.shutdown()
+
+    asyncio.run(run())
+
+
 def test_mini_app_mobile_search_and_prepare(mini_config):
     executable = shutil.which("chromium") or shutil.which("google-chrome")
     if not executable:
