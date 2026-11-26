@@ -6,7 +6,7 @@ from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.error import BadRequest
 
-from app.config import FIELDS, OPTIONAL, setting
+from app.config import BOOLEANS, FIELDS, OPTIONAL, setting
 from app.database import ACTIVE, HISTORY, LABELS
 from app.diagnostics import report, resource_warning
 from app.resume import MAX_FILE, checked, read_upload
@@ -15,19 +15,18 @@ from app.services import ServiceError, browserbase_projects
 from app.vacancies import HH, TEMPLATE, parse_vacancy, search_links, terms, vacancy_id
 
 PREVIEW = LinkPreviewOptions(is_disabled=True)
-MENUS = {
-    "run": "Запустить поиск",
-    "stop": "Остановить",
-    "status": "Статус",
-    "add": "Добавить вакансию",
-    "found": "Найденные вакансии",
-    "drafts": "Очередь откликов",
-    "history": "История",
-    "stats": "Статистика",
-    "settings": "Настройки поиска",
-    "resume": "Моё резюме",
-    "login": "Авторизация HH",
-    "diagnose": "Диагностика",
+SETTINGS_SECTIONS = {
+    "search": (
+        "🔎 Поиск вакансий",
+        ("query", "region", "salary", "format", "schedule", "experience"),
+    ),
+    "filters": (
+        "🎯 Фильтры",
+        ("score", "currency", "unknown_salary", "employers", "excluded", "required"),
+    ),
+    "related": ("🧭 Смежные должности", ("use_related", "related")),
+    "letters": ("✍️ Письма и отклики", ("tone", "length", "limit")),
+    "reminders": ("🔔 Напоминания", ("interval",)),
 }
 COMMANDS = {
     "start": "Главное меню",
@@ -37,7 +36,7 @@ COMMANDS = {
     "status": "Текущее состояние",
     "login": "Вход и проверка аккаунта на HH",
     "mobile": "Войти с iPhone",
-    "finish": "Открыть профиль и проверить вход",
+    "finish": "Подтвердить, что вы вошли в HH",
     "groq": "Диагностика Groq",
     "browserbase": "Проверка списка проектов Browserbase",
     "diagnose": "Полная диагностика",
@@ -76,13 +75,24 @@ def markup(rows):
 
 
 def menu():
-    entries = list(MENUS.items())
     return markup(
         [
-            [button(title, key) for key, title in entries[i : i + 2]]
-            for i in range(0, len(entries), 2)
+            [button("🔎 Поиск", "search"), button("➕ Вакансия", "add")],
+            [button("📨 Отклики", "drafts"), button("📄 Резюме", "resume")],
+            [button("🔑 Вход в HH", "login"), button("⚙️ Настройки", "settings")],
+            [button("⋯ Ещё", "more")],
         ]
     )
+
+
+def setting_section(key):
+    return next(section for section, (_, keys) in SETTINGS_SECTIONS.items() if key in keys)
+
+
+def setting_value(value):
+    if isinstance(value, bool):
+        return "Да" if value else "Нет"
+    return str(value) if value != "" else "Не задано"
 
 
 def search_keyboard(settings):
@@ -90,7 +100,7 @@ def search_keyboard(settings):
     rows.append(
         [link("Как включить автопоиск HH", "https://feedback.hh.ru/knowledge-base/article/0048")]
     )
-    rows.append([button("Добавить вакансию", "add"), button("Меню", "start")])
+    rows.append([button("➕ Вакансия", "add"), button("🏠 Меню", "start")])
     return markup(rows)
 
 
@@ -149,6 +159,33 @@ class TelegramUI:
             if not self.config.persistent:
                 title += "\nПредупреждение. Постоянство DATA_DIR не подтверждено. Данные могут исчезнуть при обновлении."
             await self.answer(update, title, menu())
+        elif kind == "more":
+            await self.answer(
+                update,
+                "Дополнительные разделы",
+                markup(
+                    [
+                        [button("📋 Статус", "status"), button("📊 Статистика", "stats")],
+                        [button("📚 Все вакансии", "found"), button("🕘 История", "history")],
+                        [button("🩺 Диагностика", "diagnose"), button("❓ Справка", "help")],
+                        [button("🏠 Меню", "start")],
+                    ]
+                ),
+            )
+        elif kind == "search":
+            running = self.db.get("reminders", False)
+            controls = (
+                button("⏸ Остановить анализ и напоминания", "stop")
+                if running
+                else button("▶️ Включить анализ и напоминания", "run")
+            )
+            keyboard = search_keyboard(settings)
+            await self.answer(
+                update,
+                "Откройте поиск на HH и сохраните автопоиск для новых вакансий. "
+                "Затем передайте выбранную вакансию боту.",
+                markup([*keyboard.inline_keyboard[:-1], [controls], keyboard.inline_keyboard[-1]]),
+            )
         elif kind == "help":
             await self.answer(
                 update,
@@ -180,18 +217,34 @@ class TelegramUI:
             await self.page(update, kind, int(value or 0))
         elif kind in {"status", "stats", "errors"}:
             await self.status(update, kind, settings)
-        elif kind in {"login", "mobile", "finish"}:
+        elif kind in {"login", "mobile"}:
             await self.answer(
                 update,
-                "Откройте HH в Safari или приложении. Введите код "
-                "и пароль на HH. Проверьте вход по своему резюме или профилю.",
+                "Откройте HH. Когда увидите свой профиль или резюме, закройте браузер "
+                "кнопкой × и нажмите «Я вошёл». Браузер Telegram не сообщает боту о входе.",
                 markup(
                     [
-                        [link("Войти в HH", HH + "/account/login")],
-                        [link("Мои резюме на HH", HH + "/applicant/resumes")],
-                        [button("Меню", "start")],
+                        [link("🔑 Войти в HH", HH + "/account/login")],
+                        [link("📄 Мои резюме на HH", HH + "/applicant/resumes")],
+                        [button("✅ Я вошёл", "finish")],
+                        [button("🏠 Меню", "start")],
                     ]
                 ),
+            )
+        elif kind == "finish":
+            if not self.db.get("resume", ""):
+                next_step = button("📄 Загрузить резюме", "upload")
+                instructions = "Добавьте в бот текст резюме для анализа вакансий."
+            elif not self.db.get("groq_consent", False):
+                next_step = button("📄 Настроить анализ резюме", "resume")
+                instructions = "Разрешите анализ профессионального текста в Groq."
+            else:
+                next_step = button("🔎 Открыть поиск", "search")
+                instructions = "Откройте поиск или добавьте выбранную вакансию."
+            await self.answer(
+                update,
+                f"✅ Вы подтвердили вход в HH. {instructions}",
+                markup([[next_step], [button("🏠 Меню", "start")]]),
             )
         elif kind in {"groq", "browserbase", "diagnose"}:
             await self.diagnostics(update, kind)
@@ -239,7 +292,7 @@ class TelegramUI:
             navigation.append(button("Далее ›", f"{kind}:{page + 1}"))
         if navigation:
             rows.append(navigation)
-        rows.append([button("Добавить вакансию", "add"), button("Меню", "start")])
+        rows.append([button("➕ Вакансия", "add"), button("🏠 Меню", "start")])
         await self.answer(update, "\n".join(info) or "Здесь пока пусто.", markup(rows))
 
     async def status(self, update, kind, settings):
@@ -319,12 +372,17 @@ class TelegramUI:
     async def settings(self, update, kind, value, settings):
         if kind == "set" and value in FIELDS:
             self.input = ("setting", value)
-            hint = (
-                " Для списков используйте точку с запятой, для очистки — «-»."
-                if value in OPTIONAL
-                else ""
+            hint = ""
+            if value in OPTIONAL:
+                hint = " Для списков используйте точку с запятой, для очистки — «-»."
+            elif value in BOOLEANS:
+                hint = " Ответьте «да» или «нет»."
+            await self.answer(
+                update,
+                f"{FIELDS[value]}\nСейчас: {setting_value(settings[value])}\n"
+                f"Отправьте новое значение.{hint}",
+                markup([[button("‹ Назад", f"settings:{setting_section(value)}")]]),
             )
-            await self.answer(update, f"{FIELDS[value]}. Введите новое значение.{hint}")
             return
         if kind == "choose" and value in {"manual", "confirm"}:
             self.save_setting("mode", value)
@@ -348,14 +406,18 @@ class TelegramUI:
                 ),
             )
             return
-        rows = []
-        for key, label in FIELDS.items():
-            current = settings[key]
-            if isinstance(current, bool):
-                current = "да" if current else "нет"
-            rows.append([button(f"{label} · {current or '—'}"[:95], f"set:{key}")])
-        rows.append([button("Режим откликов", "mode"), button("Меню", "start")])
-        await self.answer(update, "Настройки поиска, анализа и писем.", markup(rows))
+        if value in SETTINGS_SECTIONS:
+            title, keys = SETTINGS_SECTIONS[value]
+            rows = [[button(FIELDS[key], f"set:{key}")] for key in keys]
+            if value == "letters":
+                rows.append([button("📨 Режим откликов", "mode")])
+            rows.append([button("‹ Все настройки", "settings")])
+            summary = "\n".join(f"{FIELDS[key]} — {setting_value(settings[key])}" for key in keys)
+            await self.answer(update, f"{title}\n\n{summary}", markup(rows))
+            return
+        rows = [[button(title, f"settings:{key}")] for key, (title, _) in SETTINGS_SECTIONS.items()]
+        rows.append([button("🏠 Меню", "start")])
+        await self.answer(update, "⚙️ Что хотите настроить?", markup(rows))
 
     def save_setting(self, key, value):
         self.db.set("settings", self.db.get("settings", {}) | {key: value})
@@ -457,7 +519,9 @@ class TelegramUI:
             updated = setting(value, text)
             self.save_setting(value, updated)
             self.input = None
-            await self.settings(update, "settings", "", self.db.settings(self.config))
+            await self.settings(
+                update, "settings", setting_section(value), self.db.settings(self.config)
+            )
         elif action == "edit":
             if not 1 <= len(text.strip()) <= 1200:
                 raise ValueError("Введите от 1 до 1200 символов.")
