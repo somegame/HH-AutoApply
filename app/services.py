@@ -5,7 +5,6 @@ import re
 import httpx
 
 GROQ = "https://api.groq.com/openai/v1"
-BROWSERBASE = "https://api.browserbase.com/v1"
 
 
 class ServiceError(Exception):
@@ -148,21 +147,3 @@ class Groq:
         except (KeyError, IndexError, TypeError, ValueError):
             raise ServiceError("Groq не вернул читаемый JSON.") from None
         return validate(result, data["resume"])
-
-
-async def browserbase_projects(client, config):
-    if not config.browserbase_key:
-        raise ServiceError("Требуется настройка BROWSERBASE_API_KEY для проверки проектов.")
-    response = await request(
-        client,
-        "GET",
-        BROWSERBASE + "/projects",
-        headers={"X-BB-API-Key": config.browserbase_key},
-    )
-    if (
-        not isinstance(response, list)
-        or not response
-        or not all(isinstance(item, dict) and item.get("id") for item in response)
-    ):
-        raise ServiceError("Browserbase не вернул доступные проекты.")
-    return len(response)

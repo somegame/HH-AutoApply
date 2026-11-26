@@ -12,7 +12,7 @@ from app.database import ACTIVE, HISTORY, LABELS
 from app.diagnostics import report, resource_warning
 from app.resume import MAX_FILE, checked, read_upload
 from app.scheduler import local_day
-from app.services import ServiceError, browserbase_projects
+from app.services import ServiceError
 from app.vacancies import HH, TEMPLATE, parse_vacancy, search_links, terms, vacancy_id
 
 PREVIEW = LinkPreviewOptions(is_disabled=True)
@@ -41,7 +41,7 @@ COMMANDS = {
     "mobile": "Войти с iPhone",
     "finish": "Подтвердить, что вы вошли в HH",
     "groq": "Диагностика Groq",
-    "browserbase": "Проверка списка проектов Browserbase",
+    "browser": "Диагностика локального браузера",
     "diagnose": "Полная диагностика",
     "drafts": "Очередь откликов",
     "history": "История",
@@ -169,7 +169,7 @@ class TelegramUI:
     async def route(self, update, action):
         kind, _, value = action.partition(":")
         self.input = None
-        if self.config.browser_engine == "browserbase":
+        if self.config.browser_engine == "chromium":
             kind = {
                 "login": "cloud_login",
                 "mobile": "cloud_login",
@@ -181,7 +181,7 @@ class TelegramUI:
             title = "HH AutoApply · помощник соискателя"
             if not self.config.persistent:
                 title += "\nПредупреждение. Постоянство DATA_DIR не подтверждено. Данные могут исчезнуть при обновлении."
-            await self.answer(update, title, menu(self.config.browser_engine == "browserbase"))
+            await self.answer(update, title, menu(self.config.browser_engine == "chromium"))
         elif kind.startswith("cloud_"):
             await self.browser_action(update, kind, value)
         elif kind == "more":
@@ -311,7 +311,7 @@ class TelegramUI:
                     ]
                 ),
             )
-        elif kind in {"groq", "browserbase", "diagnose"}:
+        elif kind in {"groq", "browser", "diagnose"}:
             await self.diagnostics(update, kind)
         elif kind in {"settings", "set", "mode", "choose"}:
             await self.settings(update, kind, value, settings)
@@ -346,9 +346,7 @@ class TelegramUI:
         browser = self.scheduler.browser
         try:
             if not browser.available:
-                raise ServiceError(
-                    "Браузерный режим выключен. Включите BROWSER_ENGINE=browserbase."
-                )
+                raise ServiceError("Браузерный режим выключен. Включите BROWSER_ENGINE=chromium.")
             if kind == "cloud_login":
                 await self.answer(update, "Открываю браузер HH. Это может занять несколько секунд.")
                 url = await browser.start_login()
@@ -550,14 +548,28 @@ class TelegramUI:
                     )
                 except ServiceError as exc:
                     lines.append(f"Groq — {exc}")
-            if kind in {"diagnose", "browserbase"}:
-                try:
-                    count = await browserbase_projects(self.client, self.config)
+            if kind in {"diagnose", "browser"}:
+                browser = self.scheduler.browser
+                if browser.available:
+                    try:
+                        browser.require_browser()
+                        lines.append("Chromium — исполняемый файл доступен.")
+                    except ServiceError as exc:
+                        lines.append(str(exc))
                     lines.append(
-                        f"Browserbase — доступных проектов {count}. Браузер не запускался."
+                        "Страница входа — "
+                        + (
+                            "локальный порт открыт. Внешний HTTPS проверяется с телефона."
+                            if browser.view.runner
+                            else "нужны HTTPS-домен и LOGIN_PUBLIC_URL."
+                        )
                     )
-                except ServiceError as exc:
-                    lines.append(f"Browserbase — {exc}")
+                    if browser.provider.state.is_file():
+                        lines.append(
+                            "Состояние HH сохранено. Срок входа проверяется при обращении к HH."
+                        )
+                else:
+                    lines.append("Локальный браузер выключен. Включите BROWSER_ENGINE=chromium.")
             await self.answer(update, "\n".join(lines), menu())
         except Exception as exc:
             import logging

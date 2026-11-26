@@ -5,7 +5,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
-VERSION = "5.1.0"
+from app.local_browser import public_login_url
+
+VERSION = "5.2.0"
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"
@@ -75,14 +77,15 @@ class Config:
     owner: int
     groq_key: str
     model: str
-    browserbase_key: str
     data_dir: Path
     persistent: bool
     zone: ZoneInfo
     defaults: dict
     log_level: str
     browser_engine: str
-    browser_month_seconds: int
+    chromium_path: str
+    login_public_url: str
+    web_port: int
     auto_send: bool
 
     @classmethod
@@ -134,26 +137,36 @@ class Config:
             except ValueError as exc:
                 raise ValueError(f"{name}. {exc}") from None
         engine = env.get("BROWSER_ENGINE", "manual").strip().lower()
-        if engine not in {"manual", "browserbase"}:
-            raise ValueError("BROWSER_ENGINE должен быть manual или browserbase.")
-        try:
-            budget = int(env.get("BROWSER_MONTH_SECONDS", "3600"))
-        except ValueError:
-            raise ValueError("BROWSER_MONTH_SECONDS задаётся целым числом секунд.") from None
-        if not 240 <= budget <= 3600:
-            raise ValueError("BROWSER_MONTH_SECONDS должен быть от 240 до 3600.")
+        if engine == "browserbase":
+            engine = "manual"
+        if engine not in {"manual", "chromium"}:
+            raise ValueError("BROWSER_ENGINE должен быть manual или chromium.")
+        login_url = (
+            public_login_url(env.get("LOGIN_PUBLIC_URL", "").strip())
+            if engine == "chromium"
+            else ""
+        )
+        port = 8000
+        if login_url:
+            try:
+                port = int(env.get("PORT", "").strip() or "8000")
+            except ValueError:
+                raise ValueError("PORT должен быть целым числом.") from None
+            if not 1 <= port <= 65535:
+                raise ValueError("PORT должен быть от 1 до 65535.")
         return cls(
             token,
             int(owner),
             env.get("GROQ_API_KEY", "").strip(),
             env.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-120b",
-            env.get("BROWSERBASE_API_KEY", "").strip(),
             Path(env.get("DATA_DIR", "./data")),
             env.get("PERSISTENT_STORAGE") == "true",
             zone,
             defaults,
             env.get("LOG_LEVEL", "INFO").upper(),
             engine,
-            budget,
+            env.get("CHROMIUM_PATH", "/usr/bin/chromium-headless-shell"),
+            login_url,
+            port,
             env.get("AUTO_SEND", "false").strip().lower() in {"true", "1", "yes"},
         )

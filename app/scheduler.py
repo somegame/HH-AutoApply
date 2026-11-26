@@ -22,7 +22,7 @@ class Scheduler:
         self.config = config
         self.db = db
         self.groq = Groq(client, config)
-        self.browser = BrowserWorkflow(config, db, client)
+        self.browser = BrowserWorkflow(config, db)
         self.task = None
         self.warning = None
 
