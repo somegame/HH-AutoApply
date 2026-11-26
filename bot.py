@@ -22,6 +22,7 @@ def build(config, db, client, *, telegram_request=None):
     ui = TelegramUI(config, db, scheduler, client)
 
     async def startup(app):
+        db.recover_browser_applications()
         await app.bot.set_my_commands(list(COMMANDS.items()))
         path = Path("resume.txt")
         if not db.get("resume") and path.is_file() and path.stat().st_size <= MAX_FILE:
@@ -34,6 +35,7 @@ def build(config, db, client, *, telegram_request=None):
 
     async def shutdown(app):
         await scheduler.shutdown()
+        await scheduler.browser.cancel_login()
         if ui.diagnostic_task:
             ui.diagnostic_task.cancel()
             await asyncio.gather(ui.diagnostic_task, return_exceptions=True)
@@ -65,7 +67,7 @@ def main():
         level=getattr(logging, config.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    for name in ("httpx", "httpcore", "telegram"):
+    for name in ("httpx", "httpcore", "telegram", "playwright"):
         logging.getLogger(name).setLevel(logging.CRITICAL + 1)
     client = httpx.AsyncClient(timeout=httpx.Timeout(25, connect=8), follow_redirects=False)
     try:

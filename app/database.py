@@ -3,8 +3,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-ACTIVE = ("queued", "draft", "approved", "deferred", "unknown", "questions", "error")
-HISTORY = ("reported", "rejected", "filtered", "duplicate")
+ACTIVE = ("queued", "draft", "approved", "deferred", "unknown", "questions", "error", "sending")
+HISTORY = ("reported", "rejected", "filtered", "duplicate", "sent")
 LABELS = {
     "queued": "Ожидает анализа",
     "draft": "Подготовлен черновик",
@@ -16,7 +16,9 @@ LABELS = {
     "rejected": "Отклонена владельцем",
     "questions": "Требуются ответы",
     "error": "Ошибка анализа",
-    "duplicate": "Уже отправлялся по данным владельца",
+    "duplicate": "Отклик уже есть на HH",
+    "sending": "Отправляется через HH",
+    "sent": "Отправка подтверждена на HH",
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -165,6 +167,30 @@ class Database:
             if changed:
                 self.event(db, vacancy_id, status)
             return "ok" if changed else "stale"
+
+    def next_browser_application(self):
+        with self.connection() as db:
+            return db.execute(
+                """SELECT * FROM vacancies WHERE status='approved'
+                   AND json_extract(details, '$.source')='browser'
+                   ORDER BY found_at,id LIMIT 1"""
+            ).fetchone()
+
+    def complete_browser_application(self, vacancy_id, status, *, previous="sending"):
+        with self.connection() as db:
+            changed = db.execute(
+                "UPDATE vacancies SET status=? WHERE id=? AND status=?",
+                (status, vacancy_id, previous),
+            ).rowcount
+            if changed:
+                self.event(db, vacancy_id, status)
+
+    def recover_browser_applications(self):
+        with self.connection() as db:
+            rows = db.execute("SELECT id FROM vacancies WHERE status='sending'").fetchall()
+            db.execute("UPDATE vacancies SET status='unknown' WHERE status='sending'")
+            for row in rows:
+                self.event(db, row["id"], "unknown")
 
     def cached(self, key):
         with self.connection() as db:

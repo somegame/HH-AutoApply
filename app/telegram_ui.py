@@ -1,5 +1,6 @@
 import asyncio
 import json
+import secrets
 import time
 from datetime import datetime
 
@@ -76,7 +77,19 @@ def markup(rows):
     return InlineKeyboardMarkup(rows)
 
 
-def menu():
+def menu(browser=False):
+    if browser:
+        return markup(
+            [
+                [button("🔑 Войти в HH через браузер", "cloud_login")],
+                [button("▶️ Браузерный поиск и автоотклики", "cloud_menu")],
+                [
+                    button("📨 Черновики и очередь", "drafts"),
+                    link("📨 Отклики HH", HH_APPLICATIONS),
+                ],
+                [button("⚙️ Настройки", "settings"), button("⋯ Ещё", "more")],
+            ]
+        )
     return markup(
         [
             [button("🔎 Подобрать вакансии", "search")],
@@ -114,6 +127,7 @@ class TelegramUI:
         self.client = client
         self.input = None
         self.diagnostic_task = None
+        self.auto_prompt = None
 
     async def answer(self, update, text, keyboard=None):
         return await update.effective_message.reply_text(
@@ -155,12 +169,21 @@ class TelegramUI:
     async def route(self, update, action):
         kind, _, value = action.partition(":")
         self.input = None
+        if self.config.browser_engine == "browserbase":
+            kind = {
+                "login": "cloud_login",
+                "mobile": "cloud_login",
+                "finish": "cloud_finish",
+                "run": "cloud_menu",
+            }.get(kind, kind)
         settings = self.db.settings(self.config)
         if kind == "start":
             title = "HH AutoApply · помощник соискателя"
             if not self.config.persistent:
                 title += "\nПредупреждение. Постоянство DATA_DIR не подтверждено. Данные могут исчезнуть при обновлении."
-            await self.answer(update, title, menu())
+            await self.answer(update, title, menu(self.config.browser_engine == "browserbase"))
+        elif kind.startswith("cloud_"):
+            await self.browser_action(update, kind, value)
         elif kind == "more":
             await self.answer(
                 update,
@@ -250,7 +273,10 @@ class TelegramUI:
             )
         elif kind == "stop":
             self.db.set_many({"reminders": False, "processing": False})
+            self.scheduler.browser.pause("")
+            self.auto_prompt = None
             await self.scheduler.shutdown()
+            await self.scheduler.browser.cancel_login()
             await self.answer(update, "Напоминания и анализ остановлены.", menu())
         elif kind in PAGES:
             await self.page(update, kind, int(value or 0))
@@ -312,8 +338,129 @@ class TelegramUI:
             "confirm",
             "exclude",
             "retry",
+            "reconcile",
         }:
             await self.vacancy(update, kind, value, settings)
+
+    async def browser_action(self, update, kind, value):
+        browser = self.scheduler.browser
+        try:
+            if not browser.available:
+                raise ServiceError(
+                    "Браузерный режим выключен. Включите BROWSER_ENGINE=browserbase."
+                )
+            if kind == "cloud_login":
+                await self.answer(update, "Открываю браузер HH. Это может занять несколько секунд.")
+                url = await browser.start_login()
+                await self.answer(
+                    update,
+                    "Откройте защищённую ссылку и войдите на HH. Затем закройте окно и нажмите "
+                    "«Проверить вход» в этом чате. Ссылка действует около трёх минут.",
+                    markup(
+                        [
+                            [link("🔑 Войти на HH", url)],
+                            [button("✅ Проверить вход", "cloud_finish")],
+                            [button("✖️ Закрыть сессию", "cloud_cancel")],
+                        ]
+                    ),
+                )
+            elif kind == "cloud_finish":
+                resumes = await browser.finish_login()
+                await self.answer(
+                    update,
+                    "HH открыл ваш личный список резюме. Выберите резюме для поиска и откликов.",
+                    markup(
+                        [
+                            [button(name, f"cloud_resume:{identifier}")]
+                            for identifier, name in list(resumes.items())[:20]
+                            if len(identifier) <= 50
+                        ]
+                    ),
+                )
+            elif kind == "cloud_cancel":
+                await browser.cancel_login()
+                await self.answer(update, "Окно входа закрыто.", menu(True))
+            elif kind == "cloud_resume":
+                name = await browser.import_resume(value)
+                await self.answer(
+                    update,
+                    f"Выбрано резюме «{name}». Для оценки вакансий и подготовки сопроводительных "
+                    "Groq получит профессиональный текст резюме. Разрешить обработку?",
+                    markup(
+                        [
+                            [button("✅ Разрешить Groq", "cloud_consent")],
+                            [button("🏠 Меню", "start")],
+                        ]
+                    ),
+                )
+            elif kind == "cloud_consent":
+                if not self.db.get("hh_selected_resume") or not self.db.get("resume"):
+                    raise ServiceError("Сначала выберите резюме HH.")
+                self.db.set("groq_consent", True)
+                await self.browser_action(update, "cloud_menu", "")
+            elif kind == "cloud_menu":
+                selected = self.db.get("hh_selected_resume", {})
+                current = (
+                    "Включены автоотклики"
+                    if self.db.get("browser_auto_enabled")
+                    else "Включён поиск"
+                    if self.db.get("browser_search")
+                    else "Остановлено"
+                )
+                notice = self.db.get("browser_notice", "")
+                if notice:
+                    current += f". {notice}"
+                await self.answer(
+                    update,
+                    f"{current}\nРезюме: {selected.get('name', 'выберите после входа в HH')}",
+                    markup(
+                        [
+                            [button("🔎 Найти вакансии и подготовить письма", "cloud_search")],
+                            [button("⚡ Настроить автоотклики", "cloud_auto")],
+                            [button("⏸ Остановить", "stop")],
+                            [button("🔑 Войти в HH", "cloud_login"), button("🏠 Меню", "start")],
+                        ]
+                    ),
+                )
+            elif kind == "cloud_auto":
+                browser.readiness()
+                if not (self.config.auto_send and self.config.persistent):
+                    raise ServiceError(
+                        "Для автооткликов нужны AUTO_SEND=true и подтверждённый постоянный Volume."
+                    )
+                token = secrets.token_hex(5)
+                self.auto_prompt = (token, time.monotonic() + 180)
+                cap = self.db.settings(self.config)["limit"]
+                await self.answer(
+                    update,
+                    f"Разрешить отправлять работодателям выбранное резюме и сгенерированное письмо "
+                    f"без подтверждения каждого отклика? Лимит: {cap} в сутки.",
+                    markup(
+                        [
+                            [button("✅ Включить автоотклики", f"cloud_send:{token}")],
+                            [button("‹ Назад", "cloud_menu")],
+                        ]
+                    ),
+                )
+            elif kind in {"cloud_search", "cloud_send"}:
+                if kind == "cloud_send" and (
+                    not self.auto_prompt
+                    or self.auto_prompt[0] != value
+                    or self.auto_prompt[1] < time.monotonic()
+                ):
+                    raise ServiceError(
+                        "Подтверждение истекло. Снова откройте настройки автооткликов."
+                    )
+                self.auto_prompt = None
+                browser.start_search(send=kind == "cloud_send")
+                await self.scheduler.start(update.get_bot())
+                await self.answer(
+                    update,
+                    "Цикл запущен. Подходящие вакансии появятся в очереди.",
+                    markup([[button("📨 Очередь", "drafts"), button("⏸ Остановить", "stop")]]),
+                )
+        except ServiceError as exc:
+            await self.answer(update, str(exc), menu(browser.available))
 
     async def page(self, update, kind, page):
         page = max(0, min(10000, page))
@@ -531,7 +678,15 @@ class TelegramUI:
         await self.save_resume(update, text)
 
     async def save_resume(self, update, text):
-        self.db.set_many({"resume": checked(text), "groq_consent": False})
+        self.db.set_many(
+            {
+                "resume": checked(text),
+                "groq_consent": False,
+                "hh_selected_resume": {},
+                "browser_auto_enabled": False,
+                "browser_search": False,
+            }
+        )
         self.input = None
         await self.resume(update, "resume")
 
@@ -601,6 +756,21 @@ class TelegramUI:
         ):
             self.input = ("edit", identifier)
             await self.answer(update, "Отправьте новый текст письма до 1200 символов.")
+            return
+        if kind == "reconcile":
+            try:
+                found = await self.scheduler.browser.reconcile(identifier)
+            except ServiceError as exc:
+                await self.answer(update, str(exc))
+                return
+            if not found:
+                await self.answer(
+                    update, "HH пока не показывает отправку. Повторный отклик не отправлен."
+                )
+            await self.card(update, identifier)
+            return
+        if kind in {"confirm", "reported"} and status == "unknown" and row["sent_day"]:
+            await self.card(update, identifier)
             return
         if kind == "confirm" and status in {"approved", "unknown", "questions"}:
             await self.answer(
@@ -685,7 +855,9 @@ class TelegramUI:
             )
         if status in {"draft", "approved"}:
             rows.append([button("Отложить", f"defer:{identifier}")])
-        if status in {"approved", "unknown", "questions"}:
+        if status == "unknown" and row["sent_day"]:
+            rows.append([button("Проверить результат на HH", f"reconcile:{identifier}")])
+        elif status in {"approved", "unknown", "questions"}:
             rows.append([button("Отметить отправку", f"confirm:{identifier}")])
         if status == "approved":
             rows.append(

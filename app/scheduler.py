@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from datetime import datetime
 
+from app.browser_workflow import BrowserWorkflow
 from app.diagnostics import resource_warning
 from app.services import Groq, ServiceError, cache_key, prepared_input
 from app.vacancies import filter_reason
@@ -20,6 +22,7 @@ class Scheduler:
         self.config = config
         self.db = db
         self.groq = Groq(client, config)
+        self.browser = BrowserWorkflow(config, db, client)
         self.task = None
         self.warning = None
 
@@ -60,6 +63,28 @@ class Scheduler:
                 "Откройте поиск HH или проверьте сохранённый автопоиск.",
                 reply_markup=search_keyboard(settings),
             )
+        if self.browser.available and self.db.get("browser_search"):
+            try:
+                await self.browser.tick(bot, settings, local_day(self.config))
+            except ServiceError as exc:
+                notice = str(exc)
+                if exc.retry:
+                    self.db.set("next_browser_operation", now + exc.retry)
+                    failures = self.db.get("browser_failures", 0) + 1
+                    self.db.set("browser_failures", failures)
+                    if failures >= 3:
+                        self.browser.pause("После трёх сбоев браузер остановлен. " + notice)
+                        await bot.send_message(self.config.owner, self.db.get("browser_notice"))
+                    elif notice != self.db.get("browser_notice") and self.db.get("browser_search"):
+                        self.db.set("browser_notice", notice)
+                        await bot.send_message(self.config.owner, notice)
+                    elif not self.db.get("browser_search"):
+                        await bot.send_message(
+                            self.config.owner, self.db.get("browser_notice") or notice
+                        )
+                else:
+                    self.browser.pause(notice)
+                    await bot.send_message(self.config.owner, notice)
         row = self.db.pending()
         if not (row and self.db.get("processing", True)):
             return
@@ -86,8 +111,13 @@ class Scheduler:
             return
         qualifies = result["score"] >= settings["score"] and bool(result["letter"].strip())
         status = "draft" if qualifies else "filtered"
-        if qualifies and settings["mode"] == "manual":
+        if qualifies and (
+            settings["mode"] == "manual"
+            or (vacancy.get("source") == "browser" and self.db.get("browser_auto_enabled"))
+        ):
             status = "approved"
+        if vacancy.get("source") == "browser":
+            result = result | {"resume_hash": hashlib.sha256(resume.encode()).hexdigest()}
         self.db.finish_analysis(row["id"], status, result, result["letter"] if qualifies else None)
         from app.telegram_ui import button, markup
 
