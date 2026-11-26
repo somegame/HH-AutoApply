@@ -11,10 +11,12 @@ from aiohttp import web
 
 from app.config import setting
 from app.database import LABELS
+from app.hh_browser import HHLoginRequired
 from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, source_vacancy_id, text
 from app.resume import checked
 from app.scheduler import local_day
 from app.services import ServiceError
+from app.superjob import SuperJob
 from app.vacancies import HH, URL_FIELDS, vacancy_id
 
 STATIC = Path(__file__).with_name("mini_web")
@@ -26,7 +28,7 @@ HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": (
         "default-src 'none'; script-src 'self' https://telegram.org; "
-        "style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+        "style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; "
         "frame-ancestors 'self' https://web.telegram.org; base-uri 'none'; form-action 'none'"
     ),
 }
@@ -65,6 +67,7 @@ class MiniApp:
         self.scheduler = scheduler
         self.browser = scheduler.browser
         self.sources = JobSources(config, self.browser, client)
+        self.superjob = SuperJob(config, db, client)
         self.bot = bot
         self.search_lock = asyncio.Lock()
         self.catalog = OrderedDict()
@@ -74,9 +77,11 @@ class MiniApp:
             [
                 web.get("/mini", self.asset),
                 web.get("/mini/{asset:app\\.js|app\\.css}", self.asset),
-                web.get("/mini/api/{command:state|search}", self.api),
+                web.get("/mini/api/{command:state|search|vacancy}", self.api),
+                web.get("/mini/oauth/superjob", self.superjob_callback),
+                web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
-                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|hh-mode}",
+                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|hh-mode|superjob}",
                     self.api,
                 ),
             ]
@@ -98,6 +103,27 @@ class MiniApp:
     def json(self, payload, status=200):
         return web.json_response(payload, status=status, headers=HEADERS)
 
+    async def superjob_callback(self, request):
+        success = await self.superjob.connect(request.query)
+        location = "/mini/oauth/finished" + ("?connected=1" if success else "")
+        raise web.HTTPSeeOther(location=location, headers=HEADERS)
+
+    async def oauth_finished(self, request):
+        status = (
+            "SuperJob подключён."
+            if request.query.get("connected") == "1"
+            else "SuperJob не подтвердил вход."
+        )
+        return web.Response(
+            text=f'<!doctype html><html lang="ru"><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<title>SuperJob</title><link rel="stylesheet" href="/mini/app.css">'
+            f'<main class="oauth-result"><h1>{status}</h1>'
+            f"<p>Вернитесь в Telegram и откройте раздел «Аккаунты».</p></main></html>",
+            content_type="text/html",
+            headers=HEADERS,
+        )
+
     async def api(self, request):
         origin = request.headers.get("Origin")
         if (origin and origin != self.config.login_public_url) or (
@@ -115,6 +141,8 @@ class MiniApp:
                 return self.json(self.state())
             if command == "search":
                 return self.json(await self.search(request.query))
+            if command == "vacancy":
+                return self.json(self.vacancy_details(request.query.get("id", "")))
             data = await request.clone(client_max_size=100_000).json()
             if not isinstance(data, dict):
                 raise ValueError("Ожидались данные в виде объекта.")
@@ -126,8 +154,19 @@ class MiniApp:
                 return self.json(await self.import_job(data))
             if command == "hh-mode":
                 return self.json(await self.change_hh_mode(data))
+            if command == "superjob":
+                action = data.get("action")
+                if action == "connect":
+                    return self.json({"url": self.superjob.start()})
+                if action == "disconnect" and data.get("confirm") is True:
+                    self.superjob.disconnect()
+                elif action == "resume":
+                    self.superjob.select(data.get("id"))
+                else:
+                    raise ValueError("Выберите действие для SuperJob.")
+                return self.json(self.state())
             if command == "connect":
-                return self.json({"url": await self.connect_hh()})
+                return self.json({"url": await self.connect_hh(fresh=data.get("fresh") is True)})
             if command == "cancel":
                 await self.browser.cancel_login()
                 self.db.set("mini_hh_progress", "")
@@ -156,6 +195,10 @@ class MiniApp:
             return self.json(self.state())
         except json.JSONDecodeError:
             return self.json({"error": "Некорректные данные."}, 400)
+        except HHLoginRequired as exc:
+            self.db.set("hh_needs_login", True)
+            self.browser.pause("Нужно снова подключить HH.")
+            return self.json({"error": str(exc)}, 400)
         except (ValueError, ServiceError) as exc:
             return self.json({"error": str(exc)}, 400)
         except OSError:
@@ -163,6 +206,11 @@ class MiniApp:
 
     def state(self):
         prefs = self.db.settings(self.config)
+        counts, today = self.db.counts(local_day(self.config))
+        resumes = self.db.get("superjob_resumes", {})
+        hh_resume = self.db.get("hh_selected_resume", {})
+        hh_needs_login = self.db.get("hh_needs_login", False)
+        hh_login_open = bool(self.browser.login_task and not self.browser.login_task.done())
         return {
             "defaults": {key: prefs[key] for key in ("query", "region", "salary")},
             "sources": self.directory(prefs),
@@ -171,22 +219,49 @@ class MiniApp:
             "consent": self.db.get("groq_consent", False),
             "groq": bool(self.config.groq_key),
             "resumes": self.db.get("hh_resume_choices", {}),
-            "hh_resume": self.db.get("hh_selected_resume", {}).get("name", ""),
-            "hh_has_session": self.browser.provider.state.is_file(),
-            "hh_progress": self.db.get("mini_hh_progress", ""),
+            "hh_resume": hh_resume.get("name", ""),
+            "hh_resume_id": hh_resume.get("id", ""),
+            "hh_has_session": self.browser.provider.state.is_file() and not hh_needs_login,
+            "hh_login_open": hh_login_open,
+            "hh_progress": "Срок входа истёк. Подключите HH заново."
+            if hh_needs_login and not hh_login_open
+            else self.db.get("mini_hh_progress", ""),
             "persistent": self.config.persistent,
-            "hh_send": self.browser.available and self.config.auto_send and self.config.persistent,
+            "hh_send": self.browser.available and self.config.persistent,
+            "hh_auto_allowed": self.browser.available
+            and self.config.auto_send
+            and self.config.persistent,
             "hh_running": bool(self.db.get("browser_search")),
             "hh_auto": bool(self.db.get("browser_auto_enabled")),
             "hh_notice": self.db.get("browser_notice", ""),
             "daily_limit": prefs["limit"],
+            "summary": {
+                "total": sum(counts.values()),
+                "sent": counts.get("sent", 0),
+                "today": today,
+            },
+            "superjob": {
+                "enabled": self.superjob.available,
+                "connected": bool(self.db.get("superjob_tokens"))
+                and not self.db.get("superjob_needs_login"),
+                "resumes": resumes,
+                "selected": self.db.get("superjob_resume_id", ""),
+                "status": self.db.get("superjob_status", ""),
+                "send": self.superjob.available and self.config.persistent,
+            },
         }
 
     def directory(self, prefs):
         modes = {
             "hh": "browser" if self.browser.available else "link",
             "trudvsem": "public",
-            "superjob": "key" if self.config.superjob_key else "needs_key",
+            "superjob": (
+                "account"
+                if self.superjob.available
+                else "key"
+                if self.config.superjob_key
+                else "needs_key"
+            ),
         }
         return [
             {
@@ -194,6 +269,8 @@ class MiniApp:
                 "name": info[0],
                 "url": source_url(key, prefs["query"], prefs),
                 "mode": modes.get(key, "link"),
+                "in_app_apply": (key == "hh" and self.browser.available)
+                or (key == "superjob" and self.superjob.available),
             }
             for key, info in SOURCES.items()
         ]
@@ -216,9 +293,33 @@ class MiniApp:
             "score": result.get("score"),
             "reason": result.get("reason") or row["error"] or "",
             "can_edit": row["status"] in EDITABLE and bool(row["letter"]),
-            "can_send": site in {"browser", "mini_hh"}
+            "can_send": site in {"browser", "mini_hh", "superjob"}
             and row["status"] in {"draft", "approved"}
             and bool(row["letter"]),
+        }
+
+    def vacancy_details(self, identifier):
+        if not 1 <= len(identifier) <= 55:
+            raise ValueError("Выберите вакансию.")
+        row = self.db.vacancy(identifier)
+        entry = self.catalog.get(identifier)
+        if row:
+            detail = json.loads(row["details"])
+        elif entry and time.monotonic() - entry[0] <= 1800:
+            detail = entry[1]
+        else:
+            raise ServiceError("Вакансия устарела. Обновите поиск.")
+        return {
+            key: detail.get(key, "")
+            for key in (
+                "title",
+                "company",
+                "region",
+                "salary",
+                "description",
+                "experience",
+                "format",
+            )
         }
 
     async def search(self, query):
@@ -236,6 +337,9 @@ class MiniApp:
         if self.search_lock.locked():
             raise ServiceError("Поиск уже выполняется.")
         keys = SEARCH_SOURCES if source == "all" else (source,)
+        if query.get("apply_only") == "true":
+            applicable = {item["id"] for item in self.directory(prefs) if item["in_app_apply"]}
+            keys = tuple(key for key in keys if key in applicable)
         async with self.search_lock:
             results = await asyncio.gather(
                 *(self.sources.search(prefs, key) for key in keys), return_exceptions=True
@@ -284,7 +388,7 @@ class MiniApp:
         self.db.set_many(values)
         return self.state()
 
-    async def connect_hh(self):
+    async def connect_hh(self, *, fresh=False):
         if not self.browser.available:
             raise ServiceError("На сервере не включён Chromium. Можно открыть HH на телефоне.")
 
@@ -292,9 +396,15 @@ class MiniApp:
             if isinstance(result, ServiceError):
                 self.db.set("mini_hh_progress", str(result))
             else:
-                self.db.set("mini_hh_progress", "Вход подтверждён. Выберите резюме.")
+                selected = self.db.get("hh_selected_resume", {})
+                self.db.set(
+                    "mini_hh_progress",
+                    "Резюме привязано к профилю."
+                    if selected
+                    else "Вход подтверждён. Выберите резюме.",
+                )
 
-        url = await self.browser.start_login(notify)
+        url = await self.browser.start_login(notify, in_mini=True, fresh=fresh)
         self.db.set("mini_hh_progress", "Окно входа открыто.")
         return url
 
@@ -397,7 +507,11 @@ class MiniApp:
             if status != "ok":
                 raise ServiceError("Этот статус уже изменился. Обновите список.")
         elif action == "send" and row and data.get("confirm") is True:
-            await self.browser.submit_selected(self.bot, row, local_day(self.config))
+            day = local_day(self.config)
+            if json.loads(row["details"]).get("source") == "superjob":
+                await self.superjob.apply(row, day, self.db.settings(self.config)["limit"])
+            else:
+                await self.browser.submit_selected(self.bot, row, day)
         elif action == "edit" and row and row["status"] in EDITABLE and row["letter"]:
             letter = data.get("letter")
             if not isinstance(letter, str) or not 1 <= len(letter.strip()) <= 1200:

@@ -145,8 +145,8 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
     async def session():
         yield "session", None
 
-    async def resumes(page):
-        return {RESUME: "Финансовый менеджер"}
+    async def verify(page, identifier):
+        assert identifier == RESUME
 
     async def apply(page, vacancy_id, resume_id, letter, reserve):
         assert resume_id == RESUME
@@ -160,7 +160,7 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
     async def run():
         flow = BrowserWorkflow(config, db)
         monkeypatch.setattr(flow.provider, "session", session)
-        monkeypatch.setattr(hh_browser, "authorized_resumes", resumes)
+        monkeypatch.setattr(hh_browser, "verify_resume", verify)
         monkeypatch.setattr(hh_browser, "apply", apply)
         flow.start_search(send=True)
         await flow.tick(SimpleNamespace(send_message=message), config.defaults, "2026-11-26")

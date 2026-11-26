@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 import httpx
 import pytest
@@ -85,9 +85,7 @@ def test_stop_cancels_confirmed_send_before_reservation(mini_config, monkeypatch
         "Сопроводительное письмо",
     )
     monkeypatch.setattr(workflow, "require_browser", lambda: None)
-    monkeypatch.setattr(
-        hh_browser, "authorized_resumes", AsyncMock(return_value={selected["id"]: "Резюме"})
-    )
+    monkeypatch.setattr(hh_browser, "verify_resume", AsyncMock())
 
     @asynccontextmanager
     async def session(_):
@@ -277,13 +275,110 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     await page.goto(PUBLIC_URL + "/mini")
                     await page.get_by_role("button", name="Найти", exact=False).click()
                     await page.get_by_role("heading", name="Финансовый менеджер").wait_for()
-                    await page.get_by_role("button", name="Подготовить отклик").click()
+                    await page.get_by_role("button", name="Описание").click()
+                    await page.get_by_text("Работа с бюджетами", exact=False).wait_for()
+                    await page.get_by_role("button", name="Закрыть", exact=True).click()
+                    await page.get_by_role("button", name="Сохранить вакансию", exact=True).click()
                     await page.get_by_text("Ожидает анализа").wait_for()
-                    await page.get_by_role("button", name="Подключения").click()
+                    await (
+                        page.get_by_role("navigation")
+                        .get_by_role("button", name="Аккаунты")
+                        .click()
+                    )
                     await page.get_by_role("heading", name="Авито Работа").wait_for()
+                    await page.set_viewport_size({"width": 320, "height": 680})
+                    assert await page.evaluate("document.documentElement.scrollWidth") == 320
                     await browser.close()
             finally:
                 await scheduler.shutdown()
+                await view.shutdown()
+
+    asyncio.run(run())
+
+
+def test_superjob_authorization_and_real_status_in_the_journal(mini_config):
+    config = replace(mini_config, superjob_client_id="42", persistent=True)
+    db = Database(config.data_dir)
+    requests = []
+    token = "synthetic-access"
+
+    def provider(request):
+        path = request.url.path
+        if path.endswith("/access_token/"):
+            assert request.method == "POST"
+            assert dict(parse_qsl(request.content.decode())) == {
+                "client_id": "42",
+                "client_secret": "fake",
+                "redirect_uri": PUBLIC_URL + "/mini/oauth/superjob",
+                "code": "synthetic-code",
+            }
+            return httpx.Response(
+                200, json={"access_token": token, "refresh_token": "synthetic-refresh"}
+            )
+        assert request.headers["Authorization"] == "Bearer " + token
+        assert request.headers["X-Api-App-Id"] == "fake"
+        if path == "/1.0/user_cvs/":
+            return httpx.Response(200, json={"objects": [{"id": 37, "profession": "Аналитик"}]})
+        assert path == "/2.0/send_cv_on_vacancy/"
+        payload = dict(parse_qsl(request.content.decode()))
+        requests.append(payload)
+        if payload["id_vacancy"] == "71":
+            raise httpx.ReadTimeout("synthetic timeout")
+        return httpx.Response(200, json={"result": True})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as sources:
+            scheduler = Scheduler(config, db, sources)
+            view = scheduler.browser.view
+            view.mini_app = MiniApp(config, db, scheduler, sources, SimpleNamespace())
+            await view.start()
+            try:
+                port = view.runner.addresses[0][1]
+                headers = {"Authorization": "tma " + signed(int(time.time())), "Origin": PUBLIC_URL}
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    connect = await client.post(
+                        "/mini/api/superjob", headers=headers, json={"action": "connect"}
+                    )
+                    query = parse_qs(urlsplit(connect.json()["url"]).query)
+                    invalid = await client.get(
+                        "/mini/oauth/superjob?state=invalid&code=synthetic-code"
+                    )
+                    assert invalid.headers["Location"] == "/mini/oauth/finished"
+                    auth_query = {"state": query["state"][0], "code": "synthetic-code"}
+                    callback = await client.get("/mini/oauth/superjob", params=auth_query)
+                    assert callback.headers["Location"] == "/mini/oauth/finished?connected=1"
+                    assert (await client.get("/mini/oauth/superjob", params=auth_query)).headers[
+                        "Location"
+                    ] == "/mini/oauth/finished"
+                    profile = await client.get("/mini/api/state", headers=headers)
+                    assert token not in profile.text
+                    assert profile.json()["superjob"]["selected"] == "37"
+
+                    for vacancy, expected in (("70", "sent"), ("71", "unknown")):
+                        identifier = "superjob:" + vacancy
+                        details = dict.fromkeys(URL_FIELDS, "")
+                        details.update(
+                            title="Аналитик",
+                            source="superjob",
+                            url=f"https://www.superjob.ru/vakansii/analitik-{vacancy}.html",
+                        )
+                        db.add(identifier, details)
+                        db.finish_analysis(identifier, "draft", {"score": 90}, "Письмо аналитика")
+                        action = {"id": identifier, "action": "send", "confirm": False}
+                        assert (
+                            await client.post("/mini/api/job", headers=headers, json=action)
+                        ).status_code == 400
+                        action["confirm"] = True
+                        result = await client.post("/mini/api/job", headers=headers, json=action)
+                        assert result.json()["job"]["status"] == expected
+                        assert (
+                            await client.post("/mini/api/job", headers=headers, json=action)
+                        ).status_code == 400
+                    assert requests == [
+                        {"id_vacancy": number, "id_cv": "37", "comment": "Письмо аналитика"}
+                        for number in ("70", "71")
+                    ]
+            finally:
                 await view.shutdown()
 
     asyncio.run(run())

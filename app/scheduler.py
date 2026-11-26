@@ -7,6 +7,7 @@ from datetime import datetime
 
 from app.browser_workflow import BrowserWorkflow
 from app.diagnostics import resource_warning
+from app.hh_browser import HHLoginRequired
 from app.services import Groq, ServiceError, cache_key, prepared_input
 from app.vacancies import filter_reason
 
@@ -68,6 +69,8 @@ class Scheduler:
                 await self.browser.tick(bot, settings, local_day(self.config))
             except ServiceError as exc:
                 notice = str(exc)
+                if isinstance(exc, HHLoginRequired):
+                    self.db.set("hh_needs_login", True)
                 if exc.retry:
                     self.db.set("next_browser_operation", now + exc.retry)
                     failures = self.db.get("browser_failures", 0) + 1

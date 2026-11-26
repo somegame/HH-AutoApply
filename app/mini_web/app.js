@@ -7,16 +7,18 @@ const notices = byId("notices");
 let state;
 let selectedTab = "search";
 let selectedFilter = "all";
-let pendingLink = "";
+let pendingSuperjob = "";
+let finishedHH = false;
 let profileDirty = false;
 let searches = [];
 
 const modes = {
-  browser: "Поиск в приложении",
-  public: "Открытый каталог",
-  key: "Поиск по API",
-  needs_key: "Для поиска здесь нужен ключ",
-  link: "Поиск на сайте",
+  browser: "Поиск и отклики",
+  account: "Поиск и отклики",
+  public: "Только поиск",
+  key: "Поиск подключён",
+  needs_key: "Требуется настройка",
+  link: "Нет подключения",
 };
 const sent = new Set(["sent", "reported", "duplicate"]);
 
@@ -30,6 +32,11 @@ function el(tag, value, css) {
 function showError(message = "") {
   byId("error").textContent = message;
   byId("error").hidden = !message;
+}
+
+function showFeedback(message = "") {
+  byId("feedback").textContent = message;
+  byId("feedback").hidden = !message;
 }
 
 function external(url) {
@@ -56,6 +63,7 @@ function action(label, fn, primary = false) {
   button.type = "button";
   button.addEventListener("click", async () => {
     showError();
+    showFeedback();
     button.disabled = true;
     try {
       await fn();
@@ -77,6 +85,7 @@ function confirmAction(message) {
 
 function changeTab(tab) {
   showError();
+  showFeedback();
   selectedTab = tab;
   for (const button of document.querySelectorAll("#navigation button")) {
     const active = button.dataset.tab === tab;
@@ -92,11 +101,35 @@ function sourceName(key) {
   return state.sources.find(source => source.id === key)?.name || "Ссылка";
 }
 
+function statusClass(status) {
+  if (status === "sent" || status === "duplicate") return "status good";
+  return "status" + (["unknown", "error", "questions"].includes(status) ? " attention" : "");
+}
+
+function canSend(job) {
+  if (job.source === "hh") return state.hh_send && state.hh_has_session && state.hh_resume && state.consent && state.groq;
+  if (job.source === "superjob") return state.superjob.send && state.superjob.connected && state.superjob.selected;
+  return false;
+}
+
+async function showVacancy(job) {
+  const detail = await api("vacancy?" + new URLSearchParams({ id: job.id }));
+  byId("job-dialog-title").textContent = detail.title;
+  const body = byId("job-description-body");
+  body.replaceChildren(
+    el("p", [detail.company, detail.region, detail.salary].filter(Boolean).join(" / "), "muted"),
+    el("p", detail.description || "В карточке нет подробного описания.")
+  );
+  if (job.url) body.append(action("Карточка на сайте", () => external(job.url)));
+  byId("job-dialog").showModal();
+}
+
 function jobCard(job, history) {
   const card = el("article", "", "card");
+  card.dataset.jobId = job.id;
   const header = el("div", "", "card-header");
   header.append(el("span", sourceName(job.source), "chip"));
-  if (job.label) header.append(el("span", job.label, "muted"));
+  if (job.label) header.append(el("span", job.label, statusClass(job.status)));
   card.append(header, el("h3", job.title), el("p", [job.company, job.region].filter(Boolean).join(" · "), "muted"),
     el("p", job.salary || "Зарплата не указана", "salary"));
   if (Number.isFinite(job.score)) card.append(el("p", "Соответствие резюме " + job.score + "%", "muted"));
@@ -120,8 +153,9 @@ function jobCard(job, history) {
     }
   }
   const actions = el("div", "", "actions");
+  const provider = state.sources.find(source => source.id === job.source);
   if (!history) {
-    actions.append(action(job.saved ? "К откликам" : "Подготовить отклик", async () => {
+    actions.append(action(job.saved ? "К откликам" : provider?.in_app_apply ? "Подготовить отклик" : "Сохранить вакансию", async () => {
       if (!job.saved) {
         await api("job", { id: job.id, action: "prepare" });
         job.saved = true;
@@ -129,35 +163,42 @@ function jobCard(job, history) {
       }
       changeTab("jobs");
     }, true));
-  } else if (job.can_send && state.hh_send && state.hh_resume) {
-    actions.append(action("Отправить через HH", async () => {
-      if (await confirmAction("Отправить это резюме и сопроводительное работодателю?")) {
-        await api("job", { id: job.id, action: "send", confirm: true });
-        await refresh();
+    if (!provider?.in_app_apply) card.append(el("p", "Площадка доступна для поиска. Отправка здесь не подключена.", "muted"));
+  } else if (job.can_send && canSend(job)) {
+    const button = action("Отправить отклик", async () => {
+      if (await confirmAction("Отправить резюме и письмо работодателю через " + sourceName(job.source) + "?")) {
+        button.textContent = "Отправляю…";
+        try {
+          const result = await api("job", { id: job.id, action: "send", confirm: true });
+          await refresh();
+          if (result.job.status === "sent" || result.job.status === "duplicate") showFeedback(result.job.label);
+          if (result.job.status === "unknown") showError("Площадка пока не подтвердила отправку. Статус сохранён в журнале.");
+        } catch (error) {
+          await refresh().catch(() => {});
+          throw error;
+        } finally {
+          button.textContent = "Отправить отклик";
+        }
       }
-    }, true));
+    }, true);
+    actions.append(button);
+  } else if (job.can_send && provider?.in_app_apply) {
+    actions.append(action("Проверить аккаунт", () => changeTab("connections")));
   }
   if (history && job.status === "unknown" && job.source === "hh") {
     actions.append(action("Проверить отправку", async () => {
       await api("job", { id: job.id, action: "reconcile" });
       await refresh();
+      showFeedback("Отправка подтверждена площадкой.");
     }));
   }
-  if (job.url) {
-    const title = history && job.status === "unknown" ? "Проверить на сайте" :
-      history && !sent.has(job.status) ? "Открыть для отклика" : "На сайте";
-    actions.append(action(title, () => external(job.url)));
+  if (history && job.status === "unknown" && job.source === "superjob") {
+    card.append(el("p", "SuperJob не подтвердил результат. Повторная отправка заблокирована.", "muted"));
   }
-  if (history && !sent.has(job.status) && !["sending", "unknown", "rejected"].includes(job.status)) {
-    actions.append(action("Отметить отправленным", async () => {
-      if (await confirmAction("Вы уже отправили отклик на сайте?")) {
-        await api("job", { id: job.id, action: "reported", confirm: true });
-        await refresh();
-      }
-    }));
-  }
+  actions.append(action("Описание", () => showVacancy(job)));
   if (job.letter && navigator.clipboard) actions.append(action("Скопировать письмо", async () => {
     await navigator.clipboard.writeText(job.letter);
+    showFeedback("Письмо скопировано.");
   }));
   card.append(actions);
   return card;
@@ -169,89 +210,148 @@ function renderSearch() {
 
 function renderJobs() {
   const filtered = state.jobs.filter(job => selectedFilter === "all" || (selectedFilter === "sent") === sent.has(job.status));
-  byId("jobs-count").textContent = filtered.length ? String(filtered.length) : "";
+  byId("total-count").textContent = state.summary.total;
+  byId("sent-count").textContent = state.summary.sent;
+  byId("today-count").textContent = state.summary.today + " / " + state.daily_limit;
+  const setup = byId("jobs-setup");
+  setup.hidden = !state.jobs.some(job => job.status === "queued") || Boolean(state.resume && state.consent && state.groq);
+  setup.replaceChildren(
+    el("span", "Для писем нужен профиль и согласие на анализ. "),
+    action("Открыть профиль", () => changeTab("connections"))
+  );
   if (!filtered.length) {
-    byId("jobs").replaceChildren(el("p", selectedFilter === "sent" ? "Отправленных откликов пока нет." : "Подготовьте отклик из результатов поиска.", "notice muted"));
+    byId("jobs").replaceChildren(el("p", selectedFilter === "sent" ? "Отправленных откликов пока нет." : "Подготовьте отклик из результатов поиска.", "empty"));
     return;
   }
   byId("jobs").replaceChildren(...filtered.map(job => jobCard(job, true)));
+}
+
+function resumePicker(label, resumes, active, use) {
+  const group = el("div", "", "stack");
+  const chosen = document.createElement("select");
+  chosen.setAttribute("aria-label", label);
+  for (const [id, title] of Object.entries(resumes)) chosen.append(new Option(title, id));
+  if (active) chosen.value = active;
+  group.append(chosen, action("Использовать резюме", () => use(chosen.value)));
+  return group;
+}
+
+async function openHH(fresh = false) {
+  const result = await api("connect", { fresh });
+  finishedHH = false;
+  byId("hh-frame").src = result.url;
+  byId("hh-dialog").showModal();
+  await refresh();
+}
+
+function renderHH(card, operations) {
+  const ready = state.hh_has_session && state.hh_resume;
+  if (ready) card.append(el("p", state.hh_resume, "resume-name"));
+  if (state.hh_progress && !ready) card.append(el("p", state.hh_progress, "muted"));
+  if (state.hh_running) {
+    card.append(el("p", state.hh_auto ? "Автоотклики включены" : "Фоновый поиск включён", "muted"));
+  } else if (state.hh_notice && ready && !state.hh_login_open) {
+    card.append(el("p", state.hh_notice, "muted"));
+  }
+  if (!state.hh_login_open) {
+    if (!ready) operations.append(action("Подключить HH", () => openHH(), true));
+    if (state.hh_has_session) {
+      operations.append(action("Сменить аккаунт", () => openHH(true)));
+      operations.append(action("Отключить", async () => {
+        if (await confirmAction("Закрыть сохранённую сессию HH?")) {
+          await api("disconnect", { confirm: true });
+          await refresh();
+        }
+      }));
+    }
+  } else if (!byId("hh-dialog").open) {
+    operations.append(action("Закрыть текущий вход", async () => {
+      await api("cancel", {});
+      await refresh();
+    }));
+  }
+  if (state.hh_has_session && !state.hh_login_open && Object.keys(state.resumes).length && (!ready || Object.keys(state.resumes).length > 1)) {
+    card.append(resumePicker("Выберите резюме HH", state.resumes, state.hh_resume_id, async id => {
+      await api("resume", { id });
+      profileDirty = false;
+      await refresh();
+    }));
+  }
+  if (ready && state.consent && state.groq && !state.hh_login_open) {
+    if (!state.hh_running) operations.append(action("Включить фоновый поиск", async () => {
+      await api("hh-mode", { mode: "search" });
+      await refresh();
+    }));
+    if (state.hh_auto_allowed && !state.hh_auto) operations.append(action("Включить автоотклики", async () => {
+      const message = "Разрешить отправлять резюме и письма работодателям HH? Лимит на день: " + state.daily_limit;
+      if (await confirmAction(message)) {
+        await api("hh-mode", { mode: "auto", confirm: true });
+        await refresh();
+      }
+    }));
+  } else if (ready && !state.consent) {
+    operations.append(action("Настроить письма", () => byId("profile-form").scrollIntoView({ block: "start" })));
+  }
+  if (state.hh_running) operations.append(action("Остановить поиск", async () => {
+    await api("hh-mode", { mode: "stop" });
+    await refresh();
+  }));
+}
+
+function renderSuperjob(card, operations) {
+  const account = state.superjob;
+  if (!account.enabled) {
+    card.append(el("p", "Для входа нужен зарегистрированный ключ и ID приложения SuperJob.", "muted"));
+    return;
+  }
+  if (account.status) card.append(el("p", account.status, "muted"));
+  if (pendingSuperjob && !account.status.startsWith("Авторизация открыта")) pendingSuperjob = "";
+  if (pendingSuperjob) operations.append(action("Войти на SuperJob", () => external(pendingSuperjob), true));
+  operations.append(action(account.connected ? "Подключить заново" : pendingSuperjob ? "Создать новую ссылку" : "Подключить SuperJob", async () => {
+    pendingSuperjob = (await api("superjob", { action: "connect" })).url;
+    await refresh();
+  }, !pendingSuperjob));
+  if (account.connected) {
+    if (account.selected) card.append(el("p", account.resumes[account.selected], "resume-name"));
+    if (Object.keys(account.resumes).length && (!account.selected || Object.keys(account.resumes).length > 1)) {
+      card.append(resumePicker("Выберите резюме SuperJob", account.resumes, account.selected, async id => {
+        await api("superjob", { action: "resume", id });
+        await refresh();
+      }));
+    }
+    operations.append(action("Отключить", async () => {
+      if (await confirmAction("Отключить аккаунт SuperJob?")) {
+        await api("superjob", { action: "disconnect", confirm: true });
+        pendingSuperjob = "";
+        await refresh();
+      }
+    }));
+  }
 }
 
 function renderConnections() {
   const cards = [];
   for (const source of state.sources) {
     const card = el("article", "", "card");
-    card.append(el("h3", source.name), el("p", modes[source.mode], "muted"));
+    const head = el("div", "", "card-header");
+    const linked = (source.id === "hh" && state.hh_has_session && state.hh_resume) ||
+      (source.id === "superjob" && state.superjob.connected && !state.superjob.status.startsWith("Нужно снова"));
+    head.append(el("h3", source.name), el("span", linked ? "Подключён" : modes[source.mode], linked ? "status good" : "status"));
+    card.append(head);
     const operations = el("div", "", "actions");
-    operations.append(action("Открыть сайт", () => external(source.url)));
-    if (source.id === "hh" && source.mode === "browser") {
-      const note = state.hh_resume ? "Выбрано резюме " + state.hh_resume : state.hh_progress;
-      if (note) card.append(el("p", note, "muted"));
-      if (state.hh_running) {
-        card.append(el("p", state.hh_auto ? "Автоотклики включены" : "Фоновый поиск включён", "muted"));
-      }
-      if (state.hh_notice) card.append(el("p", state.hh_notice, "muted"));
-      if (pendingLink && state.hh_progress !== "Окно входа открыто.") pendingLink = "";
-      operations.append(pendingLink
-        ? action("Открыть вход HH", () => external(pendingLink), true)
-        : action("Подключить HH", async () => {
-            pendingLink = (await api("connect", {})).url;
-            await refresh();
-          }, true)
-      );
-      if (state.hh_has_session && !pendingLink) {
-        operations.append(action("Отключить HH", async () => {
-          if (await confirmAction("Закрыть сохранённую сессию HH на Bothost?")) {
-            await api("disconnect", { confirm: true });
-            await refresh();
-          }
-        }));
-      }
-      if (pendingLink || state.hh_progress === "Окно входа открыто.") {
-        operations.append(action("Закрыть окно входа", async () => {
-          await api("cancel", {});
-          pendingLink = "";
-          await refresh();
-        }));
-      }
-      if (Object.keys(state.resumes).length) {
-        const chosen = document.createElement("select");
-        chosen.setAttribute("aria-label", "Выберите резюме HH");
-        for (const [id, title] of Object.entries(state.resumes)) chosen.append(new Option(title, id));
-        card.append(chosen, action("Использовать резюме", async () => {
-          await api("resume", { id: chosen.value });
-          profileDirty = false;
-          await refresh();
-          byId("profile-form").scrollIntoView({ block: "start" });
-        }));
-      }
-      if (state.hh_has_session && state.hh_resume && state.consent && state.groq) {
-        if (!state.hh_running) operations.append(action("Включить фоновый поиск", async () => {
-          await api("hh-mode", { mode: "search" });
-          await refresh();
-        }));
-        if (state.hh_send && !state.hh_auto) operations.append(action("Включить автоотклики", async () => {
-          const message = "Разрешить отправлять резюме и письма работодателям HH? Лимит на день: " + state.daily_limit;
-          if (await confirmAction(message)) {
-            await api("hh-mode", { mode: "auto", confirm: true });
-            await refresh();
-          }
-        }));
-      }
-      if (state.hh_running) operations.append(action("Остановить поиск и автоотклики", async () => {
-        await api("hh-mode", { mode: "stop" });
-        await refresh();
-      }));
-    } else if (source.id === "superjob" && source.mode === "needs_key") {
-      card.append(el("p", "Для поиска через API укажите SUPERJOB_API_KEY на хостинге.", "muted"));
-    }
-    card.append(operations);
+    if (source.id === "hh" && source.mode === "browser") renderHH(card, operations);
+    else if (source.id === "superjob") renderSuperjob(card, operations);
+    else card.append(el("p", source.mode === "public" ? "Вакансии доступны в поиске. Личный аккаунт здесь не подключается." :
+      "Подключение аккаунта и отправка откликов пока недоступны.", "muted"));
+    if (operations.childElementCount) card.append(operations);
     cards.push(card);
   }
   byId("connections").replaceChildren(...cards);
   byId("profile-info").textContent = [
-    state.groq ? "Groq доступен при согласии на анализ." : "Для анализа требуется ключ Groq.",
-    state.persistent ? "" : "Постоянное хранилище не подтверждено.",
+    state.hh_resume ? "Резюме HH уже в профиле." :
+      state.resume ? "Резюме сохранено." : "Подключите HH, чтобы загрузить резюме из аккаунта.",
+    !state.groq ? "Для писем нужно настроить Groq." : "",
+    !state.persistent ? "Для отправки подключите постоянное хранилище Bothost." : "",
   ].filter(Boolean).join(" ");
   if (!profileDirty) {
     byId("resume").value = state.resume;
@@ -278,6 +378,7 @@ byId("search-form").addEventListener("submit", async event => {
   showError();
   const submit = byId("search-submit");
   submit.disabled = true;
+  submit.textContent = "Ищу…";
   byId("search-status").textContent = "Ищу по выбранным источникам…";
   byId("search-status").hidden = false;
   notices.replaceChildren();
@@ -288,14 +389,13 @@ byId("search-form").addEventListener("submit", async event => {
     const result = await api("search?" + query);
     searches = result.jobs;
     renderSearch();
-    byId("result-count").textContent = String(searches.length);
+    byId("result-count").textContent = "Найдено: " + searches.length;
     byId("search-status").hidden = Boolean(searches.length);
-    if (!searches.length) byId("search-status").textContent = "По этим параметрам вакансии пока не найдены. Можно открыть поиск на источнике.";
+    if (!searches.length) byId("search-status").textContent = "Вакансии не найдены. Попробуйте изменить параметры поиска.";
     for (const notice of result.notices) {
       const node = el("div", "", "source-note");
       node.append(el("p", sourceName(notice.source) + " · " + notice.message, "muted"));
-      const source = result.sources.find(item => item.id === notice.source);
-      if (source) node.append(action("Искать на сайте", () => external(source.url)));
+      node.append(action("Аккаунты", () => changeTab("connections")));
       notices.append(node);
     }
   } catch (error) {
@@ -303,6 +403,7 @@ byId("search-form").addEventListener("submit", async event => {
     byId("search-status").textContent = "Выполните поиск повторно.";
   } finally {
     submit.disabled = false;
+    submit.textContent = "Найти";
   }
 });
 
@@ -321,7 +422,7 @@ byId("import-form").addEventListener("submit", async event => {
     }
     await refresh();
     const card = Array.from(byId("jobs").children).find(item =>
-      item.querySelector("h3")?.textContent === result.job.title);
+      item.dataset.jobId === result.job.id);
     card?.scrollIntoView({ block: "center" });
   } catch (error) {
     showError(error.message);
@@ -363,6 +464,37 @@ for (const button of document.querySelectorAll("#jobs-filters button")) {
 byId("reload").addEventListener("click", () => {
   if (auth) refresh(!state).catch(error => showError(error.message));
 });
+const hhDialog = byId("hh-dialog");
+const hhFrame = byId("hh-frame");
+byId("close-hh").addEventListener("click", () => hhDialog.close());
+byId("close-job").addEventListener("click", () => byId("job-dialog").close());
+hhDialog.addEventListener("close", async () => {
+  hhFrame.removeAttribute("src");
+  try {
+    await refresh();
+    if (state.hh_login_open && !finishedHH) {
+      await api("cancel", {});
+      await refresh();
+    }
+  } catch (error) {
+    showError(error.message);
+  }
+});
+window.addEventListener("message", event => {
+  if (event.origin !== location.origin || event.source !== hhFrame.contentWindow) return;
+  if (event.data?.hhLogin === "done") {
+    finishedHH = true;
+    hhDialog.close();
+    showFeedback("Вход в HH подтверждён.");
+  } else if (["blocked", "failed", "expired"].includes(event.data?.hhLogin)) {
+    refresh(false, true).catch(() => {});
+  }
+});
+document.addEventListener("visibilitychange", () => {
+  if (state && document.visibilityState === "visible" && selectedTab === "connections") {
+    refresh(false, true).catch(() => {});
+  }
+});
 if (auth) {
   tg.ready();
   tg.expand?.();
@@ -370,7 +502,6 @@ if (auth) {
   window.setInterval(() => {
     if (state && document.visibilityState === "visible" && selectedTab !== "search") {
       if (document.querySelector(".letter-editor[open]")) return;
-      if (selectedTab === "connections" && !pendingLink && state.hh_progress !== "Окно входа открыто.") return;
       refresh(false, true).catch(() => {});
     }
   }, 6000);

@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 from app.local_browser import public_login_url
 
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"
@@ -88,6 +88,7 @@ class Config:
     web_port: int
     auto_send: bool
     superjob_key: str = ""
+    superjob_client_id: str = ""
 
     @classmethod
     def load(cls):
@@ -167,4 +168,5 @@ class Config:
             port,
             env.get("AUTO_SEND", "false").strip().lower() in {"true", "1", "yes"},
             env.get("SUPERJOB_API_KEY", "").strip(),
+            env.get("SUPERJOB_CLIENT_ID", "").strip(),
         )
