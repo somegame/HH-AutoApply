@@ -10,3 +10,8 @@ main { max-width: 430px; margin: auto; }
 #fields input { position: absolute; box-sizing: border-box; pointer-events: auto; font: 16px system-ui, sans-serif; padding: 2px 9px; background: transparent; color: transparent; border: 1px solid transparent; border-radius: 6px; }
 #fields input:focus { outline: 2px solid #246ad3; outline-offset: -1px; background: #fff; color: #18212c; }
 [hidden] { display: none !important; }
+
+#sms-form { padding: 12px 14px; border-bottom: 1px solid #e6e8eb; }
+#sms-form label { display: block; margin-bottom: 7px; font-weight: 600; }
+.sms-controls { display: flex; gap: 8px; }
+#sms-code { flex: 1; min-width: 0; font: inherit; padding: 9px; border: 1px solid #a7afbd; border-radius: 9px; }

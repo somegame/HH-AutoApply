@@ -120,6 +120,25 @@ def test_local_login_frame_input_expiration_and_state(tmp_path):
                             "() => document.querySelector('input').value === 'phone-input'"
                         )
                         assert not urlsplit(phone.url).fragment
+                        # HH can draw the digits over an input that cannot be hit-tested.
+                        await page.set_content(
+                            "<h1>Введите код из СМС</h1>"
+                            '<div style="position:relative"><input id="otp" maxlength="4" '
+                            'inputmode="numeric" autocomplete="one-time-code">'
+                            '<span style="position:absolute;inset:0;background:white">• • • •</span></div>'
+                        )
+                        sms = phone.get_by_label("Код из SMS от HH")
+                        await sms.wait_for(state="visible", timeout=5000)
+                        assert await sms.get_attribute("inputmode") == "numeric"
+                        assert await sms.get_attribute("autocomplete") == "one-time-code"
+                        assert not await phone.locator("#check").is_visible()
+                        await sms.tap()
+                        await sms.fill("4242")
+                        await phone.get_by_role("button", name="Ввести код").tap()
+                        await page.wait_for_function(
+                            "() => document.querySelector('#otp').value === '4242'"
+                        )
+                        assert not view.check.is_set()
                         await view.revoke("done")
                         await phone.get_by_text("Вход подтверждён.", exact=False).wait_for(
                             timeout=5000
@@ -175,12 +194,14 @@ def test_failed_login_check_keeps_session_until_success(tmp_path, monkeypatch):
         workflow = BrowserWorkflow(config, db)
         monkeypatch.setattr("app.browser_workflow.resource_warning", lambda _: None)
         notified = []
+        visits = []
         active = None
         session = workflow.provider.session
 
         async def serve(route):
             path = urlsplit(route.request.url).path
             if path == "/applicant/resumes":
+                visits.append(path)
                 if "test_session=on" not in (await route.request.all_headers()).get("cookie", ""):
                     await route.fulfill(status=302, headers={"location": "/account/login"})
                 else:
@@ -188,6 +209,11 @@ def test_failed_login_check_keeps_session_until_success(tmp_path, monkeypatch):
                         body='<a href="/resume/123456789abc">Finance Manager</a>',
                         content_type="text/html",
                     )
+            elif urlsplit(route.request.url).query == "otp=1":
+                await route.fulfill(
+                    body='<h1>Введите код из СМС</h1><input autocomplete="one-time-code">',
+                    content_type="text/html",
+                )
             else:
                 await route.fulfill(body="<input autofocus>", content_type="text/html")
 
@@ -214,6 +240,13 @@ def test_failed_login_check_keeps_session_until_success(tmp_path, monkeypatch):
             assert workflow.view.secret == token
             assert workflow.view.page == active
             assert not workflow.provider.state.exists()
+            await active.goto("https://hh.ru/account/login?otp=1")
+            assert await workflow.finish_login() is None
+            async with asyncio.timeout(3):
+                while workflow.view.check.is_set():
+                    await asyncio.sleep(0.03)
+            assert len(visits) == 1
+            assert workflow.view.secret == token
             await active.context.add_cookies(
                 [{"name": "test_session", "value": "on", "domain": ".hh.ru", "path": "/"}]
             )
@@ -228,5 +261,30 @@ def test_failed_login_check_keeps_session_until_success(tmp_path, monkeypatch):
         finally:
             await workflow.cancel_login()
             await workflow.view.shutdown()
+
+    asyncio.run(run())
+
+
+def test_genuine_access_barrier_during_account_check_is_not_retried(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app import hh_browser
+    from app.browser_workflow import BrowserWorkflow
+    from app.database import Database
+
+    async def run():
+        workflow = BrowserWorkflow(SimpleNamespace(data_dir=tmp_path), Database(tmp_path))
+        monkeypatch.setattr(hh_browser, "guard", AsyncMock())
+        monkeypatch.setattr("app.browser_workflow.waiting_for_sms", AsyncMock(return_value=False))
+        verify = AsyncMock(side_effect=hh_browser.HHAccessBarrier("HH вернул HTTP 429."))
+        monkeypatch.setattr(hh_browser, "authorized_resumes", verify)
+        probe = SimpleNamespace(close=AsyncMock())
+        page = SimpleNamespace(url="https://hh.ru/", bring_to_front=AsyncMock())
+        context = SimpleNamespace(new_page=AsyncMock(return_value=probe))
+        workflow.view.check.set()
+        with pytest.raises(hh_browser.HHAccessBarrier, match="429"):
+            await workflow.wait_for_account(context, page)
+        verify.assert_awaited_once_with(probe)
+        probe.close.assert_awaited_once()
 
     asyncio.run(run())

@@ -40,6 +40,26 @@ FIELDS = """
 """
 
 
+OTP_COPY = re.compile(
+    r"код из (?:смс|sms)|введите (?:проверочный )?код|код подтверждения|verification code",
+    re.I,
+)
+OTP_INPUT = (
+    'input[autocomplete="one-time-code"], input[name="otp"], '
+    'input[name="verificationCode"], input[data-qa*="otp" i], '
+    '[data-qa*="otp" i] input, input[data-qa*="verification-code" i], '
+    'input[data-qa*="pin-input" i], [data-qa*="pin-input" i] input'
+)
+EDITABLE = 'input:not([type="hidden"]):not([disabled]):not([readonly])'
+
+
+async def waiting_for_sms(page):
+    return (
+        await page.locator(OTP_INPUT).first.is_visible()
+        or await page.get_by_text(OTP_COPY, exact=False).first.is_visible()
+    )
+
+
 class LoginView:
     def __init__(self, config):
         self.config = config
@@ -204,12 +224,14 @@ class LoginView:
         try:
             await guard(page, login_allowed=True)
             fields = await page.evaluate(FIELDS)
+            sms = await waiting_for_sms(page)
         except (ServiceError, PlaywrightError):
             return web.Response(status=204, headers=headers)
         # A completed session must not publish a frame that was already in flight.
         if page is not self.page or self.status in {"done", "failed", "blocked"}:
             return web.Response(status=204, headers=HEADERS | {"X-HH-Status": self.status})
         headers["X-HH-Fields"] = json.dumps(fields, separators=(",", ":"))
+        headers["X-HH-Sms"] = "1" if sms else "0"
         return web.Response(body=image, content_type="image/jpeg", headers=headers)
 
     async def input(self, request):
@@ -260,6 +282,8 @@ class LoginView:
             await locator.fill(value, timeout=1500)
             if kind == "enter":
                 await locator.press("Enter", timeout=1500)
+        elif kind == "sms":
+            await self.enter_sms(page, event.get("text"))
         elif kind == "scroll":
             delta = event.get("delta")
             if type(delta) not in {int, float} or not -820 <= delta <= 820:
@@ -267,6 +291,53 @@ class LoginView:
             await page.mouse.move(WIDTH / 2, HEIGHT / 2)
             await page.mouse.wheel(0, delta)
         elif kind == "check":
-            self.check.set()
+            if not await waiting_for_sms(page):
+                self.check.set()
         else:
             raise web.HTTPBadRequest(headers=HEADERS)
+
+    @staticmethod
+    async def enter_sms(page, value):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4,8}", value):
+            raise web.HTTPBadRequest(headers=HEADERS)
+        if not await waiting_for_sms(page):
+            raise web.HTTPConflict(headers=HEADERS)
+        candidates = page.locator(OTP_INPUT + ', input[name="code"]').and_(page.locator(EDITABLE))
+        fields = [field for field in await candidates.all() if await field.is_visible()]
+        if not fields:
+            active = candidates.and_(page.locator("input:focus"))
+            if await active.count() == 1 and await active.is_editable():
+                await page.keyboard.press("Control+a")
+                await page.keyboard.insert_text(value)
+                return
+        if not fields:
+            focused = page.locator(
+                EDITABLE + ':focus:is([inputmode="numeric"], [inputmode="decimal"], '
+                '[type="tel"], [type="number"], [maxlength="4"], [maxlength="5"], '
+                '[maxlength="6"], [maxlength="7"], [maxlength="8"], [maxlength="1"])'
+            )
+            if await focused.count() == 1 and await focused.is_editable():
+                if not await focused.is_visible():
+                    await page.keyboard.press("Control+a")
+                    await page.keyboard.insert_text(value)
+                    return
+                fields = [focused]
+        if not fields:
+            # Some OTP widgets draw their own boxes over a single numeric input.
+            numeric = page.locator(
+                EDITABLE + ':is([inputmode="numeric"], [type="tel"], [type="number"], '
+                '[maxlength="4"], [maxlength="5"], [maxlength="6"], [maxlength="7"], [maxlength="8"])'
+            )
+            fields = [field for field in await numeric.all() if await field.is_visible()]
+        if len(fields) == 1 and await fields[0].get_attribute("maxlength") != "1":
+            width = await fields[0].get_attribute("maxlength")
+            if width and width.isascii() and width.isdigit() and int(width) != len(value):
+                raise web.HTTPUnprocessableEntity(headers=HEADERS)
+            await fields[0].fill(value, timeout=1500)
+        elif len(fields) == len(value) and all(
+            [await field.get_attribute("maxlength") == "1" for field in fields]
+        ):
+            for field, digit in zip(fields, value, strict=True):
+                await field.fill(digit, timeout=1500)
+        else:
+            raise web.HTTPUnprocessableEntity(headers=HEADERS)

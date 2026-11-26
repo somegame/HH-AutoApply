@@ -5,6 +5,9 @@ const screen = document.querySelector("#screen");
 const statusLine = document.querySelector("#status");
 const check = document.querySelector("#check");
 const fields = document.querySelector("#fields");
+const smsForm = document.querySelector("#sms-form");
+const smsCode = document.querySelector("#sms-code");
+const smsSubmit = document.querySelector("#sms-submit");
 const headers = { Authorization: `Bearer ${token}` };
 const controls = new Map();
 const pending = new Map();
@@ -18,7 +21,7 @@ let gesture;
 const closed = {
   done: "Вход подтверждён. Закройте это окно — бот пришлёт список резюме в Telegram.",
   failed: "Вход не завершился. Откройте новую ссылку в Telegram.",
-  blocked: "HH ограничил доступ или показал проверку. Сессия остановлена.",
+  blocked: "HH остановил вход. Причина будет в Telegram.",
   expired: "Ссылка истекла. Откройте новую ссылку в Telegram.",
 };
 const messages = {
@@ -35,7 +38,8 @@ function end(message) {
   fields.replaceChildren();
   if (frameUrl) URL.revokeObjectURL(frameUrl);
   screen.removeAttribute("src");
-  stage.hidden = check.hidden = true;
+  smsCode.value = "";
+  stage.hidden = check.hidden = smsForm.hidden = true;
   statusLine.textContent = message;
 }
 
@@ -49,9 +53,20 @@ function send(event) {
         body: JSON.stringify(event),
       });
       if (response.status === 401 || response.status === 403) end(closed.expired);
-      else if (!response.ok) statusLine.textContent = "Действие не принято. Коснитесь поля ещё раз.";
+      else if (event.kind === "sms") {
+        if (response.ok) {
+          smsCode.value = "";
+          statusLine.textContent = "Код введён на странице HH.";
+        } else {
+          statusLine.textContent = "HH не принял ввод. Проверьте код и повторите.";
+        }
+      } else if (!response.ok) {
+        statusLine.textContent = "Действие не принято. Коснитесь поля ещё раз.";
+      }
     } catch {
       statusLine.textContent = "Связь прервалась. Повторите действие.";
+    } finally {
+      if (event.kind === "sms") smsSubmit.disabled = false;
     }
   });
 }
@@ -128,8 +143,15 @@ async function refresh() {
         screen.src = next;
         if (frameUrl) URL.revokeObjectURL(frameUrl);
         frameUrl = next;
-        stage.hidden = check.hidden = false;
-        showFields(JSON.parse(response.headers.get("X-HH-Fields") || "[]"));
+        const sms = response.headers.get("X-HH-Sms") === "1";
+        stage.hidden = false;
+        check.hidden = sms;
+        if (sms && smsForm.hidden) {
+          smsForm.hidden = false;
+          smsForm.scrollIntoView({ block: "nearest" });
+        } else if (!sms) smsForm.hidden = true;
+        if (!sms) smsCode.value = "";
+        showFields(sms ? [] : JSON.parse(response.headers.get("X-HH-Fields") || "[]"));
       }
       await new Promise(resolve => setTimeout(resolve, 100));
     } catch {
@@ -165,6 +187,15 @@ screen.addEventListener("wheel", event => {
 check.addEventListener("click", () => {
   flush();
   send({ kind: "check" });
+});
+smsCode.addEventListener("input", () => {
+  smsCode.value = smsCode.value.replace(/[^0-9]/g, "").slice(0, 8);
+});
+smsForm.addEventListener("submit", event => {
+  event.preventDefault();
+  if (ended || smsSubmit.disabled || !/^[0-9]{4,8}$/.test(smsCode.value)) return;
+  smsSubmit.disabled = true;
+  send({ kind: "sms", text: smsCode.value });
 });
 if (ended) end(closed.expired);
 else refresh();

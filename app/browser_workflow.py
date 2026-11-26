@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from app import hh_browser as hh
 from app.diagnostics import resource_warning
 from app.local_browser import LocalBrowser
-from app.login_view import SESSION_SECONDS, LoginView
+from app.login_view import SESSION_SECONDS, LoginView, waiting_for_sms
 from app.services import ServiceError, clean_text
 from app.vacancies import filter_reason, search_links, vacancy_id
 
@@ -104,6 +104,8 @@ class BrowserWorkflow:
                 requested = False
             self.view.check.clear()
             await hh.guard(page, login_allowed=True)
+            if await waiting_for_sms(page):
+                continue
             path = urlsplit(page.url).path
             login_path = any(part in path for part in ("/login", "/oauth", "/auth", "/account"))
             if not requested and (login_path or page.url == last_checked):
@@ -113,7 +115,9 @@ class BrowserWorkflow:
             probe = await context.new_page()
             try:
                 return await hh.authorized_resumes(probe)
-            except hh.HHLoginRequired:
+            except hh.HHAccessBarrier:
+                raise
+            except hh.HHAttention:
                 self.view.change_status("retry")
             finally:
                 await probe.close()
