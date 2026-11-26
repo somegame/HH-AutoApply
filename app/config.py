@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
-VERSION = "5.0.2"
+VERSION = "5.1.0"
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"
@@ -81,6 +81,9 @@ class Config:
     zone: ZoneInfo
     defaults: dict
     log_level: str
+    browser_engine: str
+    browser_month_seconds: int
+    auto_send: bool
 
     @classmethod
     def load(cls):
@@ -130,8 +133,15 @@ class Config:
                 defaults[key] = setting(key, env.get(name, fallback))
             except ValueError as exc:
                 raise ValueError(f"{name}. {exc}") from None
-        if env.get("AUTO_SEND", "false").lower() not in {"false", "0", "no", ""}:
-            raise ValueError("Укажите AUTO_SEND=false. Отклики отправляются вручную в HH.")
+        engine = env.get("BROWSER_ENGINE", "manual").strip().lower()
+        if engine not in {"manual", "browserbase"}:
+            raise ValueError("BROWSER_ENGINE должен быть manual или browserbase.")
+        try:
+            budget = int(env.get("BROWSER_MONTH_SECONDS", "3600"))
+        except ValueError:
+            raise ValueError("BROWSER_MONTH_SECONDS задаётся целым числом секунд.") from None
+        if not 240 <= budget <= 3600:
+            raise ValueError("BROWSER_MONTH_SECONDS должен быть от 240 до 3600.")
         return cls(
             token,
             int(owner),
@@ -143,4 +153,7 @@ class Config:
             zone,
             defaults,
             env.get("LOG_LEVEL", "INFO").upper(),
+            engine,
+            budget,
+            env.get("AUTO_SEND", "false").strip().lower() in {"true", "1", "yes"},
         )
