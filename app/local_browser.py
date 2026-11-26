@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -93,8 +94,12 @@ class LocalBrowser:
 
 
 def public_login_url(value):
+    value = value.strip()
     if not value:
         return ""
+    label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    if re.fullmatch(rf"(?:{label}\.)+{label}", value):
+        value = f"https://{value}"
     try:
         parsed = urlsplit(value)
         hostname = parsed.hostname
@@ -110,4 +115,6 @@ def public_login_url(value):
             return f"https://{hostname}"
     except ValueError:
         pass
-    raise ValueError("LOGIN_PUBLIC_URL должен быть HTTPS-адресом бота без пути и параметров.")
+    raise ValueError(
+        "LOGIN_PUBLIC_URL должен содержать домен бота или HTTPS-адрес без пути и параметров."
+    )

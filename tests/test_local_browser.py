@@ -13,12 +13,26 @@ from app.login_view import LoginView
 
 
 @pytest.mark.parametrize(
-    "value", ["http://host.test", "https://u:p@host.test", "https://host.test/path"]
+    "value",
+    [
+        "http://host.test",
+        "https://u:p@host.test",
+        "https://host.test/path",
+        "host.test/path",
+        "host.test?param=x",
+        "host.test:3000",
+    ],
 )
 def test_public_login_requires_https_origin(value):
     with pytest.raises(ValueError, match="HTTPS"):
         public_login_url(value)
-    assert public_login_url("https://bot.example.test/") == "https://bot.example.test"
+
+
+@pytest.mark.parametrize(
+    "value", ["bot.example.test", "  BoT.example.test ", "https://bot.example.test/"]
+)
+def test_public_login_accepts_panel_domain_or_full_url(value):
+    assert public_login_url(value) == "https://bot.example.test"
 
 
 def test_local_login_frame_input_expiration_and_state(tmp_path):

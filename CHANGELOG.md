@@ -1,5 +1,9 @@
 # История изменений
 
+## 5.2.1
+
+- LOGIN_PUBLIC_URL принимает домен из панели Bothost и добавляет HTTPS.
+
 ## 5.2.0
 
 - Внешний браузер заменён на Chromium Headless Shell в контейнере Bothost.
