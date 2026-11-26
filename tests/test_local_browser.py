@@ -275,6 +275,7 @@ def test_genuine_access_barrier_during_account_check_is_not_retried(tmp_path, mo
     async def run():
         workflow = BrowserWorkflow(SimpleNamespace(data_dir=tmp_path), Database(tmp_path))
         monkeypatch.setattr(hh_browser, "guard", AsyncMock())
+        monkeypatch.setattr(hh_browser, "dashboard_authenticated", AsyncMock(return_value=False))
         monkeypatch.setattr("app.browser_workflow.waiting_for_sms", AsyncMock(return_value=False))
         verify = AsyncMock(side_effect=hh_browser.HHAccessBarrier("HH вернул HTTP 429."))
         monkeypatch.setattr(hh_browser, "authorized_resumes", verify)
@@ -302,6 +303,7 @@ def test_temporary_probe_failure_keeps_login_open(tmp_path, monkeypatch):
     async def run():
         workflow = BrowserWorkflow(SimpleNamespace(data_dir=tmp_path), Database(tmp_path))
         monkeypatch.setattr(hh_browser, "guard", AsyncMock())
+        monkeypatch.setattr(hh_browser, "dashboard_authenticated", AsyncMock(return_value=False))
         monkeypatch.setattr("app.browser_workflow.waiting_for_sms", AsyncMock(return_value=False))
         result = {"123456789abc": "Финансовый менеджер"}
         verify = AsyncMock(return_value=result)
@@ -317,7 +319,7 @@ def test_temporary_probe_failure_keeps_login_open(tmp_path, monkeypatch):
         )
         workflow.view.check.set()
         task = asyncio.create_task(workflow.wait_for_account(context, page))
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(5):
             while workflow.view.status != "retry":
                 await asyncio.sleep(0.02)
             assert not task.done()

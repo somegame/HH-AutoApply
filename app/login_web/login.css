@@ -1,7 +1,9 @@
 :root { color-scheme: light; font: 16px system-ui, sans-serif; color: #18212c; background: #fff; }
 body { margin: 0; }
-header { position: sticky; top: 0; z-index: 2; background: #fff; border-bottom: 1px solid #e6e8eb; display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; min-height: 38px; }
-button { font: inherit; border: 1px solid #d4dae2; background: #fff; color: #18212c; border-radius: 9px; padding: 7px 10px; }
+header { position: sticky; top: 0; z-index: 2; background: #fff; border-bottom: 1px solid #e6e8eb; }
+.login-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 7px 12px; min-height: 50px; }
+button { font: inherit; border: 1px solid #d4dae2; background: #fff; color: #18212c; border-radius: 9px; padding: 7px 10px; min-height: 40px; }
+button:disabled { opacity: .65; }
 main { max-width: 430px; margin: auto; }
 #status { margin: 0; padding: 8px 14px; font-size: 14px; background: #f4f6f9; }
 #stage { position: relative; touch-action: none; }

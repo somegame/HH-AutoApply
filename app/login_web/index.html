@@ -6,11 +6,13 @@
 <link rel="stylesheet" href="/hh-login.css">
 <script defer src="/hh-login.js"></script>
 <header>
-  <strong>Вход в HH</strong>
-  <button id="check" type="button" hidden>Проверить вход</button>
+  <div class="login-heading">
+    <strong>Вход в HH</strong>
+    <button id="check" type="button" hidden>Проверить вход</button>
+  </div>
+  <p id="status" role="status">Открываю страницу HH…</p>
 </header>
 <main>
-  <p id="status" role="status">Открываю страницу HH…</p>
   <form id="sms-form" hidden>
     <label for="sms-code">Код из SMS от HH</label>
     <div class="sms-controls">

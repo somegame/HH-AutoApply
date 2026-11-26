@@ -21,6 +21,9 @@ RESUME_TITLE = '[data-qa="resume-block-title"], [data-qa="resume-title"], h1'
 RESUME_EDIT = (
     '[data-qa="resume-edit"], [data-qa="resume-edit-button"], a[href^="/applicant/resume/edit"]'
 )
+DASHBOARD_PATHS = {"", "/applicant/profile"}
+DASHBOARD_METRICS = ("Просмотры", "Отклики", "Автопоиски")
+LOGIN_INPUT = '[data-qa="login-input-username"]'
 
 
 class HHAttention(ServiceError):
@@ -32,6 +35,10 @@ class HHAccessBarrier(HHAttention):
 
 
 class HHLoginRequired(HHAttention):
+    pass
+
+
+class HHResumeUnavailable(HHAttention):
     pass
 
 
@@ -70,7 +77,7 @@ async def guard(page, *, login_allowed=False):
         raise HHAccessBarrier("HH ограничил доступ. Операции остановлены.")
     if not login_allowed and (
         any(part in parsed.path for part in ("/account/login", "/login", "/oauth"))
-        or await page.locator('[data-qa="login-input-username"]').first.is_visible()
+        or await page.locator(LOGIN_INPUT).first.is_visible()
     ):
         raise HHLoginRequired("Требуется повторно войти в HH.")
 
@@ -84,13 +91,38 @@ async def open_page(page, url, *, login_allowed=False):
     await guard(page, login_allowed=login_allowed)
 
 
+async def dashboard_authenticated(page):
+    if not hh_url(page.url) or urlsplit(page.url).path.rstrip("/") not in DASHBOARD_PATHS:
+        return False
+    if await page.locator(LOGIN_INPUT).first.is_visible():
+        return False
+    for label in DASHBOARD_METRICS:
+        metric = re.compile(rf"^{label}\s+[0-9][0-9 \u00a0\u202f]*\+?$")
+        visible_value = False
+        candidates = page.get_by_text(re.compile(rf"^{label}(?:\s+[0-9][0-9 \u00a0\u202f]*\+?)?$"))
+        for index in range(min(await candidates.count(), 6)):
+            card = candidates.nth(index)
+            if not await card.is_visible():
+                continue
+            for _ in range(3):
+                if metric.fullmatch((await card.inner_text(timeout=1000)).strip()):
+                    visible_value = True
+                    break
+                card = card.locator("..")
+            if visible_value:
+                break
+        if not visible_value:
+            return False
+    return True
+
+
 async def authorized_resumes(page):
     await open_page(page, HH + "/applicant/resumes")
     owned = await owned_resume(page)
     if owned:
         return owned
     if urlsplit(page.url).path.rstrip("/") not in {"/applicant/resumes", "/applicant/resume"}:
-        raise HHLoginRequired("HH не открыл личную страницу резюме.")
+        raise HHResumeUnavailable("HH не открыл личную страницу резюме.")
     links = page.locator(f'{RESUME_LINK}, a[href*="/applicant/resumes/"]')
     try:
         await links.first.wait_for(state="visible", timeout=5000)
@@ -107,7 +139,7 @@ async def authorized_resumes(page):
         if hh_url(target) and match and name:
             items[match[1]] = name[:90]
     if not items:
-        raise HHLoginRequired("Не удалось подтвердить вход по личному списку резюме HH.")
+        raise HHResumeUnavailable("HH пока не показал список резюме.")
     return items
 
 
@@ -130,13 +162,13 @@ async def owned_resume(page):
 
 async def verify_resume(page, identifier):
     if not RESUME_ID.fullmatch(f"/resume/{identifier}"):
-        raise HHLoginRequired("Некорректный идентификатор резюме HH.")
+        raise HHResumeUnavailable("Некорректный идентификатор резюме HH.")
     if identifier not in await owned_resume(page):
         await open_page(page, f"{HH}/resume/{identifier}")
     if identifier in await owned_resume(page):
         return
     if identifier not in await authorized_resumes(page):
-        raise HHLoginRequired("Выбранное резюме отсутствует в вашем кабинете HH.")
+        raise HHResumeUnavailable("Выбранное резюме отсутствует в вашем кабинете HH.")
     await open_page(page, f"{HH}/resume/{identifier}")
 
 

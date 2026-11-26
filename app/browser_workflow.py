@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from contextlib import suppress
 from urllib.parse import urlsplit
@@ -13,6 +14,8 @@ from app.local_browser import LocalBrowser
 from app.login_view import SESSION_SECONDS, LoginView, waiting_for_sms
 from app.services import ServiceError, clean_text
 from app.vacancies import filter_reason, search_links, vacancy_id
+
+log = logging.getLogger(__name__)
 
 
 class BrowserWorkflow:
@@ -28,6 +31,15 @@ class BrowserWorkflow:
     @property
     def available(self):
         return self.config.browser_engine == "chromium"
+
+    @property
+    def account_connected(self):
+        return (
+            self.available
+            and self.provider.state.is_file()
+            and not self.db.get("hh_needs_login", False)
+            and self.db.get("hh_session_verified", bool(self.db.get("hh_resume_choices", {})))
+        )
 
     def require_browser(self):
         if not self.available:
@@ -45,7 +57,7 @@ class BrowserWorkflow:
             raise ServiceError("Окно входа уже открыто. Завершите вход или отмените его.")
         if self.lock.locked():
             raise ServiceError("Браузер занят. Повторите вход чуть позже.")
-        self.pause("Открыто новое окно входа. После проверки резюме включите нужный режим.")
+        self.pause("Открыто окно входа в HH.")
         loop = asyncio.get_running_loop()
         ready = loop.create_future()
         self.login_task = asyncio.create_task(self.login(ready, notify, in_mini, fresh))
@@ -75,10 +87,7 @@ class BrowserWorkflow:
                     async with asyncio.timeout(SESSION_SECONDS):
                         result = await self.wait_for_account(context, page)
                     await self.provider.save(context)
-                    self.db.set_many({"hh_resume_choices": result, "hh_needs_login": False})
-                    selected = self.db.get("hh_selected_resume", {})
-                    if selected and selected.get("id") not in result:
-                        self.db.set_many({"hh_selected_resume": {}, "groq_consent": False})
+                    self.remember_account(result, fresh=fresh)
                     if in_mini and len(result) == 1:
                         identifier, name = next(iter(result.items()))
                         try:
@@ -100,7 +109,8 @@ class BrowserWorkflow:
                     ready.cancel()
                 await self.view.revoke()
                 raise
-            except Exception:
+            except Exception as exc:
+                log.warning("Сбой подтверждения входа HH (%s)", type(exc).__name__)
                 result = ServiceError("Операция входа не завершилась.")
             await self.view.revoke(status if ready.done() and not ready.cancelled() else None)
             if not ready.done():
@@ -113,8 +123,17 @@ class BrowserWorkflow:
                 pass
         return result
 
+    def remember_account(self, resumes, *, fresh=False):
+        selected = self.db.get("hh_selected_resume", {})
+        values = {"hh_session_verified": True, "hh_needs_login": False, "hh_resumes_status": ""}
+        if resumes or fresh:
+            values["hh_resume_choices"] = resumes
+        if fresh or (resumes and selected and selected.get("id") not in resumes):
+            values.update(hh_selected_resume={}, groq_consent=False)
+        self.db.set_many(values)
+
     async def wait_for_account(self, context, page):
-        last_checked = None
+        last_checked, observed_url, observed_at = None, None, 0
         while True:
             try:
                 await asyncio.wait_for(self.view.check.wait(), 0.8)
@@ -128,6 +147,8 @@ class BrowserWorkflow:
             try:
                 if owned := await hh.owned_resume(page):
                     return owned
+                if await hh.dashboard_authenticated(page):
+                    return {}
             except PlaywrightError:
                 if page.is_closed():
                     raise ServiceError(
@@ -135,7 +156,15 @@ class BrowserWorkflow:
                     ) from None
             path = urlsplit(page.url).path
             login_path = any(part in path for part in ("/login", "/oauth", "/auth", "/account"))
+            if observed_url != page.url:
+                observed_url, observed_at = page.url, time.monotonic()
             if not requested and (login_path or page.url == last_checked):
+                continue
+            if (
+                not requested
+                and path.rstrip("/") in hh.DASHBOARD_PATHS
+                and time.monotonic() - observed_at < 2.5
+            ):
                 continue
             last_checked = page.url
             self.view.change_status("checking")
@@ -168,7 +197,7 @@ class BrowserWorkflow:
                 raise result
             return result
         choices = self.db.get("hh_resume_choices", {})
-        if choices:
+        if choices or self.account_connected:
             return choices
         raise ServiceError("Сначала откройте окно входа HH в боте.")
 
@@ -178,6 +207,36 @@ class BrowserWorkflow:
             await asyncio.gather(self.login_task, return_exceptions=True)
             self.login_task = None
         await self.view.revoke()
+
+    async def refresh_resumes(self):
+        self.require_browser()
+        if not self.account_connected:
+            raise ServiceError("Подключите HH, чтобы загрузить резюме.")
+        if self.lock.locked():
+            raise ServiceError("Браузер занят другой операцией.")
+        async with self.lock:
+            try:
+                async with self.provider.session(35) as (_, page):
+                    try:
+                        resumes = await hh.authorized_resumes(page)
+                    except hh.HHLoginRequired:
+                        await hh.open_page(page, hh.HH + "/", login_allowed=True)
+                        if not await hh.dashboard_authenticated(page):
+                            raise
+                        raise hh.HHResumeUnavailable(
+                            "HH не показал список резюме. Попробуйте позже."
+                        ) from None
+                self.remember_account(resumes)
+            except hh.HHAccessBarrier as exc:
+                self.pause(str(exc))
+                self.db.set("hh_resumes_status", str(exc))
+                raise
+            except hh.HHLoginRequired:
+                raise
+            except ServiceError as exc:
+                self.db.set("hh_resumes_status", str(exc))
+                raise
+        return resumes
 
     async def import_resume(self, identifier):
         self.require_browser()
@@ -205,12 +264,13 @@ class BrowserWorkflow:
                 "hh_selected_resume": {"id": identifier, "name": name},
                 "groq_consent": unchanged and self.db.get("groq_consent", False),
                 "browser_auto_enabled": False,
-                "browser_search": False,
             }
         )
 
     def readiness(self):
         self.require_browser()
+        if self.db.get("hh_needs_login", False):
+            raise ServiceError("Снова подключите HH перед отправкой откликов.")
         selected = self.db.get("hh_selected_resume", {})
         if not selected or not self.db.get("resume"):
             raise ServiceError("Войдите в HH и выберите резюме.")
@@ -219,7 +279,12 @@ class BrowserWorkflow:
         return selected
 
     def start_search(self, *, send=False):
-        self.readiness()
+        if send:
+            self.readiness()
+        else:
+            self.require_browser()
+            if not self.account_connected:
+                raise ServiceError("Подключите HH, чтобы запустить фоновый поиск.")
         if send and not (self.config.auto_send and self.config.persistent):
             raise ServiceError(
                 "Для автооткликов нужны AUTO_SEND=true и подтверждённый постоянный Volume."
@@ -235,20 +300,16 @@ class BrowserWorkflow:
             }
         )
 
-    def pause(self, notice):
+    def pause(self, notice, *, keep_search=False):
         self.pause_revision += 1
-        self.db.set_many(
-            {
-                "browser_search": False,
-                "browser_auto_enabled": False,
-                "browser_notice": notice,
-            }
-        )
+        values = {"browser_auto_enabled": False, "browser_notice": notice}
+        if not keep_search:
+            values["browser_search"] = False
+        self.db.set_many(values)
 
     async def tick(self, bot, settings, day):
         if not (self.available and self.db.get("browser_search")) or self.lock.locked():
             return
-        selected = self.readiness()
         now = int(time.time())
         due = now >= self.db.get("next_browser_search", 0)
         auto = (
@@ -266,8 +327,9 @@ class BrowserWorkflow:
             self.db.set("next_browser_search", now + settings["interval"] * 60)
         async with self.lock:
             async with self.provider.session() as (_, page):
-                await hh.verify_resume(page, selected["id"])
                 if row:
+                    selected = self.readiness()
+                    await hh.verify_resume(page, selected["id"])
                     await self.send_one(bot, page, row, selected, settings, day)
                     if self.db.get("browser_search"):
                         self.db.set_many({"browser_failures": 0, "browser_notice": ""})
@@ -277,10 +339,10 @@ class BrowserWorkflow:
                 count = await self.discover(page, settings)
                 self.db.set_many({"browser_failures": 0, "browser_notice": ""})
         if count:
-            await bot.send_message(self.config.owner, f"Новых вакансий к анализу: {count}.")
+            await bot.send_message(self.config.owner, f"Найдены новые вакансии на HH: {count}.")
 
     async def discover(self, page, settings):
-        links = list(search_links(settings))
+        links = list(search_links(settings, title_only=True))
         index = self.db.get("browser_query_offset", 0) % len(links)
         offset = self.db.get("browser_page_offset", 0)
         identifiers = await hh.search_ids(page, links[index][1])
