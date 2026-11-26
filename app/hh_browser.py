@@ -21,6 +21,10 @@ class HHAttention(ServiceError):
     pass
 
 
+class HHAccessBarrier(HHAttention):
+    """HH rejected access or requires a CAPTCHA."""
+
+
 class HHLoginRequired(HHAttention):
     pass
 
@@ -53,11 +57,11 @@ async def guard(page, *, login_allowed=False):
             'form[action*="captcha"], input[name="captcha"], [data-qa="captcha-input"]'
         ).first.is_visible()
     ):
-        raise HHAttention("HH показал CAPTCHA. Операции остановлены.")
+        raise HHAccessBarrier("HH показал CAPTCHA. Операции остановлены.")
     if await page.get_by_text(
         re.compile(r"^Доступ ограничен|^Слишком много запросов|^Вы не робот\?|^Access denied", re.I)
     ).first.is_visible():
-        raise HHAttention("HH ограничил доступ. Операции остановлены.")
+        raise HHAccessBarrier("HH ограничил доступ. Операции остановлены.")
     if not login_allowed and (
         any(part in parsed.path for part in ("/account/login", "/login", "/oauth"))
         or await page.locator('[data-qa="login-input-username"]').first.is_visible()
@@ -70,7 +74,7 @@ async def open_page(page, url, *, login_allowed=False):
         raise HHAttention("Неподдерживаемая ссылка HH.")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=12000)
     if response and response.status in {403, 429, 503}:
-        raise HHAttention(f"HH вернул HTTP {response.status}. Операции остановлены.")
+        raise HHAccessBarrier(f"HH вернул HTTP {response.status}. Операции остановлены.")
     await guard(page, login_allowed=login_allowed)
 
 

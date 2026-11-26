@@ -11,6 +11,14 @@
 </header>
 <main>
   <p id="status" role="status">Открываю страницу HH…</p>
+  <form id="sms-form" hidden>
+    <label for="sms-code">Код из SMS от HH</label>
+    <div class="sms-controls">
+      <input id="sms-code" type="text" inputmode="numeric" autocomplete="one-time-code"
+             pattern="[0-9]{4,8}" maxlength="8" required>
+      <button id="sms-submit" type="submit">Ввести код</button>
+    </div>
+  </form>
   <div id="stage" hidden>
     <img id="screen" alt="Страница HH" width="430" height="820" draggable="false">
     <div id="fields"></div>
