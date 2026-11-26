@@ -49,7 +49,6 @@ Chromium ставится при сборке, используется один
 | `OWNER_ID` | Числовой Telegram ID владельца, обязателен |
 | `GROQ_API_KEY` | Ключ Groq, обязателен для анализа |
 | `GROQ_MODEL` | Модель с поддержкой JSON object mode, по умолчанию `openai/gpt-oss-120b` |
-| `BROWSERBASE_API_KEY` | Необязательный ключ для списка проектов |
 | `SUPERJOB_API_KEY` | Необязательный ключ приложения SuperJob для поиска публичных вакансий |
 | `DATA_DIR` | Каталог SQLite, локально `./data`, на Bothost обычно `/app/data` |
 | `PERSISTENT_STORAGE` | Установите `true` после подтверждения Volume, иначе оставьте `false` |

@@ -60,6 +60,19 @@ def job_url(value, domain):
     return ""
 
 
+def source_vacancy_id(source, path):
+    if source == "trudvsem" and path.startswith("/vacancy/card/"):
+        try:
+            return f"trudvsem:{UUID(path.rstrip('/').rsplit('/', 1)[-1])}"
+        except ValueError:
+            return ""
+    if source == "superjob" and path.startswith("/vakansii/"):
+        match = re.search(r"-([0-9]{1,18})\.html/?$", path)
+        if match:
+            return f"superjob:{int(match[1])}"
+    return ""
+
+
 def details(
     source, external_id, *, url, title, company, region, low, high, currency="RUB", **fields
 ):
@@ -96,8 +109,17 @@ def trudvsem_row(item):
         return None
     region = row.get("region")
     company = row.get("company")
+    requirements = row.get("requirement")
+    education = text(requirements.get("education")) if isinstance(requirements, dict) else ""
     description = "\n".join(
-        filter(None, (text(row.get("duty"), 1600), text(row.get("requirements"), 1000)))
+        filter(
+            None,
+            (
+                text(row.get("duty"), 1600),
+                text(row.get("requirements"), 1000),
+                f"Образование — {education}" if education else "",
+            ),
+        )
     )
     return details(
         "trudvsem",

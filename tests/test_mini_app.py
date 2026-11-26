@@ -143,6 +143,13 @@ def test_search_isolated_sources_owner_actions_and_real_storage(mini_config):
                     assert (await client.get("/mini/api/state", headers=headers)).json()["jobs"][0][
                         "id"
                     ] == JOB_ID
+                    same = await client.post(
+                        "/mini/api/import",
+                        headers=headers,
+                        json={"url": data["jobs"][0]["url"], "title": data["jobs"][0]["title"]},
+                    )
+                    assert same.json()["job"]["id"] == JOB_ID
+                    assert same.json()["job"]["status"] == "reported"
                     external = {
                         "url": "https://employer.example/careers/1#details",
                         "title": "Аналитик",

@@ -11,7 +11,7 @@ from aiohttp import web
 
 from app.config import setting
 from app.database import LABELS
-from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, text
+from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, source_vacancy_id, text
 from app.resume import checked
 from app.scheduler import local_day
 from app.services import ServiceError
@@ -342,7 +342,9 @@ class MiniApp:
             ),
             "external",
         )
-        identifier = "external:" + hashlib.sha256(url.encode()).hexdigest()[:32]
+        identifier = source_vacancy_id(origin, parsed.path)
+        if not identifier:
+            identifier = "external:" + hashlib.sha256(url.encode()).hexdigest()[:32]
         try:
             identifier = vacancy_id(url)
             origin, url = "hh", f"{HH}/vacancy/{identifier}"
