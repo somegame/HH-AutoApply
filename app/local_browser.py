@@ -49,11 +49,11 @@ class LocalBrowser:
             raise ServiceError("Не удалось сохранить сессию HH. Проверьте DATA_DIR.") from None
 
     @asynccontextmanager
-    async def session(self, seconds=60, interactive=False):
+    async def session(self, seconds=60, interactive=False, guest=False):
         self.check_installation()
-        if not interactive and not self.state.is_file():
+        if not interactive and not guest and not self.state.is_file():
             raise ServiceError("Сессия HH отсутствует. Войдите из Telegram ещё раз.")
-        state = str(self.state) if self.state.is_file() else None
+        state = str(self.state) if not guest and self.state.is_file() else None
         async with async_playwright() as driver:
             try:
                 browser = await driver.chromium.launch(
@@ -79,8 +79,10 @@ class LocalBrowser:
                     page = await context.new_page()
                     page.set_default_timeout(3500)
                     yield context, page
-                    if not interactive and any(
-                        hh_domain(cookie["domain"]) for cookie in await context.cookies()
+                    if (
+                        not interactive
+                        and not guest
+                        and any(hh_domain(cookie["domain"]) for cookie in await context.cookies())
                     ):
                         await self.save(context)
             except PlaywrightError:

@@ -18,6 +18,7 @@ jobs:
       - run: python -c "import bot, app.database, app.scheduler, app.services"
       - run: ruff check .
       - run: ruff format --check .
+      - run: node --check app/mini_web/app.js
       - run: python -m pytest -q
       - name: Build container with Chromium
         if: github.event_name == 'pull_request'

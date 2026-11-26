@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f6f5fb">
+  <title>Поиск работы</title>
+  <link rel="stylesheet" href="/mini/app.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script defer src="/mini/app.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="brand-mark" aria-hidden="true">↗</div>
+    <h1>Поиск работы</h1>
+    <button class="icon-button" id="reload" type="button" aria-label="Обновить" title="Обновить">↻</button>
+  </header>
+  <main>
+    <p id="launch" class="notice" role="status">Подключаюсь к боту…</p>
+    <p id="error" class="notice notice-error" role="alert" hidden></p>
+    <section id="panel-search" hidden>
+      <form id="search-form" class="search-box">
+        <h2>Найти вакансии</h2>
+        <label for="query">Должность или навык</label>
+        <input id="query" name="query" type="search" required maxlength="120" placeholder="Например, финансовый менеджер">
+        <div class="field-row">
+          <div><label for="region">Регион</label><input id="region" name="region" required maxlength="70"></div>
+          <div><label for="salary">Зарплата от, ₽</label><input id="salary" name="salary" type="number" inputmode="numeric" min="0" max="100000000" required></div>
+        </div>
+        <label class="checkbox"><input name="hh_title_only" type="checkbox" value="true" checked> HH: искать по названию должности</label>
+        <div class="search-actions">
+          <select id="source" name="source" aria-label="Источник"><option value="all">Все доступные</option></select>
+          <button class="primary" id="search-submit" type="submit">Найти <span aria-hidden="true">↗</span></button>
+        </div>
+      </form>
+      <div class="section-title"><h2>Вакансии</h2><span id="result-count" class="muted"></span></div>
+      <p id="search-status" class="muted" role="status">Введите запрос, чтобы увидеть результаты.</p>
+      <div id="results" class="stack"></div>
+      <div id="notices" class="stack"></div>
+    </section>
+    <section id="panel-jobs" hidden>
+      <div class="section-title"><h2>Отклики</h2><span id="jobs-count" class="muted"></span></div>
+      <div id="jobs-filters" class="segmented" aria-label="Состояние откликов">
+        <button type="button" data-filter="all" aria-pressed="true">Все</button>
+        <button type="button" data-filter="draft">В работе</button>
+        <button type="button" data-filter="sent">Отправленные</button>
+      </div>
+      <div id="jobs" class="stack"></div>
+      <details class="card profile">
+        <summary>Добавить вакансию по ссылке</summary>
+        <form id="import-form" class="stack">
+          <label for="job-url">Ссылка на вакансию</label>
+          <input id="job-url" name="url" type="url" required maxlength="600" placeholder="https://…">
+          <label for="job-title">Должность</label>
+          <input id="job-title" name="title" required maxlength="180">
+          <label for="job-company">Работодатель</label>
+          <input id="job-company" name="company" maxlength="180">
+          <label for="job-description">Описание для сопроводительного</label>
+          <textarea id="job-description" name="description" maxlength="5200" rows="3"></textarea>
+          <button class="primary" type="submit">Добавить в отклики</button>
+        </form>
+      </details>
+    </section>
+    <section id="panel-connections" hidden>
+      <div class="section-title"><h2>Подключения</h2></div>
+      <div id="connections" class="stack"></div>
+      <form id="profile-form" class="card profile">
+        <h3>Профиль для сопроводительных</h3>
+        <p id="profile-info" class="muted"></p>
+        <label for="resume">Опыт и навыки</label>
+        <textarea id="resume" rows="5" maxlength="12000" placeholder="Вставьте текст резюме без контактов"></textarea>
+        <label class="checkbox"><input id="consent" type="checkbox"> Разрешаю отправлять текст в Groq для анализа</label>
+        <button class="primary" type="submit">Сохранить профиль</button>
+      </form>
+    </section>
+  </main>
+  <nav id="navigation" aria-label="Разделы" hidden>
+    <button type="button" data-tab="search" aria-current="page"><span aria-hidden="true">⌕</span>Поиск</button>
+    <button type="button" data-tab="jobs"><span aria-hidden="true">▤</span>Отклики</button>
+    <button type="button" data-tab="connections"><span aria-hidden="true">⚙</span>Подключения</button>
+  </nav>
+</body>
+</html>

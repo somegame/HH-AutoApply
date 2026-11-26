@@ -64,6 +64,7 @@ class LoginView:
     def __init__(self, config):
         self.config = config
         self.runner = None
+        self.mini_app = None
         self.page = None
         self.secret = None
         self.expires = 0
@@ -90,6 +91,8 @@ class LoginView:
                 web.post("/hh-login/input", self.input),
             ]
         )
+        if self.mini_app:
+            self.mini_app.add_routes(app)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         try:

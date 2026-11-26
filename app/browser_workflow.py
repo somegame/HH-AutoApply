@@ -2,7 +2,10 @@ import asyncio
 import hashlib
 import json
 import time
+from contextlib import suppress
 from urllib.parse import urlsplit
+
+from playwright.async_api import Error as PlaywrightError
 
 from app import hh_browser as hh
 from app.diagnostics import resource_warning
@@ -112,16 +115,24 @@ class BrowserWorkflow:
                 continue
             last_checked = page.url
             self.view.change_status("checking")
-            probe = await context.new_page()
+            probe = None
             try:
+                probe = await context.new_page()
                 return await hh.authorized_resumes(probe)
             except hh.HHAccessBarrier:
                 raise
-            except hh.HHAttention:
+            except (hh.HHAttention, PlaywrightError):
+                if page.is_closed():
+                    raise ServiceError(
+                        "Chromium закрыл вкладку HH. Откройте новое окно входа."
+                    ) from None
                 self.view.change_status("retry")
             finally:
-                await probe.close()
-                await page.bring_to_front()
+                if probe is not None:
+                    with suppress(PlaywrightError):
+                        await probe.close()
+                with suppress(PlaywrightError):
+                    await page.bring_to_front()
 
     async def finish_login(self):
         if self.login_task and not self.login_task.done():
@@ -285,31 +296,61 @@ class BrowserWorkflow:
                     return True
         return False
 
-    async def send_one(self, bot, page, row, resume, settings, day):
+    async def submit_selected(self, bot, row, day):
+        selected = self.readiness()
+        if not (self.config.auto_send and self.config.persistent):
+            raise ServiceError("Для отправки через Chromium нужны AUTO_SEND и постоянный Volume.")
+        details = json.loads(row["details"])
+        if (
+            details.get("source") not in {"browser", "mini_hh"}
+            or row["status"] not in {"draft", "approved"}
+            or not row["letter"]
+        ):
+            raise ServiceError("У этой вакансии нет готового отклика для отправки через HH.")
+        if self.lock.locked():
+            raise ServiceError("Браузер занят другой операцией.")
+        async with self.lock:
+            async with self.provider.session(45) as (_, page):
+                resumes = await hh.authorized_resumes(page)
+                if selected["id"] not in resumes:
+                    raise hh.HHLoginRequired("Выбранное резюме недоступно. Проверьте вход.")
+                await self.send_one(
+                    bot, page, row, selected, self.db.settings(self.config), day, manual=True
+                )
+
+    async def send_one(self, bot, page, row, resume, settings, day, *, manual=False):
         identifier = row["id"]
         details = json.loads(row["details"])
         result = json.loads(row["result"] or "{}")
+        allowed_states = ("draft", "approved") if manual else ("approved",)
+        effective_settings = settings | details.get("mini_filters", {})
         resume_hash = hashlib.sha256(self.db.get("resume", "").encode()).hexdigest()
         if (
-            filter_reason(details, settings)
+            filter_reason(details, effective_settings)
             or result.get("score", -1) < settings["score"]
             or result.get("resume_hash") != resume_hash
             or not row["letter"]
         ):
-            self.db.transition(identifier, ("approved",), "deferred")
+            self.db.transition(identifier, allowed_states, "deferred")
             return
         reserved = False
 
         def reserve():
             nonlocal reserved
             current = self.db.vacancy(identifier)
-            if not self.db.get("browser_auto_enabled") or current["letter"] != row["letter"]:
+            if (
+                (not manual and not self.db.get("browser_auto_enabled"))
+                or current["letter"] != row["letter"]
+                or self.db.get("hh_selected_resume") != resume
+                or hashlib.sha256(self.db.get("resume", "").encode()).hexdigest() != resume_hash
+                or not self.db.get("groq_consent")
+            ):
                 return False
             if self.db.settings(self.config) != settings:
                 return False
             reserved = (
                 self.db.transition(
-                    identifier, ("approved",), "sending", day=day, limit=settings["limit"]
+                    identifier, allowed_states, "sending", day=day, limit=settings["limit"]
                 )
                 == "ok"
             )
@@ -318,7 +359,7 @@ class BrowserWorkflow:
         try:
             result = await hh.apply(page, identifier, resume["id"], row["letter"], reserve)
         except hh.HHQuestions as exc:
-            self.db.transition(identifier, ("approved",), "questions")
+            self.db.transition(identifier, allowed_states, "questions")
             await bot.send_message(self.config.owner, f"Вакансия {identifier}. {exc}")
             return
         except BaseException:
@@ -329,7 +370,7 @@ class BrowserWorkflow:
         if reserved:
             self.db.complete_browser_application(identifier, result)
         elif result == "duplicate":
-            self.db.transition(identifier, ("approved",), "duplicate")
+            self.db.transition(identifier, allowed_states, "duplicate")
         if result in {"sent", "unknown"}:
             if result == "unknown":
                 self.pause("HH не подтвердил отправку. Проверьте результат перед возобновлением.")
