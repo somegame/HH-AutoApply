@@ -319,3 +319,40 @@ def test_pdf_text_layer():
     stream = BytesIO()
     writer.write(stream)
     assert asyncio.run(read_upload("example.pdf", stream.getvalue())) == text
+
+
+def test_iphone_login_continues_and_settings_are_grouped(config):
+    db = Database(config.data_dir)
+    ui = TelegramUI(config, db, None, None)
+    messages = []
+
+    async def reply(text, **kwargs):
+        messages.append((text, kwargs["reply_markup"].inline_keyboard))
+
+    update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply))
+
+    async def run():
+        await ui.route(update, "login")
+        text, keys = messages[-1]
+        assert "закройте браузер" in text
+        assert "finish" in {item.callback_data for row in keys for item in row}
+        await ui.route(update, "finish")
+        assert "Вы подтвердили" in messages[-1][0]
+        assert messages[-1][1][0][0].callback_data == "upload"
+        db.set("resume", PROFESSIONAL)
+        await ui.route(update, "finish")
+        assert messages[-1][1][0][0].callback_data == "resume"
+        db.set("groq_consent", True)
+        await ui.route(update, "finish")
+        assert messages[-1][1][0][0].callback_data == "search"
+
+        await ui.route(update, "settings")
+        assert all(row[0].callback_data.startswith("settings:") for row in messages[-1][1][:-1])
+        await ui.route(update, "settings:search")
+        assert "Москва" in messages[-1][0]
+        await ui.route(update, "set:region")
+        await ui.text(update, "Казань")
+        assert "Казань" in messages[-1][0]
+        assert db.settings(config)["region"] == "Казань"
+
+    asyncio.run(run())
