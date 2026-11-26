@@ -5,19 +5,15 @@
 <title>Вход в HH</title>
 <link rel="stylesheet" href="/hh-login.css">
 <script defer src="/hh-login.js"></script>
+<header>
+  <strong>Вход в HH</strong>
+  <button id="check" type="button" hidden>Проверить вход</button>
+</header>
 <main>
-  <h1>Вход в HH</h1>
-  <p>Эта страница передаёт ввод в браузер HH на Bothost. Нажмите на нужное поле на экране HH. Введите значение ниже и нажмите «Передать в поле».</p>
-  <p id="status" aria-live="polite">Открываю браузер…</p>
-  <form id="entry" autocomplete="off">
-    <input id="value" type="password" aria-label="Текст для выбранного поля" placeholder="Телефон, пароль или код" autocomplete="off" autocapitalize="off">
-    <button type="submit">Передать в поле</button>
-  </form>
-  <div class="controls">
-    <button id="up" type="button">↑ Вверх</button>
-    <button id="down" type="button">↓ Вниз</button>
+  <p id="status" role="status">Открываю страницу HH…</p>
+  <div id="stage" hidden>
+    <img id="screen" alt="Страница HH" width="430" height="820" draggable="false">
+    <div id="fields"></div>
   </div>
-  <img id="screen" alt="Экран браузера HH" width="430" height="820">
-  <p>После входа вернитесь в Telegram и нажмите «Проверить вход».</p>
 </main>
 </html>

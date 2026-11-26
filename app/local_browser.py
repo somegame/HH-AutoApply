@@ -53,7 +53,7 @@ class LocalBrowser:
         self.check_installation()
         if not interactive and not self.state.is_file():
             raise ServiceError("Сессия HH отсутствует. Войдите из Telegram ещё раз.")
-        state = str(self.state) if not interactive else None
+        state = str(self.state) if self.state.is_file() else None
         async with async_playwright() as driver:
             try:
                 browser = await driver.chromium.launch(
@@ -79,7 +79,9 @@ class LocalBrowser:
                     page = await context.new_page()
                     page.set_default_timeout(3500)
                     yield context, page
-                    if any(hh_domain(cookie["domain"]) for cookie in await context.cookies()):
+                    if not interactive and any(
+                        hh_domain(cookie["domain"]) for cookie in await context.cookies()
+                    ):
                         await self.save(context)
             except PlaywrightError:
                 raise ServiceError(

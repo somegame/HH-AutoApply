@@ -1,86 +1,170 @@
 const token = location.hash.slice(1);
 history.replaceState(null, "", location.pathname);
+const stage = document.querySelector("#stage");
 const screen = document.querySelector("#screen");
-const status = document.querySelector("#status");
-const value = document.querySelector("#value");
-let ended = !/^[A-Za-z0-9_-]{43}$/.test(token);
-let active = false;
-let frameUrl;
+const statusLine = document.querySelector("#status");
+const check = document.querySelector("#check");
+const fields = document.querySelector("#fields");
 const headers = { Authorization: `Bearer ${token}` };
+const controls = new Map();
+const pending = new Map();
+let revision = "";
+let frameUrl;
+let ended = !/^[A-Za-z0-9_-]{43}$/.test(token);
+let requests = Promise.resolve();
+let timer;
+let gesture;
 
-function handle(response) {
-  if (response.status === 401 || response.status === 403) {
-    ended = true;
-    screen.removeAttribute("src");
-    if (frameUrl) URL.revokeObjectURL(frameUrl);
-    status.textContent = "Ссылка закрыта или истекла. Вернитесь в Telegram.";
-  } else if (response.status === 409) {
-    status.textContent = "Страница HH недоступна или показала проверку. Вернитесь в Telegram.";
-  } else if (response.status === 422) {
-    status.textContent = "Сначала нажмите на поле на экране HH.";
+const closed = {
+  done: "Вход подтверждён. Закройте это окно — бот пришлёт список резюме в Telegram.",
+  failed: "Вход не завершился. Откройте новую ссылку в Telegram.",
+  blocked: "HH ограничил доступ или показал проверку. Сессия остановлена.",
+  expired: "Ссылка истекла. Откройте новую ссылку в Telegram.",
+};
+const messages = {
+  login: "Нажмите поле на странице HH и начните вводить.",
+  checking: "Проверяю вход…",
+  retry: "HH пока не подтвердил вход. Продолжайте в этом окне.",
+};
+
+function end(message) {
+  ended = true;
+  clearTimeout(timer);
+  pending.clear();
+  controls.clear();
+  fields.replaceChildren();
+  if (frameUrl) URL.revokeObjectURL(frameUrl);
+  screen.removeAttribute("src");
+  stage.hidden = check.hidden = true;
+  statusLine.textContent = message;
+}
+
+function send(event) {
+  requests = requests.then(async () => {
+    if (ended) return;
+    try {
+      const response = await fetch("/hh-login/input", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify(event),
+      });
+      if (response.status === 401 || response.status === 403) end(closed.expired);
+      else if (!response.ok) statusLine.textContent = "Действие не принято. Коснитесь поля ещё раз.";
+    } catch {
+      statusLine.textContent = "Связь прервалась. Повторите действие.";
+    }
+  });
+}
+
+function flush(except) {
+  clearTimeout(timer);
+  for (const [field, text] of pending) {
+    if (field !== except) send({ kind: "entry", field, text });
+  }
+  pending.clear();
+}
+
+function showFields(metadata) {
+  const visible = new Set();
+  for (const item of metadata) {
+    visible.add(item.id);
+    let input = controls.get(item.id);
+    if (!input) {
+      input = document.createElement("input");
+      input.type = item.type === "password" ? "password" : "text";
+      input.inputMode = item.code || item.type === "number" ? "numeric" :
+        ["email", "tel", "numeric", "decimal"].includes(item.mode) ? item.mode :
+        ["email", "tel"].includes(item.type) ? item.type : "text";
+      input.autocomplete = item.code ? "one-time-code" : "off";
+      input.autocapitalize = "off";
+      input.spellcheck = false;
+      input.setAttribute("aria-label", item.code ? "Код входа" :
+        item.type === "password" ? "Пароль" :
+        item.type === "tel" ? "Телефон" : item.type === "email" ? "Электронная почта" : "Поле HH");
+      input.addEventListener("input", () => {
+        pending.set(item.id, input.value);
+        clearTimeout(timer);
+        timer = setTimeout(flush, 160);
+      });
+      input.addEventListener("blur", () => flush());
+      input.addEventListener("keydown", event => {
+        if (event.key !== "Enter" || event.isComposing) return;
+        event.preventDefault();
+        flush(item.id);
+        send({ kind: "enter", field: item.id, text: input.value });
+        input.blur();
+      });
+      controls.set(item.id, input);
+      fields.append(input);
+    }
+    input.style.left = `${100 * item.x / 430}%`;
+    input.style.top = `${100 * item.y / 820}%`;
+    input.style.width = `${100 * item.w / 430}%`;
+    input.style.height = `${100 * item.h / 820}%`;
+  }
+  for (const [id, input] of controls) {
+    if (visible.has(id)) continue;
+    pending.delete(id);
+    input.remove();
+    controls.delete(id);
   }
 }
 
 async function refresh() {
-  if (ended) return;
-  if (!active) {
-    active = true;
+  while (!ended) {
     try {
-      const response = await fetch("/hh-login/frame", { headers, cache: "no-store" });
-      if (response.ok) {
+      const response = await fetch(`/hh-login/frame?after=${encodeURIComponent(revision)}`, {
+        headers, cache: "no-store",
+      });
+      if (response.status === 401 || response.status === 403) return end(closed.expired);
+      if (!response.ok) throw new Error();
+      const state = response.headers.get("X-HH-Status");
+      if (closed[state]) return end(closed[state]);
+      revision = response.headers.get("X-HH-Revision") || "";
+      if (messages[state]) statusLine.textContent = messages[state];
+      check.disabled = state === "checking";
+      if (response.status === 200) {
         const next = URL.createObjectURL(await response.blob());
         screen.src = next;
         if (frameUrl) URL.revokeObjectURL(frameUrl);
         frameUrl = next;
-        if (status.dataset.loaded !== "yes") status.textContent = "Браузер подключён.";
-        status.dataset.loaded = "yes";
-      } else handle(response);
+        stage.hidden = check.hidden = false;
+        showFields(JSON.parse(response.headers.get("X-HH-Fields") || "[]"));
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
     } catch {
-      status.textContent = "Связь прервана. Пробую подключиться снова.";
-    } finally {
-      active = false;
+      statusLine.textContent = "Переподключаюсь к HH…";
+      await new Promise(resolve => setTimeout(resolve, 750));
     }
   }
-  if (!ended) setTimeout(refresh, 650);
 }
 
-async function send(event) {
-  if (ended) return;
-  if (active) {
-    setTimeout(() => send(event), 120);
-    return;
-  }
-  active = true;
-  try {
-    const response = await fetch("/hh-login/input", {
-      method: "POST",
-      headers: { ...headers, "Content-Type": "application/json" },
-      body: JSON.stringify(event),
-    });
-    if (!response.ok) handle(response);
-    else status.textContent = "Действие передано в браузер HH.";
-  } catch {
-    status.textContent = "Связь прервана. Повторите действие.";
-  } finally {
-    active = false;
-  }
-}
-
-screen.addEventListener("click", event => {
-  if (!frameUrl) return;
+screen.addEventListener("pointerdown", event => {
+  gesture = event.clientY;
+  screen.setPointerCapture(event.pointerId);
+});
+screen.addEventListener("pointercancel", () => { gesture = undefined; });
+screen.addEventListener("pointerup", event => {
+  if (gesture === undefined) return;
   const box = screen.getBoundingClientRect();
-  send({ kind: "click", x: 430 * (event.clientX - box.left) / box.width,
-    y: 820 * (event.clientY - box.top) / box.height });
+  const distance = gesture - event.clientY;
+  gesture = undefined;
+  flush();
+  if (fields.contains(document.activeElement)) document.activeElement.blur();
+  if (Math.abs(distance) > 16) {
+    send({ kind: "scroll", delta: Math.max(-820, Math.min(820, 430 * distance / box.width)) });
+  } else {
+    send({ kind: "click", x: 430 * (event.clientX - box.left) / box.width,
+      y: 820 * (event.clientY - box.top) / box.height });
+  }
 });
-document.querySelector("#entry").addEventListener("submit", event => {
+screen.addEventListener("wheel", event => {
   event.preventDefault();
-  const text = value.value;
-  value.value = "";
-  if (text) send({ kind: "entry", text });
+  send({ kind: "scroll", delta: Math.max(-820, Math.min(820, event.deltaY)) });
+}, { passive: false });
+check.addEventListener("click", () => {
+  flush();
+  send({ kind: "check" });
 });
-for (const direction of ["up", "down"]) {
-  document.querySelector("#" + direction).addEventListener("click", () =>
-    send({ kind: "scroll", direction }));
-}
-if (ended) status.textContent = "Откройте свежую ссылку из Telegram.";
+if (ended) end(closed.expired);
 else refresh();

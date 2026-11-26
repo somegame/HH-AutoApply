@@ -342,6 +342,16 @@ class TelegramUI:
         }:
             await self.vacancy(update, kind, value, settings)
 
+    @staticmethod
+    def resume_choices(resumes):
+        return markup(
+            [
+                [button(name, f"cloud_resume:{identifier}")]
+                for identifier, name in list(resumes.items())[:20]
+                if len(identifier) <= 50
+            ]
+        )
+
     async def browser_action(self, update, kind, value):
         browser = self.scheduler.browser
         try:
@@ -349,32 +359,36 @@ class TelegramUI:
                 raise ServiceError("Браузерный режим выключен. Включите BROWSER_ENGINE=chromium.")
             if kind == "cloud_login":
                 await self.answer(update, "Открываю браузер HH. Это может занять несколько секунд.")
-                url = await browser.start_login()
+
+                async def notify(result):
+                    if isinstance(result, ServiceError):
+                        await update.get_bot().send_message(self.config.owner, str(result))
+                    else:
+                        await update.get_bot().send_message(
+                            self.config.owner,
+                            "✅ Вход в HH подтверждён. Выберите резюме.",
+                            reply_markup=self.resume_choices(result),
+                        )
+
+                url = await browser.start_login(notify)
                 await self.answer(
                     update,
-                    "Откройте защищённую ссылку и войдите на HH. Затем закройте окно и нажмите "
-                    "«Проверить вход» в этом чате. Ссылка действует около трёх минут.",
+                    "Войдите в открывшемся окне. Бот проверит вход и пришлёт сюда список резюме. "
+                    "Ссылка действует восемь минут.",
                     markup(
-                        [
-                            [link("🔑 Войти на HH", url)],
-                            [button("✅ Проверить вход", "cloud_finish")],
-                            [button("✖️ Закрыть сессию", "cloud_cancel")],
-                        ]
+                        [[link("🔑 Открыть HH", url)], [button("✖️ Закрыть сессию", "cloud_cancel")]]
                     ),
                 )
             elif kind == "cloud_finish":
                 resumes = await browser.finish_login()
-                await self.answer(
-                    update,
-                    "HH открыл ваш личный список резюме. Выберите резюме для поиска и откликов.",
-                    markup(
-                        [
-                            [button(name, f"cloud_resume:{identifier}")]
-                            for identifier, name in list(resumes.items())[:20]
-                            if len(identifier) <= 50
-                        ]
-                    ),
-                )
+                if resumes is None:
+                    await self.answer(update, "Проверяю вход. Окно HH пока остаётся открытым.")
+                else:
+                    await self.answer(
+                        update,
+                        "✅ Вход в HH подтверждён. Выберите резюме.",
+                        self.resume_choices(resumes),
+                    )
             elif kind == "cloud_cancel":
                 await browser.cancel_login()
                 await self.answer(update, "Окно входа закрыто.", menu(True))

@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import time
+from urllib.parse import urlsplit
 
 from app import hh_browser as hh
 from app.diagnostics import resource_warning
@@ -19,7 +20,6 @@ class BrowserWorkflow:
         self.view = LoginView(config)
         self.lock = asyncio.Lock()
         self.login_task = None
-        self.login_done = None
 
     @property
     def available(self):
@@ -32,7 +32,7 @@ class BrowserWorkflow:
         if warning := resource_warning(self.config.data_dir):
             raise ServiceError(warning)
 
-    async def start_login(self):
+    async def start_login(self, notify=None):
         self.require_browser()
         await self.view.start()
         if not self.view.runner:
@@ -45,8 +45,7 @@ class BrowserWorkflow:
         self.db.set("hh_resume_choices", {})
         loop = asyncio.get_running_loop()
         ready = loop.create_future()
-        self.login_done = asyncio.Event()
-        self.login_task = asyncio.create_task(self.login(ready, self.login_done))
+        self.login_task = asyncio.create_task(self.login(ready, notify))
         try:
             return await asyncio.shield(ready)
         except BaseException:
@@ -55,45 +54,84 @@ class BrowserWorkflow:
                 await self.cancel_login()
             raise
 
-    async def login(self, ready, done):
+    async def login(self, ready, notify):
         async with self.lock:
+            status = "failed"
             try:
-                async with self.provider.session(225, interactive=True) as (_, page):
+                async with self.provider.session(SESSION_SECONDS + 45, interactive=True) as (
+                    context,
+                    page,
+                ):
                     await hh.open_page(page, hh.HH + "/account/login", login_allowed=True)
-                    try:
-                        ready.set_result(self.view.issue(page))
-                        async with asyncio.timeout(SESSION_SECONDS):
-                            await done.wait()
-                    finally:
-                        await self.view.revoke()
-                    return await hh.authorized_resumes(page)
+                    ready.set_result(await self.view.issue(page))
+                    async with asyncio.timeout(SESSION_SECONDS):
+                        result = await self.wait_for_account(context, page)
+                    await self.provider.save(context)
+                self.db.set("hh_resume_choices", result)
+                status = "done"
             except TimeoutError:
-                error = ServiceError("Срок ссылки истёк. Откройте новое окно входа.")
+                result = ServiceError("Срок ссылки истёк. Откройте новое окно входа.")
+            except hh.HHAttention as exc:
+                result = exc
+                status = "blocked"
             except ServiceError as exc:
-                error = exc
+                result = exc
             except asyncio.CancelledError:
                 if not ready.done():
                     ready.cancel()
+                await self.view.revoke()
                 raise
             except Exception:
-                error = ServiceError("Операция входа не завершилась.")
+                result = ServiceError("Операция входа не завершилась.")
+            await self.view.revoke(status if ready.done() and not ready.cancelled() else None)
             if not ready.done():
-                ready.set_exception(error)
-            return error
+                ready.set_exception(result)
+        if notify and not ready.cancelled() and ready.exception() is None:
+            try:
+                await notify(result)
+            except Exception:
+                # The selection remains in the database for a later Telegram request.
+                pass
+        return result
+
+    async def wait_for_account(self, context, page):
+        last_checked = None
+        while True:
+            try:
+                await asyncio.wait_for(self.view.check.wait(), 0.8)
+                requested = True
+            except TimeoutError:
+                requested = False
+            self.view.check.clear()
+            await hh.guard(page, login_allowed=True)
+            path = urlsplit(page.url).path
+            login_path = any(part in path for part in ("/login", "/oauth", "/auth", "/account"))
+            if not requested and (login_path or page.url == last_checked):
+                continue
+            last_checked = page.url
+            self.view.change_status("checking")
+            probe = await context.new_page()
+            try:
+                return await hh.authorized_resumes(probe)
+            except hh.HHLoginRequired:
+                self.view.change_status("retry")
+            finally:
+                await probe.close()
+                await page.bring_to_front()
 
     async def finish_login(self):
-        if self.login_task is None:
-            raise ServiceError("Сначала откройте окно входа HH в боте.")
-        self.login_done.set()
-        try:
-            result = await asyncio.shield(self.login_task)
-        finally:
-            if self.login_task and self.login_task.done():
-                self.login_task = None
-        if isinstance(result, ServiceError):
-            raise result
-        self.db.set("hh_resume_choices", result)
-        return result
+        if self.login_task and not self.login_task.done():
+            self.view.check.set()
+            return None
+        if self.login_task:
+            result = await self.login_task
+            if isinstance(result, ServiceError):
+                raise result
+            return result
+        choices = self.db.get("hh_resume_choices", {})
+        if choices:
+            return choices
+        raise ServiceError("Сначала откройте окно входа HH в боте.")
 
     async def cancel_login(self):
         if self.login_task:

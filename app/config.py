@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 from app.local_browser import public_login_url
 
-VERSION = "5.2.1"
+VERSION = "5.3.0"
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"

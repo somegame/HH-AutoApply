@@ -1,10 +1,12 @@
-:root { color-scheme: light; }
-body { margin: 0; font: 16px system-ui, sans-serif; background: #f4f5f8; color: #1b2430; }
-main { margin: auto; max-width: 430px; padding: 16px; }
-h1 { font-size: 24px; margin: 0; }
-p { margin: 10px 0; }
-form, .controls { display: flex; gap: 8px; margin-bottom: 8px; }
-input, button { font: inherit; border: 1px solid #aeb9c8; border-radius: 8px; padding: 9px; }
-input { min-width: 0; flex: 1; }
-button { background: #fff; color: #16263d; }
-#screen { display: block; width: 100%; height: auto; background: #fff; touch-action: manipulation; cursor: pointer; }
+:root { color-scheme: light; font: 16px system-ui, sans-serif; color: #18212c; background: #fff; }
+body { margin: 0; }
+header { position: sticky; top: 0; z-index: 2; background: #fff; border-bottom: 1px solid #e6e8eb; display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; min-height: 38px; }
+button { font: inherit; border: 1px solid #d4dae2; background: #fff; color: #18212c; border-radius: 9px; padding: 7px 10px; }
+main { max-width: 430px; margin: auto; }
+#status { margin: 0; padding: 8px 14px; font-size: 14px; background: #f4f6f9; }
+#stage { position: relative; touch-action: none; }
+#screen { display: block; width: 100%; height: auto; user-select: none; }
+#fields { position: absolute; inset: 0; pointer-events: none; }
+#fields input { position: absolute; box-sizing: border-box; pointer-events: auto; font: 16px system-ui, sans-serif; padding: 2px 9px; background: transparent; color: transparent; border: 1px solid transparent; border-radius: 6px; }
+#fields input:focus { outline: 2px solid #246ad3; outline-offset: -1px; background: #fff; color: #18212c; }
+[hidden] { display: none !important; }

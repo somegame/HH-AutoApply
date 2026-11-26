@@ -13,7 +13,7 @@ APPLY = '[data-qa="vacancy-response-link-top"]'
 SUBMIT = '[data-qa="vacancy-response-popup-submit-button"]'
 LETTER = 'textarea[data-qa="vacancy-response-popup-form-letter-input"]'
 RESPONSE = '[data-qa="vacancy-response-link-view-response"]'
-RESUME_LINK = 'a[href^="/resume/"], a[href^="https://hh.ru/resume/"]'
+RESUME_LINK = 'a[href*="/resume/"]'
 RESUME_ID = re.compile(r"/resume/([a-f0-9]{12,64})/?$", re.I)
 
 
@@ -79,8 +79,9 @@ async def authorized_resumes(page):
     if urlsplit(page.url).path.rstrip("/") != "/applicant/resumes":
         raise HHLoginRequired("HH не открыл личную страницу резюме.")
     links = page.locator(RESUME_LINK)
-    if not await links.count():
-        await page.wait_for_timeout(800)
+    try:
+        await links.first.wait_for(state="visible", timeout=5000)
+    except BrowserTimeout:
         await guard(page)
     items = {}
     for item in await links.all():
