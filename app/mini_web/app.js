@@ -22,6 +22,15 @@ let lastSearchQuery;
 let searchTimer;
 let startingSearch = false;
 let skillsDirty = false;
+const resumeStudio = {
+  initialized: false,
+  starting: false,
+  adopting: false,
+  checking: false,
+  timer: undefined,
+  pollError: "",
+  formError: "",
+};
 
 const modes = {
   browser: "Поиск и отклики",
@@ -32,6 +41,25 @@ const modes = {
   link: "Нет подключения",
 };
 const sent = new Set(["sent", "reported", "duplicate"]);
+const hhApplicationReasons = {
+  analysis_pending: "Ожидают анализа",
+  analysis_error: "Ошибка анализа",
+  overall_below_threshold: "Общая оценка ниже порога",
+  skills_below_threshold: "Совпадение навыков ниже порога",
+  missing_requirements: "Обязательные требования не подтверждены резюме",
+  stale_analysis: "Нужен анализ по текущему резюме",
+  letter_review: "Сопроводительное письмо требует проверки",
+  search_filters: "Не проходят сохранённые фильтры",
+  manual_review: "Нужно проверить форму HH вручную",
+  unknown_outcome: "Требуют сверки отправки",
+  manual_only: "Доступны для ручного отклика",
+};
+const hhApplicationResults = {
+  sent: "Отправку подтвердил HH",
+  unknown: "Результат отправки неизвестен",
+  questions: "Нужно проверить форму HH вручную",
+  duplicate: "Отклик уже есть на HH",
+};
 
 function el(tag, value, css) {
   const node = document.createElement(tag);
@@ -58,8 +86,9 @@ function external(url) {
 }
 
 async function api(command, payload) {
-  const searchRequest = command === "search-start" || command.startsWith("search-status?");
-  const controller = searchRequest ? new AbortController() : undefined;
+  const quickRequest = command === "search-start" || command.startsWith("search-status?") ||
+    command === "resume-studio" || command === "ai-consent";
+  const controller = quickRequest ? new AbortController() : undefined;
   const timer = controller && window.setTimeout(() => controller.abort(), 10000);
   let response;
   try {
@@ -129,7 +158,7 @@ function changeTab(tab) {
   }
   window.scrollTo(0, 0);
   if (tab === "search") renderSearch();
-  else refresh().catch(error => showError(error.message));
+  else return refresh().catch(error => showError(error.message));
 }
 
 function sourceName(key) {
@@ -142,7 +171,7 @@ function statusClass(status) {
 }
 
 function canSend(job) {
-  if (job.source === "hh") return state.hh_send && state.hh_connected && state.hh_resume && state.consent && state.groq;
+  if (job.source === "hh") return state.hh_send && state.hh_connected && state.hh_resume && aiReady();
   if (job.source === "superjob") return state.superjob.send && state.superjob.connected && state.superjob.selected;
   return false;
 }
@@ -260,11 +289,13 @@ function jobCard(job, history) {
     actions.append(action("Проверить аккаунт", () => changeTab("connections")));
   }
   if (history && job.status === "unknown" && job.source === "hh") {
-    actions.append(action("Проверить отправку", async () => {
-      await api("job", { id: job.id, action: "reconcile" });
+    const verify = action("Проверить отправку", async () => {
+      const result = await api("job", { id: job.id, action: "reconcile" });
       await refresh();
-      showFeedback("Отправка подтверждена площадкой.");
-    }));
+      if (result.job?.status === "sent") showFeedback("Отправка подтверждена площадкой.");
+    });
+    verify.dataset.hhReconcile = "";
+    actions.append(verify);
   }
   if (history && job.status === "unknown" && job.source === "superjob") {
     card.append(el("p", "SuperJob не подтвердил результат. Повторная отправка заблокирована.", "muted"));
@@ -282,12 +313,94 @@ function renderSearch() {
   discovery.render(searches);
 }
 
+function providerName(provider) {
+  if (provider === "groq") return "Groq";
+  if (provider === "gemini") return "Gemini";
+  return "";
+}
+
+function aiReady() {
+  return state.ai_available ?? Boolean(state.groq && state.consent);
+}
+
+function providerConfigured() {
+  return Boolean(state.groq || state.gemini);
+}
+
+function dataAccessSection(id) {
+  const target = byId(id);
+  target.focus({ preventScroll: true });
+  target.scrollIntoView({ block: "start" });
+}
+
 function queueExplanation(queue) {
   if (queue?.processing === false) return "Анализ приостановлен.";
+  if (queue?.providers) {
+    const allowed = Object.entries(queue.providers).filter(([name]) =>
+      name === "groq" ? state.groq && state.consent : name === "gemini" && state.gemini && state.gemini_consent);
+    const hasLimit = entry => entry.limit > 0 && entry.used >= entry.limit;
+    const waiting = allowed.filter(([, entry]) => hasLimit(entry) || (entry.notice && entry.retry_at > Date.now() / 1000));
+    if (!waiting.length || waiting.length < allowed.length) return "";
+    return waiting.map(([name, entry]) => hasLimit(entry) ?
+      "Дневной лимит " + providerName(name) + " исчерпан." : entry.notice).join(" ") + " Очередь сохранена.";
+  }
   if (queue?.groq_limit > 0 && queue.groq_used >= queue.groq_limit) {
     return "Дневной лимит Groq исчерпан. Бот продолжит анализ после обновления лимита.";
   }
   return queue?.groq_notice || "";
+}
+
+function statusText(id, value) {
+  const node = byId(id);
+  node.hidden = !value;
+  if (node.textContent !== value) node.textContent = value;
+}
+
+function activityList(id, entries) {
+  const node = byId(id);
+  node.hidden = !entries.length;
+  node.replaceChildren(...entries.map(entry => el("li", entry)));
+}
+
+function activityDate(timestamp) {
+  if (!(timestamp > 0)) return "";
+  return new Date(timestamp * 1000).toLocaleString("ru-RU", { dateStyle: "medium", timeStyle: "short" });
+}
+
+function renderHHActivity() {
+  const application = state.hh_application;
+  byId("hh-activity").hidden = !application;
+  if (!application) return;
+  const blocked = application.blocked || {};
+  const unknown = application.unknown ?? blocked.unknown_outcome ?? 0;
+  const retry = activityDate(application.retry_at);
+  statusText("hh-activity-message", [application.message, retry && "Следующая попытка возможна " + retry + "."]
+    .filter(Boolean).join(" "));
+  byId("hh-activity-eligible").textContent = application.eligible ?? 0;
+  byId("hh-activity-pending").textContent = application.pending ?? blocked.analysis_pending ?? 0;
+  byId("hh-activity-confirmed").textContent = application.confirmed_today ?? 0;
+  statusText("hh-activity-verification", unknown ? "Требуют сверки на HH · " + unknown + "." : "");
+  byId("hh-activity-check").hidden = !state.jobs.some(job => job.status === "unknown" && job.source === "hh");
+
+  const reasons = Object.entries(hhApplicationReasons)
+    .filter(([reason]) => reason !== "analysis_pending" && reason !== "unknown_outcome" && blocked[reason] > 0)
+    .map(([reason, label]) => label + " · " + blocked[reason]);
+  const examples = (application.examples || []).slice(0, 3).map(item =>
+    item.title + " — " + (item.message || hhApplicationReasons[item.reason] || "Требуется проверка"));
+  const recent = (application.recent || []).filter(item => hhApplicationResults[item.status]).map(item =>
+    [item.title, hhApplicationResults[item.status], activityDate(item.at)].filter(Boolean).join(" · "));
+  if (application.attempted_today > application.confirmed_today) {
+    recent.unshift("Учтено попыток HH за сегодня · " + application.attempted_today + ".");
+  }
+  activityList("hh-activity-reasons", reasons);
+  activityList("hh-activity-examples", examples);
+  activityList("hh-activity-recent", recent);
+  statusText("hh-activity-sample-note", application.sample_limited && reasons.length ?
+    "Причины показаны по последним проверенным карточкам." : "");
+  const hasReasons = reasons.length || examples.length;
+  byId("hh-activity-details").hidden = !(hasReasons || recent.length);
+  byId("hh-activity-summary").textContent = hasReasons ?
+    recent.length ? "Причины и недавние попытки" : "Почему вакансии не готовы" : "Недавние попытки";
 }
 
 function renderJobs() {
@@ -295,16 +408,21 @@ function renderJobs() {
   byId("total-count").textContent = state.summary.total;
   byId("sent-count").textContent = state.summary.sent;
   byId("today-count").textContent = state.summary.today + " / " + state.daily_limit;
+  renderHHActivity();
   const analysis = byId("analysis-status");
   const queue = state.analysis_queue;
   analysis.hidden = !(queue?.pending > 0);
   analysis.textContent = queue?.pending > 0 ?
-    ["В очереди на анализ Groq · " + queue.pending + ".", queueExplanation(queue)].filter(Boolean).join(" ") : "";
+    ["В очереди на анализ · " + queue.pending + ".", queueExplanation(queue),
+      providerName(queue?.provider) && "Последний ответ · " + providerName(queue.provider) + "."].filter(Boolean).join(" ") : "";
   const setup = byId("jobs-setup");
-  setup.hidden = !(queue?.pending || state.jobs.some(job => job.status === "queued")) || Boolean(state.resume && state.consent && state.groq);
+  setup.hidden = !(queue?.pending || state.jobs.some(job => job.status === "queued")) || Boolean(state.resume && aiReady());
   setup.replaceChildren(
     el("span", "Для писем нужен профиль и согласие на анализ. "),
-    action("Открыть профиль", () => changeTab("connections"))
+    action("Открыть профиль", async () => {
+      await changeTab("connections");
+      dataAccessSection(state.resume && state.gemini && !state.groq ? "gemini-title" : "profile-title");
+    })
   );
   if (!filtered.length) {
     byId("jobs").replaceChildren(el("p", selectedFilter === "sent" ? "Отправленных откликов пока нет." : "Подготовьте отклик из результатов поиска.", "empty"));
@@ -405,23 +523,22 @@ function renderHHAuto() {
   if (card.hidden) return;
   const persistent = state.storage_persistent ?? state.persistent;
   const status = byId("hh-auto-state");
-  const help = byId("hh-auto-help");
   const operations = byId("hh-auto-controls");
   status.textContent = state.hh_auto ? "Включены" : "Выключены";
   status.className = state.hh_auto ? "status good" : "status";
   if (!skillsDirty) byId("hh-skills-score").value = state.auto_settings.skills_score;
-  byId("hh-skills-help").textContent = "Groq сверяет навыки с резюме. Для автоотклика также нужны " +
+  byId("hh-skills-help").textContent = "Анализ сверяет навыки с резюме. Для автоотклика также нужны " +
     "общая оценка от " + state.auto_settings.score + "% и подтверждённые обязательные требования.";
   byId("hh-storage-help").hidden = persistent;
   const blockers = [
     !persistent && "Сохранение резюме, входа в HH и журнала после обновления пока не подтверждено. Автоотклики доступны с постоянным диском.",
     !(state.hh_resume && state.resume) && "Выберите резюме в аккаунте HH.",
-    !state.consent && "В профиле разрешите Groq анализировать ваш опыт и готовить письма.",
-    !state.groq && "Добавьте ключ Groq в настройки бота на Bothost.",
+    providerConfigured() && !aiReady() && "Разрешите Groq или Gemini обрабатывать профессиональные сведения.",
+    !providerConfigured() && "Добавьте ключ Groq или Gemini в настройки бота на Bothost.",
     persistent && !state.hh_auto_allowed && "Разрешите автоотклики в настройках бота на Bothost (AUTO_SEND).",
   ].filter(Boolean);
-  help.hidden = !blockers.length;
-  help.textContent = blockers.join(" ");
+  statusText("hh-auto-help", state.hh_application?.message || "");
+  activityList("hh-auto-blockers", blockers);
   operations.replaceChildren();
   if (state.hh_auto) {
     operations.append(action("Оставить только поиск", async () => {
@@ -437,9 +554,11 @@ function renderHHAuto() {
         showFeedback("Автоотклики HH включены.");
       }
     }, true));
-  } else if (!state.consent) {
-    operations.append(action("Открыть профиль для писем", () => byId("consent").focus()));
+  } else if (providerConfigured() && !aiReady()) {
+    operations.append(action("Настроить анализ", () =>
+      dataAccessSection(state.groq ? "profile-title" : "gemini-title")));
   }
+  if (state.hh_application) operations.append(action("Проверить отклики", () => changeTab("jobs")));
   operations.hidden = !operations.childElementCount;
 }
 
@@ -546,6 +665,117 @@ function renderSuperjob(card, operations) {
   }
 }
 
+function renderStudioNotes(id, notes) {
+  const section = byId(id);
+  const values = Array.isArray(notes) ? notes.filter(value => typeof value === "string" && value.trim()) : [];
+  section.hidden = !values.length;
+  section.querySelector("ul").replaceChildren(...values.map(value => el("li", value)));
+}
+
+function resumeStudioBusy() {
+  return resumeStudio.starting || state.resume_studio_status?.status === "processing";
+}
+
+function resumeStudioLinkedHH() {
+  return Boolean(state.hh_connected || state.hh_resume_id);
+}
+
+function renderResumeStudio() {
+  const draft = state.resume_studio;
+  const result = state.resume_studio_status;
+  const busy = resumeStudioBusy();
+  if (!resumeStudio.initialized) {
+    byId("resume-studio-mode").value = draft?.mode || (state.resume ? "improve" : "build");
+    byId("resume-studio-target").value = draft?.target || byId("query").value || state.defaults.query;
+    resumeStudio.initialized = true;
+  }
+  const consent = byId("resume-studio-consent");
+  byId("resume-studio-consent-label").hidden = Boolean(state.consent) || !state.groq;
+  if (state.consent) consent.checked = false;
+  byId("resume-studio-gemini-jump").hidden = !state.gemini || state.gemini_consent;
+  const aiHelp = byId("resume-studio-ai-help");
+  if (state.groq && state.gemini && state.gemini_consent) {
+    aiHelp.textContent = "Для черновика обрабатываются профессиональные сведения профиля и факты из формы. При недоступности Groq используется Gemini.";
+  } else if (state.groq) {
+    aiHelp.textContent = "Для черновика Groq обработает профессиональные сведения профиля и факты из формы.";
+  } else if (state.gemini) {
+    aiHelp.textContent = "Для черновика Gemini обработает профессиональные сведения профиля и факты из формы после вашего разрешения.";
+  } else {
+    aiHelp.textContent = "Для подготовки текста настройте Groq или Gemini на Bothost. Уточняющие вопросы доступны без подключения.";
+  }
+  const generate = byId("resume-studio-generate");
+  generate.disabled = busy || resumeStudio.adopting;
+  generate.textContent = busy ? "Готовлю черновик…" : "Подготовить черновик";
+  byId("resume-studio-form").setAttribute("aria-busy", String(busy));
+
+  const status = byId("resume-studio-status");
+  const problem = resumeStudio.formError || (busy ? resumeStudio.pollError : result?.message);
+  const message = problem || (busy ?
+    "Подготовка может занять до минуты. Можно продолжить пользоваться приложением." :
+    result?.status === "ready" ? (draft?.text ? "Черновик готов." : "Добавьте сведения, чтобы подготовить текст.") : "");
+  status.classList.toggle("form-error", Boolean(problem));
+  status.hidden = !message;
+  if (status.textContent !== message) status.textContent = message;
+  byId("resume-studio-check").hidden = !resumeStudio.pollError || !busy;
+
+  byId("resume-studio-result").hidden = !draft;
+  if (draft) {
+    const hasText = Boolean(draft.text);
+    const linked = resumeStudioLinkedHH();
+    const inUse = hasText && draft.text === state.resume;
+    byId("resume-studio-result-title").textContent = busy ? "Предыдущий черновик" : "Черновик резюме";
+    byId("resume-studio-result-target").textContent = draft.target;
+    byId("resume-studio-review").hidden = !hasText;
+    byId("resume-studio-document").hidden = !hasText;
+    const preview = byId("resume-studio-preview");
+    if (preview.value !== draft.text) preview.value = draft.text || "";
+    byId("resume-studio-adopt").hidden = linked || inUse;
+    byId("resume-studio-adopt").disabled = busy || resumeStudio.adopting;
+    byId("resume-studio-hh-help").hidden = !linked;
+    byId("resume-studio-in-use").hidden = linked || !inUse;
+    statusText("resume-studio-sample", [
+      providerName(draft.provider),
+      draft.sample_count > 0 && "Вакансий учтено: " + draft.sample_count,
+    ].filter(Boolean).join(" · "));
+    renderStudioNotes("resume-studio-suggestions", draft.suggestions);
+    renderStudioNotes("resume-studio-questions", draft.questions);
+  }
+  if (result?.status !== "processing") {
+    window.clearTimeout(resumeStudio.timer);
+    resumeStudio.timer = undefined;
+    resumeStudio.pollError = "";
+  } else if (!resumeStudio.timer && !resumeStudio.checking && !resumeStudio.pollError) {
+    resumeStudio.timer = window.setTimeout(checkResumeStudio, 1500);
+  }
+}
+
+function updateResumeStudio(next) {
+  state = {
+    ...state,
+    resume_studio: next.resume_studio,
+    resume_studio_status: next.resume_studio_status,
+    consent: next.consent ?? state.consent,
+    gemini_consent: next.gemini_consent ?? state.gemini_consent,
+    ai_available: next.ai_available ?? state.ai_available,
+  };
+}
+
+async function checkResumeStudio() {
+  window.clearTimeout(resumeStudio.timer);
+  resumeStudio.timer = undefined;
+  if (resumeStudio.checking) return;
+  resumeStudio.checking = true;
+  resumeStudio.pollError = "";
+  try {
+    updateResumeStudio(await api("resume-studio"));
+  } catch (error) {
+    resumeStudio.pollError = error.message;
+  } finally {
+    resumeStudio.checking = false;
+    renderResumeStudio();
+  }
+}
+
 function renderConnections() {
   renderHHAuto();
   const cards = [];
@@ -569,12 +799,23 @@ function renderConnections() {
     state.hh_connected && state.hh_resume ? "Резюме HH уже в профиле." :
       state.resume ? "Резюме сохранено." :
       state.hh_connected ? "Выберите резюме HH для подготовки писем." : "Подключите HH, чтобы загрузить резюме из аккаунта.",
-    !state.groq ? "Для писем нужно настроить Groq." : "",
+    !providerConfigured() ? "Для писем нужен подключённый Groq или Gemini." : "",
   ].filter(Boolean).join(" ");
+  byId("groq-consent-label").hidden = !state.groq && Boolean(state.gemini);
   if (!profileDirty) {
     byId("resume").value = state.resume;
     byId("consent").checked = state.consent;
   }
+  byId("gemini-access").hidden = !state.gemini;
+  byId("gemini-title").textContent = state.groq ? "Резервный анализ Gemini" : "Анализ Gemini";
+  const gemini = byId("gemini-status");
+  gemini.textContent = state.gemini_consent ? "Разрешён" : "Отключён";
+  gemini.className = state.gemini_consent ? "status good" : "status";
+  byId("gemini-info").textContent = state.groq ?
+    "Если Groq достигнет лимита или временно недоступен, Gemini сможет обработать профессиональные сведения для анализа, писем и резюме." :
+    "После вашего разрешения Gemini сможет обрабатывать профессиональные сведения для анализа, писем и резюме.";
+  byId("gemini-consent").textContent = state.gemini_consent ? "Отозвать разрешение Gemini" : "Разрешить Gemini";
+  renderResumeStudio();
 }
 
 function applyState(next, first = false) {
@@ -606,6 +847,7 @@ const discovery = vacancyDiscovery({
   el,
   api,
   action,
+  providerName,
   makeCard: jobCard,
   getPreferences: () => state.preferences || {},
   updateState: preferences => applyState({ ...state, preferences }),
@@ -663,7 +905,7 @@ function showSearchResults(search, result) {
   } else if (result.analysis_pending > 0) {
     const explanation = queueExplanation(result.analysis_queue) || (result.analysis_running
       ? "Оценки появятся по мере обработки." : "Проверьте настройки анализа в аккаунтах.");
-    searchUpdate("В очереди Groq · " + result.analysis_pending + ". " + explanation);
+    searchUpdate("В очереди на анализ · " + result.analysis_pending + ". " + explanation);
   } else if (jobs.length) {
     searchUpdate();
   } else {
@@ -800,6 +1042,111 @@ byId("profile-form").addEventListener("submit", async event => {
   }
 });
 
+byId("gemini-consent").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  const consent = !state.gemini_consent;
+  showError();
+  showFeedback();
+  button.disabled = true;
+  try {
+    applyState(await api("ai-consent", { gemini: consent }));
+    showFeedback(consent ? "Обработка в Gemini разрешена." : "Разрешение для Gemini отозвано.");
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+byId("resume-studio-jump").addEventListener("click", () => {
+  byId("resume-studio-title").focus({ preventScroll: true });
+  byId("resume-studio").scrollIntoView({ block: "start" });
+});
+byId("resume-studio-gemini-jump").addEventListener("click", () => dataAccessSection("gemini-title"));
+byId("resume-studio-check").addEventListener("click", checkResumeStudio);
+byId("resume-studio-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (resumeStudioBusy() || resumeStudio.adopting) return;
+  showError();
+  showFeedback();
+  const consent = !state.consent && byId("resume-studio-consent").checked;
+  resumeStudio.starting = true;
+  resumeStudio.formError = resumeStudio.pollError = "";
+  renderResumeStudio();
+  try {
+    const next = await api("resume-studio", {
+      action: "generate",
+      mode: byId("resume-studio-mode").value,
+      target: byId("resume-studio-target").value.trim(),
+      facts: byId("resume-studio-facts").value.trim(),
+      ...(consent ? { consent: true } : {}),
+    });
+    updateResumeStudio(next);
+    if (consent) refresh(false, true).catch(() => {});
+  } catch (error) {
+    resumeStudio.formError = error.message;
+    refresh(false, true).catch(() => {});
+  } finally {
+    resumeStudio.starting = false;
+    renderResumeStudio();
+  }
+});
+
+byId("resume-studio-export").addEventListener("click", async () => {
+  const text = state.resume_studio?.text;
+  if (!text) return;
+  const file = new File([text, "\n"], "resume.txt", { type: "text/plain;charset=utf-8" });
+  try {
+    if (navigator.canShare?.({ files: [file] })) {
+      await navigator.share({ files: [file] });
+      return;
+    }
+  } catch (error) {
+    if (error.name === "AbortError") return;
+  }
+  const url = URL.createObjectURL(file);
+  const download = document.createElement("a");
+  download.href = url;
+  download.download = file.name;
+  document.body.append(download);
+  download.click();
+  download.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+});
+
+byId("resume-studio-copy").addEventListener("click", async () => {
+  const preview = byId("resume-studio-preview");
+  if (!preview.value) return;
+  try {
+    await navigator.clipboard.writeText(preview.value);
+    showFeedback("Текст резюме скопирован.");
+  } catch {
+    preview.focus();
+    preview.select();
+    showFeedback("Текст выделен. Выберите «Скопировать» в меню телефона.");
+  }
+});
+
+byId("resume-studio-adopt").addEventListener("click", async () => {
+  const text = state.resume_studio?.text;
+  if (!text || text === state.resume || resumeStudioBusy() || resumeStudio.adopting || resumeStudioLinkedHH()) return;
+  resumeStudio.adopting = true;
+  resumeStudio.formError = "";
+  renderResumeStudio();
+  try {
+    if (!await confirmAction("Черновик заменит текст профиля для анализа вакансий и подготовки писем. Использовать его?")) return;
+    const next = await api("resume-studio", { action: "adopt", confirm: true });
+    profileDirty = false;
+    applyState(next);
+    showFeedback("Резюме сохранено в профиле для анализа вакансий.");
+  } catch (error) {
+    resumeStudio.formError = error.message;
+  } finally {
+    resumeStudio.adopting = false;
+    renderResumeStudio();
+  }
+});
+
 byId("hh-auto-form").addEventListener("input", () => { skillsDirty = true; });
 byId("hh-auto-form").addEventListener("submit", async event => {
   event.preventDefault();
@@ -861,6 +1208,14 @@ for (const button of document.querySelectorAll("#jobs-filters button")) {
     renderJobs();
   });
 }
+byId("hh-activity-settings").addEventListener("click", async () => {
+  await changeTab("connections");
+  if (!byId("hh-auto-card").hidden) dataAccessSection("hh-auto-title");
+});
+byId("hh-activity-check").addEventListener("click", () => {
+  if (selectedFilter === "sent") byId("jobs-filters").querySelector('[data-filter="draft"]').click();
+  byId("jobs").querySelector("[data-hh-reconcile]")?.focus();
+});
 byId("reload").addEventListener("click", () => {
   if (!auth) return;
   if (activeSearch && selectedTab === "search") {

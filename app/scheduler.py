@@ -9,15 +9,19 @@ from datetime import datetime
 
 from app.browser_workflow import BrowserWorkflow
 from app.diagnostics import resource_warning
+from app.gemini import Gemini
 from app.hh_browser import HHLoginRequired
 from app.services import (
+    AI_PROVIDERS,
     AUTO_ANALYSIS_POLICY,
     Groq,
-    GroqUnavailable,
+    ProviderUnavailable,
     ServiceError,
+    ai_allowed,
     cache_key,
     grounded_auto_letter,
     prepared_input,
+    provider_allowed,
 )
 from app.vacancies import filter_reason
 
@@ -33,17 +37,15 @@ class Scheduler:
         self.config = config
         self.db = db
         self.groq = Groq(client, config)
+        self.providers = {"groq": self.groq, "gemini": Gemini(client, config)}
+        self.ai_lock = asyncio.Lock()
         self.browser = BrowserWorkflow(config, db)
         self.task = None
         self.warning = None
 
     async def start(self, bot):
         if self.task is None or self.task.done():
-            if (
-                self.config.groq_key
-                and self.db.get("browser_search")
-                and self.db.get("groq_consent")
-            ):
+            if self.db.get("browser_search") and ai_allowed(self.config, self.db):
                 resume = self.db.get("resume", "")
                 if resume:
                     self.db.refresh_auto_drafts(
@@ -127,16 +129,17 @@ class Scheduler:
                 )
 
     def analysis_status(self):
-        budget = self.db.get("groq_usage", {})
-        used = budget.get("count", 0) if budget.get("day") == local_day(self.config) else 0
-        notice = self.db.get("groq_notice", "")
-        retry_at = self.db.get("next_groq", 0) if notice else 0
+        providers = {name: self.provider_status(name) for name in AI_PROVIDERS}
+        groq = providers["groq"]
+        active = self.db.get("ai_provider", "")
         return {
             "processing": self.db.get("processing", True),
-            "groq_used": used,
-            "groq_limit": self.config.groq_daily_limit,
-            "groq_retry_at": retry_at,
-            "groq_notice": notice,
+            "groq_used": groq["used"],
+            "groq_limit": groq["limit"],
+            "groq_retry_at": groq["retry_at"] if groq["notice"] else 0,
+            "groq_notice": groq["notice"],
+            "provider": active if providers.get(active, {}).get("allowed") else "",
+            "providers": providers,
         }
 
     async def tick_analysis(self, bot):
@@ -154,24 +157,11 @@ class Scheduler:
             )
             return
         resume = self.db.get("resume", "")
-        if not resume or not self.db.get("groq_consent", False) or not self.config.groq_key:
+        if not resume or not ai_allowed(self.config, self.db):
             return
         try:
             result = await self.analyze(resume, vacancy, settings, int(time.time()))
-        except GroqUnavailable as exc:
-            failures = self.db.get("groq_failures", 0) + 1
-            delay = max(exc.retry, min(900, 60 * 2 ** min(failures - 1, 4)))
-            self.db.set_many(
-                {
-                    "next_groq": int(time.time()) + delay,
-                    "groq_failures": failures,
-                    "groq_notice": str(exc),
-                }
-            )
-            return
         except ServiceError as exc:
-            if self.db.get("groq_notice"):
-                self.db.set_many({"groq_notice": "", "groq_failures": 0})
             attempt = row["attempts"] + 1
             delay = max(exc.retry, 60 * 2 ** (attempt - 1)) if attempt < 3 else 0
             self.db.failure(row["id"], attempt, str(exc), delay, expected_details=row["details"])
@@ -180,7 +170,9 @@ class Scheduler:
             return
         if result is None:
             return
-        if self.db.get("resume", "") != resume or not self.db.get("groq_consent", False):
+        if self.db.get("resume", "") != resume or not provider_allowed(
+            self.config, self.db, result.get("analysis_provider", "groq")
+        ):
             return
         qualifies = (
             not reason and result["score"] >= settings["score"] and bool(result["letter"].strip())
@@ -204,7 +196,10 @@ class Scheduler:
         if reason:
             result["filter_reason"] = reason
         if source == "browser":
-            result = result | {"analysis_policy": AUTO_ANALYSIS_POLICY}
+            result = result | {
+                "analysis_policy": AUTO_ANALYSIS_POLICY,
+                "analysis_threshold": settings["score"],
+            }
             if safe_letter:
                 result["auto_policy"] = AUTO_ANALYSIS_POLICY
         updated = self.db.finish_analysis(
@@ -225,22 +220,84 @@ class Scheduler:
             reply_markup=markup([[button("Открыть карточку", f"v:{row['id']}")]]),
         )
 
+    def provider_status(self, name):
+        day = local_day(self.config)
+        budget = self.db.get(f"{name}_usage", {})
+        used = budget.get("count", 0) if budget.get("day") == day else 0
+        return {
+            "allowed": provider_allowed(self.config, self.db, name),
+            "used": used,
+            "limit": getattr(self.config, f"{name}_daily_limit", 50),
+            "retry_at": self.db.get(f"next_{name}", 0),
+            "notice": self.db.get(f"{name}_notice", ""),
+        }
+
+    def reserve_ai(self, name, now, status):
+        self.db.set_many(
+            {
+                f"{name}_usage": {"day": local_day(self.config), "count": status["used"] + 1},
+                f"next_{name}": now + 12,
+            }
+        )
+
+    def ai_backoff(self, name, error):
+        failures = self.db.get(f"{name}_failures", 0) + 1
+        delay = max(error.retry, min(900, 60 * 2 ** min(failures - 1, 4)))
+        self.db.set_many(
+            {
+                f"next_{name}": int(time.time()) + delay,
+                f"{name}_failures": failures,
+                f"{name}_notice": str(error),
+            }
+        )
+
+    async def try_ai(self, operation, now):
+        for name, provider in self.providers.items():
+            status = self.provider_status(name)
+            if not status["allowed"] or status["used"] >= status["limit"]:
+                continue
+            if now < status["retry_at"]:
+                if status["notice"]:
+                    continue
+                return None
+            self.reserve_ai(name, now, status)
+            try:
+                result = await operation(provider)
+            except ProviderUnavailable as exc:
+                self.ai_backoff(name, exc)
+                now = int(time.time())
+                continue
+            except ServiceError:
+                self.db.set_many({f"{name}_notice": "", f"{name}_failures": 0})
+                raise
+            if provider_allowed(self.config, self.db, name):
+                self.db.set_many({f"{name}_notice": "", f"{name}_failures": 0, "ai_provider": name})
+                return name, result
+        return None
+
+    def ai_request_delay(self, now):
+        for name in AI_PROVIDERS:
+            status = self.provider_status(name)
+            if status["allowed"] and status["used"] < status["limit"]:
+                if not status["notice"] or status["retry_at"] <= now:
+                    return max(0, status["retry_at"] - now)
+        return 0
+
     async def analyze(self, resume, vacancy, settings, now):
         data = prepared_input(resume, vacancy, settings)
-        key = cache_key(self.config.model, data)
-        cached = self.db.cached(key)
-        if cached is not None:
-            return cached
-        if now < self.db.get("next_groq", 0):
+        keys = {
+            "groq": cache_key(self.config.model, data),
+            "gemini": cache_key(f"gemini:{getattr(self.config, 'gemini_model', '')}", data),
+        }
+        for name, key in keys.items():
+            if provider_allowed(self.config, self.db, name) and (cached := self.db.cached(key)):
+                return cached | {"analysis_provider": name}
+        if self.ai_lock.locked():
             return None
-        day = local_day(self.config)
-        budget = self.db.get("groq_usage", {})
-        used = budget.get("count", 0) if budget.get("day") == day else 0
-        if used >= self.config.groq_daily_limit:
-            return None
-        self.db.set_many({"groq_usage": {"day": day, "count": used + 1}, "next_groq": now + 12})
-        result = await self.groq.analyze(data)
-        self.db.cache(key, result)
-        if self.db.get("groq_notice"):
-            self.db.set_many({"groq_notice": "", "groq_failures": 0})
-        return result
+        async with self.ai_lock:
+            completed = await self.try_ai(lambda provider: provider.analyze(data), now)
+        if completed:
+            name, result = completed
+            self.db.cache(keys[name], result)
+            return result | {"analysis_provider": name}
+        return None

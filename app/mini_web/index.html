@@ -102,8 +102,29 @@
       <div class="summary" aria-label="Статистика откликов">
         <div><strong id="total-count">0</strong><span>В журнале</span></div>
         <div><strong id="sent-count">0</strong><span>Подтверждено</span></div>
-        <div><strong id="today-count">0</strong><span>Лимит на сегодня</span></div>
+        <div><strong id="today-count">0</strong><span>Учтено в лимите</span></div>
       </div>
+      <section id="hh-activity" class="card hh-auto-card" aria-labelledby="hh-activity-title" hidden>
+        <h3 id="hh-activity-title">Автоотклики HH</h3>
+        <p id="hh-activity-message" class="muted" role="status"></p>
+        <dl class="hh-activity-counts">
+          <div><dt>Готовы к автоотклику</dt><dd id="hh-activity-eligible">0</dd></div>
+          <div><dt>Ждут анализа</dt><dd id="hh-activity-pending">0</dd></div>
+          <div><dt>Подтвердил HH сегодня</dt><dd id="hh-activity-confirmed">0</dd></div>
+        </dl>
+        <p id="hh-activity-verification" class="muted" role="status" hidden></p>
+        <details id="hh-activity-details" hidden>
+          <summary id="hh-activity-summary">Причины и недавние попытки</summary>
+          <p id="hh-activity-sample-note" class="muted" hidden></p>
+          <ul id="hh-activity-reasons" class="hh-activity-list muted" hidden></ul>
+          <ul id="hh-activity-examples" class="hh-activity-list muted" hidden></ul>
+          <ul id="hh-activity-recent" class="hh-activity-list muted" hidden></ul>
+        </details>
+        <div class="actions">
+          <button id="hh-activity-check" class="secondary" type="button" hidden>К проверке отправки</button>
+          <button id="hh-activity-settings" class="secondary" type="button">Настройки автооткликов</button>
+        </div>
+      </section>
       <div id="jobs-filters" class="segmented" aria-label="Состояние откликов">
         <button type="button" data-filter="all" aria-pressed="true">Все</button>
         <button type="button" data-filter="draft">В работе</button>
@@ -129,9 +150,10 @@
     </section>
 
     <section id="panel-connections" hidden>
-      <div class="section-title"><h2>Аккаунты</h2></div>
+      <div class="section-title"><h2>Аккаунты</h2><button id="resume-studio-jump" class="resume-studio-jump" type="button"
+        aria-controls="resume-studio">Редактор резюме</button></div>
       <section id="hh-auto-card" class="card hh-auto-card" aria-labelledby="hh-auto-title" hidden>
-        <div class="card-header"><h3 id="hh-auto-title">Автоотклики HH</h3><span id="hh-auto-state" class="status"></span></div>
+        <div class="card-header"><h3 id="hh-auto-title" tabindex="-1">Автоотклики HH</h3><span id="hh-auto-state" class="status"></span></div>
         <form id="hh-auto-form" class="stack">
           <label for="hh-skills-score">Совпадение навыков от, %</label>
           <div class="skill-threshold">
@@ -141,7 +163,8 @@
           </div>
           <p id="hh-skills-help" class="muted"></p>
         </form>
-        <p id="hh-auto-help" class="muted" hidden></p>
+        <p id="hh-auto-help" class="muted" role="status" hidden></p>
+        <ul id="hh-auto-blockers" class="hh-activity-list muted" hidden></ul>
         <details id="hh-storage-help" hidden>
           <summary>Как сохранить данные при обновлении</summary>
           <p class="muted">В настройках бота на Bothost проверьте постоянный диск (Volume) и путь к нему. Укажите этот путь в <code>DATA_DIR</code> и добавьте <code>PERSISTENT_STORAGE=true</code>, если диск сохраняется при обновлениях.</p>
@@ -193,13 +216,75 @@
         <button class="primary" type="submit">Сохранить настройки дороги</button>
       </form>
       <form id="profile-form" class="profile" autocomplete="off">
-        <h3>Профиль для писем</h3>
+        <h3 id="profile-title" tabindex="-1">Профиль для писем</h3>
         <p id="profile-info" class="muted"></p>
         <label for="resume">Опыт и навыки</label>
         <textarea id="resume" rows="4" maxlength="24000" placeholder="Подключите HH или добавьте текст резюме"></textarea>
-        <label class="checkbox"><input id="consent" type="checkbox"> Разрешаю Groq анализировать мой опыт и готовить письма</label>
+        <label id="groq-consent-label" class="checkbox"><input id="consent" type="checkbox"> Разрешаю Groq обрабатывать сведения для анализа, писем и резюме</label>
         <button class="primary" type="submit">Сохранить профиль</button>
       </form>
+      <section id="gemini-access" class="profile" aria-labelledby="gemini-title" hidden>
+        <div class="card-header">
+          <h3 id="gemini-title" tabindex="-1">Анализ Gemini</h3>
+          <span id="gemini-status" class="status"></span>
+        </div>
+        <p id="gemini-info" class="muted"></p>
+        <button id="gemini-consent" class="secondary" type="button" aria-describedby="gemini-info">Разрешить Gemini</button>
+      </section>
+      <section id="resume-studio" class="profile" aria-labelledby="resume-studio-title">
+        <h3 id="resume-studio-title" tabindex="-1">Редактор резюме</h3>
+        <form id="resume-studio-form" class="stack" autocomplete="off">
+          <div class="resume-studio-field">
+            <label for="resume-studio-mode">Что подготовить</label>
+            <select id="resume-studio-mode">
+              <option value="improve">Доработать существующее резюме</option>
+              <option value="build">Составить новое резюме</option>
+            </select>
+          </div>
+          <div class="resume-studio-field">
+            <label for="resume-studio-target">Желаемая должность</label>
+            <input id="resume-studio-target" type="text" minlength="2" maxlength="120" required>
+          </div>
+          <div class="resume-studio-field">
+            <label for="resume-studio-facts">Ваши факты и достижения</label>
+            <textarea id="resume-studio-facts" rows="4" maxlength="6000" aria-describedby="resume-studio-facts-help"></textarea>
+            <p id="resume-studio-facts-help" class="muted">Можно добавить обязанности, навыки и результаты, в которых вы уверены. Если профиль пуст, впишите свой опыт здесь.</p>
+          </div>
+          <p id="resume-studio-ai-help" class="muted"></p>
+          <label id="resume-studio-consent-label" class="checkbox" hidden>
+            <input id="resume-studio-consent" type="checkbox"> Разрешаю Groq обработать мой опыт и подготовить черновик
+          </label>
+          <button id="resume-studio-gemini-jump" class="secondary" type="button" aria-controls="gemini-access" hidden>Настроить доступ Gemini</button>
+          <button id="resume-studio-generate" class="primary" type="submit">Подготовить черновик</button>
+        </form>
+        <p id="resume-studio-status" class="muted" role="status" hidden></p>
+        <button id="resume-studio-check" class="secondary resume-studio-check" type="button" hidden>Проверить черновик</button>
+        <section id="resume-studio-result" class="resume-studio-result" aria-labelledby="resume-studio-result-title" hidden>
+          <h4 id="resume-studio-result-title">Черновик резюме</h4>
+          <p id="resume-studio-result-target" class="resume-name"></p>
+          <p id="resume-studio-sample" class="muted" hidden></p>
+          <p id="resume-studio-review" class="muted">Проверьте факты в тексте перед использованием.</p>
+          <div id="resume-studio-document" class="resume-studio-field" hidden>
+            <label for="resume-studio-preview">Текст черновика</label>
+            <textarea id="resume-studio-preview" rows="9" readonly></textarea>
+            <div class="actions">
+              <button id="resume-studio-export" class="secondary" type="button">Скачать TXT</button>
+              <button id="resume-studio-copy" class="secondary" type="button">Скопировать текст</button>
+              <button id="resume-studio-adopt" class="primary" type="button">Использовать для анализа</button>
+            </div>
+            <p id="resume-studio-hh-help" class="muted" hidden>Чтобы использовать этот текст для откликов HH, обновите резюме на HH и загрузите его в Mini App из карточки HeadHunter.</p>
+            <p id="resume-studio-in-use" class="muted" hidden>Этот текст уже используется для анализа вакансий.</p>
+          </div>
+          <div id="resume-studio-suggestions" hidden>
+            <h5>Что улучшить</h5>
+            <ul></ul>
+          </div>
+          <div id="resume-studio-questions" hidden>
+            <h5>Что стоит уточнить</h5>
+            <ul></ul>
+          </div>
+        </section>
+      </section>
       <p id="app-version" class="muted app-version" hidden></p>
     </section>
   </main>

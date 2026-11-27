@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -7,8 +8,11 @@ from dotenv import load_dotenv
 
 from app.local_browser import public_login_url
 
-VERSION = "6.4.0"
+VERSION = "6.5.0"
 DEFAULT_GROQ_DAILY_LIMIT = 50
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_DAILY_LIMIT = 50
+GEMINI_MODEL_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}")
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"
@@ -26,7 +30,7 @@ FIELDS = {
     "format": "Формат работы",
     "schedule": "График",
     "experience": "Опыт",
-    "score": "Минимальный общий балл Groq",
+    "score": "Минимальный общий балл анализа",
     "skills_score": "Совпадение по навыкам для автоотклика",
     "limit": "Суточный лимит отметок",
     "interval": "Интервал, мин",
@@ -79,6 +83,13 @@ def setting(key, value):
     return value
 
 
+def ai_daily_limit(env, name, default):
+    value = env.get(name, str(default)).strip()
+    if not value.isascii() or not value.isdigit() or len(value) > 4 or not 1 <= int(value) <= 1000:
+        raise ValueError(f"{name} должен быть целым числом от 1 до 1000.")
+    return int(value)
+
+
 @dataclass(frozen=True, repr=False)
 class Config:
     token: str
@@ -99,6 +110,13 @@ class Config:
     superjob_client_id: str = ""
     ors_key: str = ""
     groq_daily_limit: int = DEFAULT_GROQ_DAILY_LIMIT
+    gemini_key: str = ""
+    gemini_model: str = DEFAULT_GEMINI_MODEL
+    gemini_daily_limit: int = DEFAULT_GEMINI_DAILY_LIMIT
+
+    @property
+    def ai_configured(self):
+        return bool(self.groq_key or self.gemini_key)
 
     @classmethod
     def load(cls):
@@ -163,14 +181,13 @@ class Config:
                 raise ValueError("PORT должен быть целым числом.") from None
             if not 1 <= port <= 65535:
                 raise ValueError("PORT должен быть от 1 до 65535.")
-        groq_daily_limit = env.get("GROQ_DAILY_LIMIT", str(DEFAULT_GROQ_DAILY_LIMIT)).strip()
-        if (
-            not groq_daily_limit.isascii()
-            or not groq_daily_limit.isdigit()
-            or len(groq_daily_limit) > 4
-            or not 1 <= int(groq_daily_limit) <= 1000
-        ):
-            raise ValueError("GROQ_DAILY_LIMIT должен быть целым числом от 1 до 1000.")
+        groq_daily_limit = ai_daily_limit(env, "GROQ_DAILY_LIMIT", DEFAULT_GROQ_DAILY_LIMIT)
+        gemini_daily_limit = ai_daily_limit(env, "GEMINI_DAILY_LIMIT", DEFAULT_GEMINI_DAILY_LIMIT)
+        gemini_model = (env.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL).removeprefix(
+            "models/"
+        )
+        if not GEMINI_MODEL_ID.fullmatch(gemini_model):
+            raise ValueError("GEMINI_MODEL должен содержать идентификатор модели.")
         return cls(
             token,
             int(owner),
@@ -189,5 +206,8 @@ class Config:
             env.get("SUPERJOB_API_KEY", "").strip(),
             env.get("SUPERJOB_CLIENT_ID", "").strip(),
             env.get("ORS_API_KEY", "").strip(),
-            int(groq_daily_limit),
+            groq_daily_limit,
+            env.get("GEMINI_API_KEY", "").strip(),
+            gemini_model,
+            gemini_daily_limit,
         )

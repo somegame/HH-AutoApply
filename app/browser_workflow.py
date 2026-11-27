@@ -3,7 +3,9 @@ import hashlib
 import json
 import logging
 import time
-from contextlib import suppress
+from collections import Counter
+from contextlib import closing, suppress
+from datetime import datetime
 from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError
@@ -13,11 +15,30 @@ from app import hh_browser as hh
 from app.diagnostics import resource_warning
 from app.local_browser import LocalBrowser
 from app.login_view import SESSION_SECONDS, LoginView, waiting_for_sms
-from app.services import AUTO_ANALYSIS_POLICY, ServiceError, auto_letter_supported, clean_text
+from app.services import (
+    AUTO_ANALYSIS_POLICY,
+    ServiceError,
+    ai_allowed,
+    auto_letter_supported,
+    clean_text,
+)
 from app.vacancies import filter_reason, search_links, vacancy_id
 
 log = logging.getLogger(__name__)
 DISCOVERY_BATCH_SIZE = 3
+APPLICATION_MESSAGES = {
+    "analysis_pending": "Ожидает анализа.",
+    "analysis_error": "Анализ завершился ошибкой.",
+    "overall_below_threshold": "Общая оценка ниже текущего порога.",
+    "skills_below_threshold": "Совпадение навыков ниже текущего порога.",
+    "missing_requirements": "В резюме не подтверждены обязательные требования.",
+    "stale_analysis": "Требуется анализ по актуальному резюме и настройкам.",
+    "letter_review": "Письмо требует ручной проверки.",
+    "search_filters": "Вакансия не проходит сохранённые фильтры.",
+    "manual_review": "Проверьте форму или вопросы работодателя на HH.",
+    "unknown_outcome": "Сверьте историю откликов на HH.",
+    "manual_only": "Карточка доступна для ручного отклика.",
+}
 
 
 def next_query(items, offset, available):
@@ -152,7 +173,7 @@ class BrowserWorkflow:
         if resumes or fresh:
             values["hh_resume_choices"] = resumes
         if fresh or (resumes and selected and selected.get("id") not in resumes):
-            values.update(hh_selected_resume={}, groq_consent=False)
+            values.update(hh_selected_resume={}, groq_consent=False, gemini_consent=False)
         self.db.set_many(values)
 
     async def wait_for_account(self, context, page, *, resume_mode=False):
@@ -328,6 +349,7 @@ class BrowserWorkflow:
                 "resume": resume,
                 "hh_selected_resume": {"id": identifier, "name": name},
                 "groq_consent": unchanged and self.db.get("groq_consent", False),
+                "gemini_consent": unchanged and self.db.get("gemini_consent", False),
                 "browser_auto_enabled": unchanged and self.db.get("browser_auto_enabled", False),
             }
         )
@@ -337,15 +359,159 @@ class BrowserWorkflow:
         if self.db.get("hh_needs_login", False):
             raise ServiceError("Снова подключите HH перед отправкой откликов.")
         selected = self.db.get("hh_selected_resume", {})
-        if not selected or not self.db.get("resume"):
+        if not selected.get("id") or not self.db.get("resume"):
             raise ServiceError("Войдите в HH и выберите резюме.")
-        if not self.db.get("groq_consent") or not self.config.groq_key:
-            raise ServiceError("Разрешите анализ в Groq и проверьте ключ GROQ_API_KEY.")
+        if not ai_allowed(self.config, self.db):
+            raise ServiceError("Добавьте ключ модели на Bothost и разрешите анализ в профиле.")
         return selected
+
+    def application_status(self):
+        settings = self.db.settings(self.config)
+        day = datetime.now(self.config.zone).date().isoformat()
+        totals, rows = self.db.hh_application_overview(day)
+        resume = self.db.get("resume", "")
+        digest = hashlib.sha256(resume.encode()).hexdigest()
+        blocked = Counter()
+        examples = []
+        for row in rows[:200]:
+            reason, message = self.application_block(row, resume, settings, digest)
+            if reason is None:
+                continue
+            blocked[reason] += 1
+            title = json.loads(row["details"]).get("title")
+            if title and len(examples) < 3:
+                examples.append(
+                    {"id": row["id"], "title": title, "reason": reason, "message": message}
+                )
+        blocked.update(
+            {
+                "analysis_pending": totals["pending"] - blocked["analysis_pending"],
+                "unknown_outcome": totals["unknown"] - blocked["unknown_outcome"],
+            }
+        )
+        eligible = sum(1 for _ in self.eligible_applications(resume, settings, digest))
+        enabled = bool(self.db.get("browser_auto_enabled"))
+        search = bool(self.db.get("browser_search"))
+        retry = self.db.get("next_browser_operation", 0)
+        notice = self.db.get("browser_notice", "")
+        reason, message = self.application_summary(enabled, search, eligible, totals, settings)
+        if reason in {"auto_disabled", "no_candidates"} and notice:
+            message = f"{message} {notice}"
+        return totals | {
+            "enabled": enabled,
+            "ready": reason in {"ready", "no_candidates"},
+            "reason": reason,
+            "message": message,
+            "eligible": eligible,
+            "blocked": dict(blocked),
+            "examples": examples,
+            "daily_limit": settings["limit"],
+            "retry_at": retry if reason == "ready" and retry > time.time() else 0,
+            "sample_limited": len(rows) > 200,
+        }
+
+    def application_summary(self, enabled, search, eligible, totals, settings):
+        if not self.available:
+            return "browser_unavailable", "Включите Chromium в настройках Bothost."
+        if not self.config.persistent:
+            return "storage_unavailable", "Для отправки подтвердите постоянное хранилище Bothost."
+        if not self.config.auto_send:
+            return "auto_not_configured", "Разрешите автоотклики переменной AUTO_SEND на Bothost."
+        if not self.account_connected:
+            return "login_required", "Подключите аккаунт HH для отправки."
+        if not self.db.get("hh_selected_resume", {}).get("id") or not self.db.get("resume"):
+            return "resume_required", "Выберите резюме HH в разделе «Аккаунты»."
+        if not ai_allowed(self.config, self.db):
+            return "analysis_setup", "Проверьте ключ модели на Bothost и согласие в профиле."
+        if not (enabled and search):
+            return "auto_disabled", "Автоотклики выключены."
+        if totals["used_today"] >= settings["limit"]:
+            return "daily_limit", "Дневной лимит откликов достигнут."
+        if not eligible:
+            return "no_candidates", "Сейчас нет вакансий, готовых к автоотклику."
+        return "ready", "Автоотклики включены. Бот отправит готовые письма по очереди."
+
+    def application_block(self, row, resume, settings, digest):
+        details = json.loads(row["details"])
+        result = json.loads(row["result"] or "{}")
+        status = row["status"]
+        reason = {
+            "queued": "analysis_pending",
+            "error": "analysis_error",
+            "unknown": "unknown_outcome",
+            "questions": "manual_review",
+            "deferred": "manual_only",
+        }.get(status)
+        message = ""
+        if reason in {"analysis_error", "manual_review"}:
+            message = row["error"] or ""
+        if reason is None:
+            reason, message = self.application_result_block(
+                row, details, result, resume, settings, digest
+            )
+        return reason, message or APPLICATION_MESSAGES.get(reason, "")
+
+    def application_result_block(self, row, details, result, resume, settings, digest):
+        if details.get("source") != "browser":
+            return "manual_only", ""
+        try:
+            filtered = filter_reason(details, settings)
+        except (KeyError, TypeError, AttributeError):
+            return "search_filters", "В карточке недостаточно сведений для проверки фильтров."
+        if filtered:
+            return "search_filters", filtered
+        score, skills = result.get("score"), result.get("skills_score")
+        if result.get("resume_hash") != digest or type(score) is not int or type(skills) is not int:
+            return "stale_analysis", ""
+        if score < settings["score"]:
+            return (
+                "overall_below_threshold",
+                f"Общая оценка {score}% при пороге {settings['score']}%.",
+            )
+        if skills < settings["skills_score"]:
+            return (
+                "skills_below_threshold",
+                f"Навыки {skills}% при пороге {settings['skills_score']}%.",
+            )
+        if result.get("missing"):
+            return "missing_requirements", ""
+        old_threshold = result.get("analysis_threshold")
+        if row["status"] == "filtered" and (
+            type(old_threshold) is not int or old_threshold > settings["score"]
+        ):
+            return "stale_analysis", ""
+        if (
+            result.get("auto_policy") != AUTO_ANALYSIS_POLICY
+            or row["status"] not in {"draft", "approved"}
+            or not auto_letter_supported(
+                result,
+                resume,
+                details,
+                settings["score"],
+                row["letter"],
+                skills_threshold=settings["skills_score"],
+            )
+        ):
+            return "letter_review", ""
+        return None, ""
+
+    def eligible_applications(self, resume, settings, digest):
+        candidates = self.db.browser_candidates(
+            policy=AUTO_ANALYSIS_POLICY,
+            resume_hash=digest,
+            min_score=settings["score"],
+            min_skills=settings["skills_score"],
+        )
+        with closing(candidates):
+            for row in candidates:
+                if self.application_block(row, resume, settings, digest)[0] is None:
+                    yield row
 
     def start_search(self, *, send=False):
         if send:
             self.readiness()
+            if not self.account_connected:
+                raise ServiceError("Подключите аккаунт HH для автооткликов.")
         else:
             self.require_browser()
             if not self.account_connected:
@@ -356,7 +522,9 @@ class BrowserWorkflow:
             )
         if send:
             digest = hashlib.sha256(self.db.get("resume", "").encode()).hexdigest()
-            self.db.refresh_auto_drafts(AUTO_ANALYSIS_POLICY, digest)
+            self.db.refresh_auto_drafts(
+                AUTO_ANALYSIS_POLICY, digest, min_score=self.db.settings(self.config)["score"]
+            )
         self.db.set_many(
             {
                 "browser_search": True,
@@ -387,15 +555,12 @@ class BrowserWorkflow:
         )
         row = None
         if auto:
-            digest = hashlib.sha256(self.db.get("resume", "").encode()).hexdigest()
-            row = self.db.next_browser_application(
-                policy=AUTO_ANALYSIS_POLICY,
-                resume_hash=digest,
-                min_skills=settings["skills_score"],
-                min_score=settings["score"],
-            )
-        if row and self.db.counts(day)[1] >= settings["limit"]:
-            row = None
+            resume = self.db.get("resume", "")
+            digest = hashlib.sha256(resume.encode()).hexdigest()
+            self.db.refresh_auto_drafts(AUTO_ANALYSIS_POLICY, digest, min_score=settings["score"])
+            if self.db.counts(day)[1] < settings["limit"]:
+                with closing(self.eligible_applications(resume, settings, digest)) as eligible:
+                    row = next(eligible, None)
         if not (due or row):
             return
         send = row is not None and (not due or self.db.get("browser_send_turn", True))
@@ -564,33 +729,20 @@ class BrowserWorkflow:
         result = json.loads(row["result"] or "{}")
         manual = manual_revision is not None
         allowed_states = ("draft", "approved")
-        effective_settings = settings | (details.get("mini_filters", {}) if manual else {})
         resume_text = self.db.get("resume", "")
         resume_hash = hashlib.sha256(resume_text.encode()).hexdigest()
-        if (
-            filter_reason(details, effective_settings)
-            or result.get("score", -1) < settings["score"]
-            or result.get("resume_hash") != resume_hash
-            or not row["letter"]
-        ):
-            self.db.transition(identifier, allowed_states, "deferred")
+        if manual:
+            if self.pause_revision != manual_revision:
+                raise ServiceError("Отправка остановлена.")
+            if (
+                filter_reason(details, settings | details.get("mini_filters", {}))
+                or result.get("score", -1) < settings["score"]
+                or result.get("resume_hash") != resume_hash
+                or not row["letter"]
+            ):
+                raise ServiceError("Отклик требует новой оценки по текущему резюме и фильтрам.")
+        elif self.application_block(row, resume_text, settings, resume_hash)[0] is not None:
             return
-        if not manual and (
-            details.get("source") != "browser"
-            or result.get("auto_policy") != AUTO_ANALYSIS_POLICY
-            or not auto_letter_supported(
-                result,
-                resume_text,
-                details,
-                settings["score"],
-                row["letter"],
-                skills_threshold=settings["skills_score"],
-            )
-        ):
-            self.db.transition(identifier, allowed_states, "deferred")
-            return
-        if manual and self.pause_revision != manual_revision:
-            raise ServiceError("Отправка остановлена.")
         revision = self.pause_revision
         reserved = False
 
@@ -606,7 +758,7 @@ class BrowserWorkflow:
                 or current["result"] != row["result"]
                 or self.db.get("hh_selected_resume") != resume
                 or hashlib.sha256(self.db.get("resume", "").encode()).hexdigest() != resume_hash
-                or not self.db.get("groq_consent")
+                or not ai_allowed(self.config, self.db)
             ):
                 return False
             if self.db.settings(self.config) != settings:

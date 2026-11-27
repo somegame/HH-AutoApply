@@ -7,6 +7,7 @@ import httpx
 from app.vacancies import URL_FIELDS
 
 GROQ = "https://api.groq.com/openai/v1"
+AI_PROVIDERS = ("groq", "gemini")
 AUTO_ANALYSIS_POLICY = "hh-evidence-v3"
 ANALYSIS_FIELDS = (*URL_FIELDS, "salary_min", "salary_max", "currency")
 
@@ -17,8 +18,25 @@ class ServiceError(Exception):
         self.retry = retry
 
 
-class GroqUnavailable(ServiceError):
+class ProviderUnavailable(ServiceError):
     """The provider is unavailable for all queued vacancies."""
+
+    def __init__(self, message, retry, *, provider):
+        super().__init__(message, retry)
+        self.provider = provider
+
+
+class GroqUnavailable(ProviderUnavailable):
+    def __init__(self, message, retry):
+        super().__init__(message, retry, provider="groq")
+
+
+def provider_allowed(config, db, provider):
+    return bool(getattr(config, f"{provider}_key", "") and db.get(f"{provider}_consent"))
+
+
+def ai_allowed(config, db):
+    return any(provider_allowed(config, db, provider) for provider in AI_PROVIDERS)
 
 
 async def request(client, method, url, *, headers=None, payload=None):
@@ -83,6 +101,20 @@ RESULT_FIELDS = {
     "missing",
     "letter",
     "evidence",
+}
+ANALYSIS_SCHEMA = {
+    "type": "object",
+    "required": sorted(RESULT_FIELDS),
+    "properties": {
+        "score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "skills_score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "reason": {"type": "string"},
+        "letter": {"type": "string"},
+        **{
+            key: {"type": "array", "items": {"type": "string"}}
+            for key in ("duties", "required", "missing", "evidence")
+        },
+    },
 }
 PROMPT = (
     "Оцени соответствие вакансии резюме как независимый помощник соискателя. "
@@ -220,7 +252,7 @@ class Groq:
         ):
             raise ServiceError("Модель недоступна для этого ключа. Проверьте GROQ_MODEL.")
 
-    async def analyze(self, data):
+    async def complete(self, system, data, *, response_schema=None, max_tokens=2500):
         response = await request(
             self.client,
             "POST",
@@ -229,16 +261,18 @@ class Groq:
             payload={
                 "model": self.config.model,
                 "temperature": 0.3,
-                "max_completion_tokens": 2500,
+                "max_completion_tokens": max_tokens,
                 "response_format": {"type": "json_object"},
                 "messages": [
-                    {"role": "system", "content": PROMPT},
+                    {"role": "system", "content": system},
                     {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
                 ],
             },
         )
         try:
-            result = json.loads(response["choices"][0]["message"]["content"])
+            return json.loads(response["choices"][0]["message"]["content"])
         except (KeyError, IndexError, TypeError, ValueError):
             raise ServiceError("Groq не вернул читаемый JSON.") from None
-        return validate(result, data["resume"])
+
+    async def analyze(self, data):
+        return validate(await self.complete(PROMPT, data), data["resume"])

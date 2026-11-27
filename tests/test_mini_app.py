@@ -460,7 +460,7 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                 "hh_selected_resume": {"id": "123456789abc", "name": "Финансовый менеджер"},
             }
         )
-        config = replace(mini_config, browser_engine="chromium")
+        config = replace(mini_config, browser_engine="chromium", gemini_key="synthetic")
         async with httpx.AsyncClient(transport=httpx.MockTransport(mapped_source)) as sources:
             scheduler = Scheduler(config, db, sources)
             scheduler.browser.provider.state.write_text("{}")
@@ -479,6 +479,15 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     )
                     tile_requests = []
                     search_down = False
+                    draft = {
+                        "text": "Финансовый менеджер\n\nОпыт работы\n" + resume,
+                        "mode": "improve",
+                        "target": "Финансовый менеджер",
+                        "suggestions": ["Уточните инструменты для отчётности."],
+                        "questions": ["Сколько бюджетов вы вели?"],
+                        "sample_count": 2,
+                        "provider": "gemini",
+                    }
 
                     async def forward(route):
                         request = route.request
@@ -494,6 +503,21 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                             return
                         if search_down and url.path == "/mini/api/search-status":
                             await route.fulfill(status=504, body="Gateway Timeout")
+                            return
+                        if url.path == "/mini/api/resume-studio" and request.method == "POST":
+                            assert request.post_data_json == {
+                                "action": "generate",
+                                "mode": "improve",
+                                "target": "Финансовый менеджер",
+                                "facts": "Вёл бюджет проекта.",
+                            }
+                            db.set("resume_studio", draft)
+                            await route.fulfill(
+                                json={
+                                    "resume_studio": draft,
+                                    "resume_studio_status": {"status": "ready", "message": ""},
+                                }
+                            )
                             return
                         if url.hostname == "tile.openstreetmap.org":
                             tile_requests.append(url.path)
@@ -523,7 +547,7 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     await page.get_by_role("heading", name="Финансовый менеджер").wait_for()
                     matches = page.locator("#results")
                     card = matches.locator('[data-job-id="' + JOB_ID + '"]')
-                    await card.get_by_text("Ожидает анализа Groq", exact=True).wait_for()
+                    await card.get_by_text("Ожидает анализа", exact=True).wait_for()
                     search_down = True
                     await page.get_by_role("button", name="Обновить", exact=True).click()
                     await page.get_by_text(
@@ -542,12 +566,13 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                                 "Строить финансовые прогнозы.",
                             ],
                             "resume_hash": hashlib.sha256(resume.encode()).hexdigest(),
+                            "analysis_provider": "gemini",
                         },
                         "Письмо работодателю",
                     )
                     search_down = False
                     await page.get_by_role("button", name="Обновить результаты").click()
-                    await card.get_by_text("Оценка Groq", exact=True).wait_for()
+                    await card.get_by_text("Оценка Gemini", exact=True).wait_for()
                     await card.get_by_text("95%", exact=True).wait_for()
                     await card.get_by_text("Лучший вариант", exact=False).wait_for()
                     await card.get_by_text("Готовить отчёты о доходах и расходах.").wait_for()
@@ -569,7 +594,28 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     await page.get_by_text("Работа с бюджетами", exact=False).wait_for()
                     await page.get_by_role("button", name="Закрыть", exact=True).click()
                     await card.get_by_role("button", name="К откликам", exact=True).click()
-                    await page.get_by_role("heading", name="Отклики").wait_for()
+                    await page.get_by_role("heading", name="Отклики", exact=True).wait_for()
+                    db.add(
+                        "53",
+                        dict.fromkeys(URL_FIELDS, "")
+                        | {
+                            "source": "browser",
+                            "title": "Финансовый контролёр",
+                            "url": "https://hh.ru/vacancy/53",
+                        },
+                    )
+                    db.transition("53", ("queued",), "unknown")
+                    await page.get_by_role("button", name="Обновить", exact=True).click()
+                    await page.get_by_text("Требуют сверки на HH · 1.").wait_for()
+                    await page.get_by_text("Причины и недавние попытки").click()
+                    assert await page.get_by_text(
+                        "Результат отправки неизвестен", exact=False
+                    ).first.is_visible()
+                    assert await page.locator("#hh-activity-confirmed").text_content() == "0"
+                    await page.get_by_role("button", name="К проверке отправки").click()
+                    assert await page.evaluate(
+                        "document.activeElement.hasAttribute('data-hh-reconcile')"
+                    )
                     await (
                         page.get_by_role("navigation")
                         .get_by_role("button", name="Аккаунты")
@@ -585,6 +631,26 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     await page.get_by_text("Порог навыков сохранён · 91%.").wait_for()
                     assert db.settings(config)["skills_score"] == 91
                     assert not db.get("browser_auto_enabled")
+                    await page.get_by_role("button", name="Редактор резюме").click()
+                    await page.get_by_role("button", name="Настроить доступ Gemini").click()
+                    await page.get_by_role("heading", name="Анализ Gemini", exact=True).wait_for()
+                    await page.get_by_role("button", name="Разрешить Gemini").click()
+                    await page.get_by_text("Обработка в Gemini разрешена.", exact=True).wait_for()
+                    assert db.get("gemini_consent") is True
+                    assert not db.get("groq_consent")
+                    await page.get_by_role("button", name="Редактор резюме").click()
+                    await page.get_by_label("Ваши факты и достижения").fill("Вёл бюджет проекта.")
+                    await page.get_by_role("button", name="Подготовить черновик").click()
+                    await page.get_by_text("Уточните инструменты для отчётности.").wait_for()
+                    assert await page.get_by_label("Текст черновика").input_value() == draft["text"]
+                    assert await page.get_by_text("Gemini · Вакансий учтено: 2").is_visible()
+                    assert not await page.get_by_role(
+                        "button", name="Использовать для анализа"
+                    ).is_visible()
+                    assert db.get("resume") == resume
+                    await page.get_by_role("button", name="Отозвать разрешение Gemini").click()
+                    await page.get_by_text("Разрешение для Gemini отозвано.", exact=True).wait_for()
+                    assert not db.get("gemini_consent")
                     await page.set_viewport_size({"width": 320, "height": 680})
                     assert await page.evaluate("document.documentElement.scrollWidth") == 320
                     await browser.close()

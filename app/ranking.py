@@ -124,11 +124,13 @@ def _fit(job, resume, analysis):
         score = analysis.get("score")
         if type(score) is int and 0 <= score <= 100:
             missing = analysis.get("missing")
-            detail = "Оценка Groq по актуальному резюме."
+            provider = "gemini" if analysis.get("analysis_provider") == "gemini" else "groq"
+            name = "Gemini" if provider == "gemini" else "Groq"
+            detail = f"Оценка {name} по актуальному резюме."
             missing_count = len(missing) if isinstance(missing, list) else 0
             if missing_count:
                 detail += f" Не подтверждено обязательных требований: {missing_count}."
-            return score, "groq", detail, missing_count
+            return score, provider, detail, missing_count
     resume_terms = set(_terms(resume))
     title_terms = set(_terms(job.get("title")))
     description_terms = {
