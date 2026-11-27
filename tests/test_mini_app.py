@@ -53,6 +53,112 @@ def test_mini_signature_rejects_old_forged_repeated_and_foreign_data():
         assert not verify_init_data(data, TOKEN, OWNER, now=now)
 
 
+def test_habr_oauth_and_manual_vacancy_work_without_hh_access(mini_config):
+    async def run():
+        config = replace(
+            mini_config,
+            habr_client_id="fixture-app",
+            habr_client_secret="fixture-app-secret",
+        )
+        db = Database(config.data_dir)
+        db.set("browser_notice", "HH вернул HTTP 403. Операции остановлены.")
+        used = []
+
+        def upstream(request):
+            used.append(request.url.path)
+            assert request.url.host == "career.habr.com"
+            if request.url.path == "/integrations/oauth/token":
+                assert request.method == "POST"
+                assert dict(parse_qsl(request.content.decode())) == {
+                    "client_id": "fixture-app",
+                    "client_secret": "fixture-app-secret",
+                    "redirect_uri": PUBLIC_URL + "/mini/oauth/habr",
+                    "grant_type": "authorization_code",
+                    "code": "fixture-code",
+                }
+                return httpx.Response(200, json={"access_token": "fixture-token"})
+            assert request.url.path == "/api/v1/integrations/users/me"
+            assert dict(request.url.params) == {"access_token": "fixture-token"}
+            return httpx.Response(
+                200, json={"login": "fixture-owner", "email": "owner@example.test"}
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as source:
+            scheduler = Scheduler(config, db, source)
+            view = scheduler.browser.view
+            view.mini_app = MiniApp(config, db, scheduler, source, SimpleNamespace())
+            await view.start()
+            try:
+                port = view.runner.addresses[0][1]
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    headers = {
+                        "Origin": PUBLIC_URL,
+                        "Authorization": "tma " + signed(int(time.time())),
+                    }
+                    action = {"action": "connect"}
+                    response = await client.post(
+                        "/mini/api/habr", headers={"Origin": PUBLIC_URL}, json=action
+                    )
+                    assert response.status_code == 401
+                    opened = await client.post("/mini/api/habr", headers=headers, json=action)
+                    oauth = urlsplit(opened.json()["url"])
+                    params = parse_qs(oauth.query)
+                    assert oauth.hostname == "career.habr.com"
+                    assert oauth.path == "/integrations/oauth/authorize"
+                    assert params["response_type"] == ["code"]
+                    assert "client_secret" not in params
+                    callback = "/mini/oauth/habr"
+                    state = params["state"][0]
+                    invalid = await client.get(
+                        callback, params=[("state", state), ("state", state)]
+                    )
+                    assert invalid.headers["Location"] == "/mini/oauth/finished?provider=habr"
+                    assert not used
+                    response = await client.get(
+                        callback, params={"state": state, "code": "fixture-code"}
+                    )
+                    assert response.headers["Location"].endswith("provider=habr&connected=1")
+                    await client.get(callback, params={"state": state, "code": "fixture-code"})
+                    assert len(used) == 2
+                    snapshot = await client.get("/mini/api/state", headers=headers)
+                    data = snapshot.json()
+                    assert data["habr"]["profile"]["login"] == "fixture-owner"
+                    assert "fixture-token" not in snapshot.text
+                    assert "owner@example.test" not in snapshot.text
+                    assert db.get("habr_profile") == data["habr"]["profile"]
+                    assert data["hh_access_restricted"] and not data["hh_send"]
+                    assert not next(site for site in data["sources"] if site["id"] == "habr")[
+                        "in_app_apply"
+                    ]
+                    assert next(site for site in data["sources"] if site["id"] == "trudvsem")[
+                        "account_url"
+                    ].endswith("/auth/login")
+
+                    url = "/mini/api/import"
+                    vacancy = {
+                        "url": "https://career.habr.com/vacancies/201?ref=test",
+                        "title": "Аналитик",
+                    }
+                    first = await client.post(url, headers=headers, json=vacancy)
+                    assert first.json()["job"]["status"] == "deferred"
+                    edited = {
+                        "url": "https://career.habr.com/vacancies/201?ref=another",
+                        "description": "Аналитик финансовых данных\nПодготовка отчётов и план-факт анализ.",
+                    }
+                    upgraded = await client.post(url, headers=headers, json=edited)
+                    assert upgraded.json()["job"]["id"] == "habr:201"
+                    assert upgraded.json()["job"]["status"] == "queued"
+                    assert (
+                        "план-факт" in json.loads(db.vacancy("habr:201")["details"])["description"]
+                    )
+                    assert len(used) == 2
+            finally:
+                await scheduler.shutdown()
+                await view.shutdown()
+
+    asyncio.run(run())
+
+
 @pytest.fixture
 def mini_config(tmp_path, monkeypatch):
     monkeypatch.setattr("app.config.load_dotenv", lambda **_: None)
@@ -660,6 +766,24 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                         "heading", name="Навыки и опыт на HH"
                     ).is_visible()
                     assert await page.get_by_role("button", name="Открыть резюме в HH").is_enabled()
+                    await page.get_by_role("button", name="Добавить вакансию по ссылке").click()
+                    await page.get_by_label("Ссылка на вакансию", exact=True).fill(
+                        "https://career.habr.com/vacancies/201"
+                    )
+                    await page.get_by_label("Описание для анализа и письма").fill(
+                        "Финансовый аналитик\nПодготовка управленческих отчётов."
+                    )
+                    await page.get_by_role("button", name="Сохранить в журнал").click()
+                    imported = page.locator('article[data-job-id="habr:201"]')
+                    await imported.wait_for()
+                    assert await imported.get_by_role(
+                        "button", name="Открыть на площадке"
+                    ).is_enabled()
+                    assert await imported.get_by_role(
+                        "button", name="Отметить свой отклик"
+                    ).is_enabled()
+                    await page.locator("#journal-source").select_option("hh")
+                    assert not await imported.count()
                     await page.set_viewport_size({"width": 320, "height": 680})
                     assert await page.evaluate("document.documentElement.scrollWidth") == 320
                     await browser.close()

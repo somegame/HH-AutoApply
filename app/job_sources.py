@@ -20,6 +20,14 @@ SOURCES = {
     "rabota": ("Работа.ру", "https://www.rabota.ru/vacancy/"),
 }
 SEARCH_SOURCES = ("hh", "trudvsem", "superjob")
+ACCOUNT_URLS = {
+    "hh": "https://hh.ru/account/login",
+    "trudvsem": "https://trudvsem.ru/auth/login",
+    "superjob": "https://www.superjob.ru/",
+    "habr": "https://career.habr.com/",
+    "avito": "https://www.avito.ru/profile",
+    "rabota": "https://www.rabota.ru/profile",
+}
 
 
 def source_url(source, query, settings):
@@ -72,6 +80,18 @@ def source_vacancy_id(source, path):
         match = re.search(r"-([0-9]{1,18})\.html/?$", path)
         if match:
             return f"superjob:{int(match[1])}"
+    if source == "habr":
+        match = re.fullmatch(r"/vacancies/([0-9]{1,18})/?", path)
+        if match:
+            return f"habr:{int(match[1])}"
+    if source == "rabota":
+        match = re.fullmatch(r"/vacancy/([0-9]{1,18})/?", path)
+        if match:
+            return f"rabota:{int(match[1])}"
+    if source == "avito" and "/vakansii/" in path:
+        match = re.search(r"_([0-9]{1,18})/?$", path)
+        if match:
+            return f"avito:{int(match[1])}"
     return ""
 
 
@@ -254,6 +274,16 @@ class JobSources:
                 parse = superjob_row
             else:
                 raise ServiceError("Поиск доступен на сайте источника.")
+            if response.status_code == 429:
+                retry = response.headers.get("Retry-After", "")
+                seconds = int(retry) if re.fullmatch(r"[0-9]{1,6}", retry) else 120
+                raise ServiceError(
+                    "Площадка ограничила частоту поиска (HTTP 429).", max(120, seconds)
+                )
+            if response.status_code in {401, 403}:
+                raise ServiceError(
+                    "Площадка ограничила доступ. Проверьте подключение в «Аккаунтах».", 3600
+                )
             if not isinstance(data, list):
                 raise ServiceError(f"Источник не вернул вакансии (HTTP {response.status_code}).")
         except ServiceError:

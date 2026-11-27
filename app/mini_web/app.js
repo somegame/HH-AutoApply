@@ -12,7 +12,9 @@ const hhResumeBoundMessage = "Резюме HH загружено и привяз
 let state;
 let selectedTab = "search";
 let selectedFilter = "all";
+let journalSource = "all";
 let pendingSuperjob = "";
+let pendingHabr = "";
 let hhWindow;
 let loadingHHResumes = false;
 let profileDirty = false;
@@ -37,6 +39,7 @@ const modes = {
   browser: "Поиск и отклики",
   account: "Поиск и отклики",
   public: "Только поиск",
+  habr: "Подтверждение профиля",
   key: "Поиск подключён",
   needs_key: "Требуется настройка",
   link: "Нет подключения",
@@ -177,6 +180,21 @@ function canSend(job) {
   return false;
 }
 
+async function openImport(job) {
+  await changeTab("jobs");
+  const form = byId("import-vacancy");
+  form.open = true;
+  if (job) {
+    byId("job-url").value = job.url;
+    byId("job-title").value = job.title;
+    byId("job-company").value = job.company;
+    byId("job-description").focus();
+  } else {
+    byId("job-url").focus();
+  }
+  form.scrollIntoView({ block: "start" });
+}
+
 async function showVacancy(job) {
   const detail = await api("vacancy?" + new URLSearchParams({ id: job.id }));
   byId("job-dialog-title").textContent = detail.title;
@@ -267,7 +285,7 @@ function jobCard(job, history) {
       changeTab("jobs");
     }, true));
     actions.append(discovery.compareButton(job));
-    if (!provider?.in_app_apply) card.append(el("p", "Площадка доступна для поиска. Отправка здесь не подключена.", "muted"));
+    if (!provider?.in_app_apply) card.append(el("p", "Отклик можно отправить на сайте площадки.", "muted"));
   } else if (job.can_send && canSend(job)) {
     const button = action("Отправить отклик", async () => {
       if (await confirmAction("Отправить резюме и письмо работодателю через " + sourceName(job.source) + "?")) {
@@ -288,6 +306,20 @@ function jobCard(job, history) {
     actions.append(button);
   } else if (job.can_send && provider?.in_app_apply) {
     actions.append(action("Проверить аккаунт", () => changeTab("connections")));
+  }
+  if (history && job.url && !canSend(job)) {
+    actions.append(action("Открыть на площадке", () => external(job.url)));
+    if (job.status === "deferred") {
+      actions.append(action("Добавить описание", () => openImport(job)));
+    }
+    if (["queued", "draft", "approved", "deferred", "filtered", "questions", "error"].includes(job.status)) {
+      actions.append(action("Отметить свой отклик", async () => {
+        if (!await confirmAction("Вы уже отправили отклик на сайте площадки?")) return;
+        await api("job", { id: job.id, action: "reported", confirm: true });
+        await refresh();
+        showFeedback("В журнал добавлена ваша отметка об отправке.");
+      }));
+    }
   }
   if (history && job.status === "unknown" && job.source === "hh") {
     const verify = action("Проверить отправку", async () => {
@@ -405,7 +437,17 @@ function renderHHActivity() {
 }
 
 function renderJobs() {
-  const filtered = state.jobs.filter(job => selectedFilter === "all" || (selectedFilter === "sent") === sent.has(job.status));
+  const filtered = state.jobs.filter(job =>
+    (journalSource === "all" || job.source === journalSource) &&
+    (selectedFilter === "all" || (selectedFilter === "sent") === sent.has(job.status)));
+  const picker = byId("journal-source");
+  const sources = [["all", "Все площадки"], ...state.sources.map(source => [source.id, source.name]), ["external", "Другие сайты"]];
+  picker.replaceChildren(...sources.map(([id, name]) => {
+    const option = el("option", name);
+    option.value = id;
+    return option;
+  }));
+  picker.value = journalSource;
   byId("total-count").textContent = state.summary.total;
   byId("sent-count").textContent = state.summary.sent;
   byId("today-count").textContent = state.summary.today + " / " + state.daily_limit;
@@ -426,7 +468,8 @@ function renderJobs() {
     })
   );
   if (!filtered.length) {
-    byId("jobs").replaceChildren(el("p", selectedFilter === "sent" ? "Отправленных откликов пока нет." : "Подготовьте отклик из результатов поиска.", "empty"));
+    byId("jobs").replaceChildren(el("p", journalSource !== "all" ? "Здесь пока нет карточек этой площадки." :
+      selectedFilter === "sent" ? "Отправленных откликов пока нет." : "Подготовьте отклик из результатов поиска.", "empty"));
     return;
   }
   const ordered = selectedFilter === "sent"
@@ -558,6 +601,7 @@ function renderHHAuto() {
     }, true));
     const source = state.sources.find(item => item.id === "hh");
     if (source) operations.append(action("Открыть вакансии на HH", () => external(source.url)));
+    operations.append(action("Добавить вакансию по ссылке", () => openImport()));
   } else if (state.hh_auto) {
     operations.append(action("Оставить только поиск", async () => {
       applyState(await api("hh-mode", { mode: "search" }));
@@ -683,6 +727,42 @@ function renderSuperjob(card, operations) {
   }
 }
 
+function renderHabr(card, operations) {
+  const account = state.habr;
+  if (account?.profile?.login) card.append(el("p", "@" + account.profile.login, "resume-name"));
+  card.append(el("p", account?.status ||
+    "Профиль можно подтвердить через Хабр Аккаунт. Отклики отправляются на Хабр Карьере.", "muted"));
+  if (!account?.enabled) {
+    if (account?.applications_url) operations.append(action("Настроить OAuth", () => external(account.applications_url)));
+    return;
+  }
+  if (pendingHabr && !account.status.startsWith("Завершите вход")) pendingHabr = "";
+  if (pendingHabr) {
+    operations.append(action("Войти через Хабр Аккаунт", () => external(pendingHabr), true));
+  }
+  operations.append(action(account.profile.login ? "Подтвердить профиль заново" : "Подтвердить профиль", async () => {
+    pendingHabr = (await api("habr", { action: "connect" })).url;
+    await refresh();
+  }, !pendingHabr));
+  if (account.profile.login) operations.append(action("Убрать профиль", async () => {
+    if (!await confirmAction("Убрать связь с профилем Хабр Карьеры из Mini App?")) return;
+    pendingHabr = "";
+    applyState(await api("habr", { action: "disconnect", confirm: true }));
+  }));
+}
+
+function renderHubSearch(card, operations, source) {
+  const search = state.hub?.[source.id];
+  if (!search?.available) return;
+  if (search.enabled) {
+    card.append(el("p", ["Фоновый поиск включён.", search.message,
+      search.last_at && "Последняя проверка " + activityDate(search.last_at) + "."].filter(Boolean).join(" "), "muted"));
+  }
+  operations.append(action(search.enabled ? "Остановить автопоиск" : "Включить автопоиск", async () => {
+    applyState(await api("hub", { source: source.id, enabled: !search.enabled }));
+  }));
+}
+
 function renderStudioNotes(id, notes) {
   const section = byId(id);
   const values = Array.isArray(notes) ? notes.filter(value => typeof value === "string" && value.trim()) : [];
@@ -800,15 +880,25 @@ function renderConnections() {
   for (const source of state.sources) {
     const card = el("article", "", "card");
     const head = el("div", "", "card-header");
-    const linked = (source.id === "hh" && state.hh_connected) ||
+    const habrLinked = source.id === "habr" && state.habr?.profile?.login;
+    const linked = (source.id === "hh" && state.hh_connected && !state.hh_access_restricted) ||
       (source.id === "superjob" && state.superjob.connected && !state.superjob.status.startsWith("Нужно снова"));
-    head.append(el("h3", source.name), el("span", linked ? "Подключён" : modes[source.mode], linked ? "status good" : "status"));
+    const badge = habrLinked ? "Профиль подтверждён" : source.id === "hh" && state.hh_access_restricted ?
+      "Доступ ограничен" : linked ? "Подключён" : source.mode === "link" ? "Вход на сайте" : modes[source.mode];
+    head.append(el("h3", source.name), el("span", badge, linked || habrLinked ? "status good" : "status"));
     card.append(head);
     const operations = el("div", "", "actions");
     if (source.id === "hh" && source.mode === "browser") renderHH(card, operations);
     else if (source.id === "superjob") renderSuperjob(card, operations);
-    else card.append(el("p", source.mode === "public" ? "Вакансии доступны в поиске. Личный аккаунт здесь не подключается." :
-      "Подключение аккаунта и отправка откликов пока недоступны.", "muted"));
+    else if (source.id === "habr") renderHabr(card, operations);
+    else card.append(el("p", source.id === "trudvsem" ?
+      "Вакансии доступны в Mini App. В личный кабинет можно войти на портале через Госуслуги." :
+      "Войдите на сайте площадки. Вакансии можно добавить в общий журнал по ссылке.", "muted"));
+    renderHubSearch(card, operations, source);
+    if (source.account_url) operations.append(action("Открыть аккаунт на сайте", () => external(source.account_url)));
+    if (source.url && (source.id !== "hh" || !state.hh_access_restricted)) {
+      operations.append(action("Вакансии на сайте", () => external(source.url)));
+    }
     if (operations.childElementCount) card.append(operations);
     cards.push(card);
   }
@@ -939,7 +1029,9 @@ function applyState(next, first = false) {
   if (first) {
     for (const key of ["query", "region", "salary"]) byId(key).value = state.defaults[key];
     byId("search-related").checked = Boolean(state.defaults.use_related);
-    for (const source of state.sources) byId("source").append(new Option(source.name, source.id));
+    for (const source of state.sources) {
+      if (source.in_app_search) byId("source").append(new Option(source.name, source.id));
+    }
     byId("launch").hidden = true;
     byId("navigation").hidden = byId("panel-search").hidden = false;
   }
@@ -1004,7 +1096,13 @@ function showSearchResults(search, result) {
     notices.replaceChildren(...result.notices.map(notice => {
       const node = el("div", "", "source-note");
       node.append(el("p", sourceName(notice.source) + " · " + notice.message, "muted"));
-      node.append(action("Аккаунты", () => changeTab("connections")));
+      const source = state.sources.find(item => item.id === notice.source);
+      if (notice.source === "hh" && state.hh_access_restricted && source) {
+        node.append(action("Поиск на HH", () => external(source.url)));
+        node.append(action("Добавить ссылку", () => openImport()));
+      } else {
+        node.append(action("Аккаунты", () => changeTab("connections")));
+      }
       return node;
     }));
     search.noticeSnapshot = notes;
@@ -1121,6 +1219,7 @@ byId("import-form").addEventListener("submit", async event => {
     event.target.reset();
     event.target.parentElement.open = false;
     selectedFilter = "all";
+    journalSource = result.job.source;
     for (const item of document.querySelectorAll("#jobs-filters button")) {
       item.setAttribute("aria-pressed", String(item.dataset.filter === "all"));
     }
@@ -1364,6 +1463,10 @@ for (const button of document.querySelectorAll("#jobs-filters button")) {
     renderJobs();
   });
 }
+byId("journal-source").addEventListener("change", event => {
+  journalSource = event.target.value;
+  renderJobs();
+});
 byId("hh-activity-settings").addEventListener("click", async () => {
   await changeTab("connections");
   if (!byId("hh-auto-card").hidden) dataAccessSection("hh-auto-title");
