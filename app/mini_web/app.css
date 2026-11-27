@@ -141,6 +141,11 @@ dialog::backdrop { background: #0f263aad; }
 .dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 9px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
 .dialog-head h2 { font-size: 1.12rem; }
 dialog iframe { width: 100%; border: 0; display: block; height: min(630px, calc(100dvh - 92px - var(--top) - var(--bottom))); }
+.hh-edit-tools { display: grid; gap: 0.45rem; margin: 0 1rem 0.8rem; }
+.hh-edit-tools p { margin: 0; }
+#hh-dialog[data-mode="edit"] iframe { height: min(570px, calc(100dvh - 285px - var(--top) - var(--bottom))); min-height: 265px; }
+.hh-edit-proposal summary { cursor: pointer; }
+.hh-edit-proposal p { white-space: pre-line; }
 .dialog-form { display: grid; gap: 9px; padding: 15px; overflow-wrap: anywhere; }
 .form-error { color: var(--danger); }
 .job-body { display: grid; gap: 12px; padding: 15px; }

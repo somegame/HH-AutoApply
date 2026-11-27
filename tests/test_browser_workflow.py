@@ -44,7 +44,9 @@ def test_persistent_attempt_recovery_and_reconciliation(tmp_path):
     assert restarted.counts(day)[1] == 1
 
 
-@pytest.mark.parametrize("scenario", ["sent", "unknown", "questions", "captcha", "limit"])
+@pytest.mark.parametrize(
+    "scenario", ["sent", "unknown", "questions", "captcha", "limit", "inline", "wrong_id"]
+)
 def test_submit_requires_letter_resume_and_confirmation(scenario):
     executable = shutil.which("chromium") or shutil.which("google-chrome")
     if not executable:
@@ -53,25 +55,32 @@ def test_submit_requires_letter_resume_and_confirmation(scenario):
     reserved = []
     letter = "Здравствуйте! Готов обсудить бюджетирование."
 
+    def fixture_form(vacancy_field=""):
+        return f"""<form data-qa="vacancy-response-popup-form" action="/fixture-submit">
+          {vacancy_field}
+          <input type="radio" name="resumeId" value="{RESUME}">
+          <textarea data-qa="vacancy-response-popup-form-letter-input" name="letter"></textarea>
+          {'<textarea data-qa="employer-question"></textarea>' if scenario == "questions" else ""}
+          <button data-qa="vacancy-response-popup-submit-button">Отправить</button>
+        </form>"""
+
     async def respond(route):
         path = route.request.url.split("hh.ru", 1)[1].split("?", 1)[0]
         if path == f"/vacancy/{VACANCY}":
-            if submissions and scenario == "sent":
+            if submissions and scenario in {"sent", "inline"}:
                 html = '<a data-qa="vacancy-response-link-view-response">Мой отклик</a>'
             elif scenario == "captcha":
                 html = '<form action="/captcha"><input name="captcha"></form>'
+            elif scenario in {"inline", "wrong_id"}:
+                identifier = VACANCY if scenario == "inline" else "990"
+                html = fixture_form(f'<input type="hidden" name="vacancyId" value="{identifier}">')
             else:
                 html = (
                     f'<a data-qa="vacancy-response-link-top" '
                     f'href="/applicant/vacancy_response?vacancyId={VACANCY}">Откликнуться</a>'
                 )
         elif path == "/applicant/vacancy_response":
-            html = f"""<form data-qa="vacancy-response-popup-form" action="/fixture-submit">
-              <input type="radio" name="resumeId" value="{RESUME}">
-              <textarea data-qa="vacancy-response-popup-form-letter-input" name="letter"></textarea>
-              {'<textarea data-qa="employer-question"></textarea>' if scenario == "questions" else ""}
-              <button data-qa="vacancy-response-popup-submit-button">Отправить</button>
-            </form>"""
+            html = fixture_form()
         elif path == "/fixture-submit":
             submissions.append(route.request.url)
             html = "<p>Отклик отправлен</p>"
@@ -88,23 +97,27 @@ def test_submit_requires_letter_resume_and_confirmation(scenario):
             browser = await driver.chromium.launch(executable_path=executable)
             page = await browser.new_page()
             await page.route("**/*", respond)
-            if scenario in {"questions", "captcha"}:
+            if scenario in {"questions", "captcha", "wrong_id"}:
                 with pytest.raises(
-                    hh_browser.HHQuestions if scenario == "questions" else hh_browser.HHAttention
+                    hh_browser.HHAttention if scenario == "captcha" else hh_browser.HHQuestions
                 ):
                     await hh_browser.apply(page, VACANCY, RESUME, letter, reserve)
             else:
-                assert await hh_browser.apply(page, VACANCY, RESUME, letter, reserve) == scenario
+                expected = "sent" if scenario == "inline" else scenario
+                assert await hh_browser.apply(page, VACANCY, RESUME, letter, reserve) == expected
             await browser.close()
 
     asyncio.run(run())
-    assert bool(reserved) == (scenario in {"sent", "unknown", "limit"})
-    assert bool(submissions) == (scenario in {"sent", "unknown"})
+    assert bool(reserved) == (scenario in {"sent", "unknown", "limit", "inline"})
+    assert bool(submissions) == (scenario in {"sent", "unknown", "inline"})
     if submissions:
-        assert parse_qs(urlsplit(submissions[0]).query) == {
+        expected_fields = {
             "resumeId": [RESUME],
             "letter": [letter],
         }
+        if scenario == "inline":
+            expected_fields["vacancyId"] = [VACANCY]
+        assert parse_qs(urlsplit(submissions[0]).query) == expected_fields
 
 
 def test_background_pagination_takes_all_ids_and_only_valid_next_links():

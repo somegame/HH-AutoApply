@@ -231,6 +231,16 @@
         <p id="gemini-info" class="muted"></p>
         <button id="gemini-consent" class="secondary" type="button" aria-describedby="gemini-info">Разрешить Gemini</button>
       </section>
+      <section id="hh-resume-editor" class="profile" aria-labelledby="hh-editor-title" hidden>
+        <h3 id="hh-editor-title" tabindex="-1">Навыки и опыт на HH</h3>
+        <p id="hh-editor-resume" class="muted"></p>
+        <div class="actions">
+          <button id="hh-editor-prepare" class="primary" type="button">Разобрать навыки и обязанности</button>
+          <button id="hh-editor-native" class="secondary" type="button">Открыть резюме в HH</button>
+        </div>
+        <p id="hh-editor-status" role="status" class="muted" hidden></p>
+        <div id="hh-editor-changes" class="stack"></div>
+      </section>
       <section id="resume-studio" class="profile" aria-labelledby="resume-studio-title">
         <h3 id="resume-studio-title" tabindex="-1">Редактор резюме</h3>
         <form id="resume-studio-form" class="stack" autocomplete="off">
@@ -272,7 +282,7 @@
               <button id="resume-studio-copy" class="secondary" type="button">Скопировать текст</button>
               <button id="resume-studio-adopt" class="primary" type="button">Использовать для анализа</button>
             </div>
-            <p id="resume-studio-hh-help" class="muted" hidden>Чтобы использовать этот текст для откликов HH, обновите резюме на HH и загрузите его в Mini App из карточки HeadHunter.</p>
+            <p id="resume-studio-hh-help" class="muted" hidden>Для отдельных навыков и мест работы используйте «Навыки и опыт на HH».</p>
             <p id="resume-studio-in-use" class="muted" hidden>Этот текст уже используется для анализа вакансий.</p>
           </div>
           <div id="resume-studio-suggestions" hidden>
@@ -300,6 +310,16 @@
       <h2 id="hh-dialog-title">Подключение HH</h2>
       <button class="secondary" id="close-hh" type="button">Закрыть</button>
     </header>
+    <section id="hh-edit-tools" class="hh-edit-tools" hidden>
+      <label for="hh-edit-change">Что вставить в поле HH</label>
+      <select id="hh-edit-change"></select>
+      <p id="hh-edit-help" class="muted"></p>
+      <div class="actions">
+        <button id="hh-edit-fill" class="primary" type="button">Заполнить поле</button>
+        <button id="hh-edit-verify" class="secondary" type="button">Проверить после сохранения</button>
+      </div>
+      <p id="hh-edit-status" class="muted" role="status" hidden></p>
+    </section>
     <iframe id="hh-frame" title="Защищённое окно входа HH" referrerpolicy="no-referrer"></iframe>
   </dialog>
   <dialog id="hh-resume-url-dialog" aria-labelledby="hh-resume-url-title">

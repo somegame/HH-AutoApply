@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections import Counter
 from contextlib import closing, suppress
@@ -12,6 +13,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as BrowserTimeout
 
 from app import hh_browser as hh
+from app import hh_resume_editor
 from app.diagnostics import resource_warning
 from app.local_browser import LocalBrowser
 from app.login_view import SESSION_SECONDS, LoginView, waiting_for_sms
@@ -26,6 +28,12 @@ from app.vacancies import filter_reason, search_links, vacancy_id
 
 log = logging.getLogger(__name__)
 DISCOVERY_BATCH_SIZE = 3
+ACCESS_STEPS = {
+    "search": "при открытии поиска",
+    "vacancy": "при открытии вакансии",
+    "application": "при открытии формы отклика",
+    "resume": "при открытии резюме",
+}
 APPLICATION_MESSAGES = {
     "analysis_pending": "Ожидает анализа.",
     "analysis_error": "Анализ завершился ошибкой.",
@@ -56,6 +64,7 @@ class BrowserWorkflow:
         self.view = LoginView(config)
         self.lock = asyncio.Lock()
         self.login_task = None
+        self.editor_identifier = ""
         self.pause_revision = 0
 
     @property
@@ -77,6 +86,70 @@ class BrowserWorkflow:
         self.provider.check_installation()
         if warning := resource_warning(self.config.data_dir):
             raise ServiceError(warning)
+
+    def access_barrier(self):
+        stored = self.db.get("hh_access_barrier", {})
+        if stored:
+            return stored
+        notice = self.db.get("browser_notice", "")
+        if match := re.search(r"HH вернул HTTP (403|429|503)", notice):
+            return {"status": int(match[1]), "step": "", "message": notice}
+        return {}
+
+    def record_access_barrier(self, error):
+        path = urlsplit(error.url).path.rstrip("/")
+        step = ""
+        if path == "/search/vacancy":
+            step = "search"
+        elif path == "/applicant/vacancy_response":
+            step = "application"
+        elif path.startswith("/vacancy/"):
+            step = "vacancy"
+        elif path.startswith(("/resume/", "/applicant/resume")):
+            step = "resume"
+        prefix = f"HH вернул HTTP {error.status}" if error.status else "HH ограничил доступ"
+        message = f"{prefix} {ACCESS_STEPS[step]}." if step else f"{prefix}."
+        message += " Отклики поставлены на паузу."
+        self.db.set(
+            "hh_access_barrier",
+            {"status": error.status, "step": step, "message": message, "url": error.url},
+        )
+        self.pause(message)
+
+    async def check_access(self):
+        self.require_browser()
+        if not self.account_connected:
+            raise ServiceError("Сначала подключите аккаунт HH.")
+        if self.lock.locked():
+            raise ServiceError("Браузер занят. Повторите проверку после завершения операции.")
+        barrier = self.access_barrier()
+        # Revisit only the read-only page that was opened through HH's visible UI.
+        url = barrier.get("url") if barrier.get("step") else None
+        try:
+            async with self.lock:
+                async with self.provider.session(35) as (_, page):
+                    if url:
+                        response = await hh.open_page(page, url)
+                        if (
+                            not response
+                            or response.status >= 400
+                            or urlsplit(page.url).path.rstrip("/") != urlsplit(url).path.rstrip("/")
+                        ):
+                            raise ServiceError("HH пока не открыл страницу. Проверьте её на сайте.")
+                    else:
+                        _, search = next(iter(search_links(self.db.settings(self.config))))
+                        await hh.search_ids(page, search)
+        except hh.HHAccessBarrier as exc:
+            self.record_access_barrier(exc)
+            return False
+        self.db.set_many(
+            {
+                "hh_access_barrier": {},
+                "browser_notice": "Проверенная страница HH открывается. Режим можно включить снова.",
+                "next_browser_operation": 0,
+            }
+        )
+        return True
 
     async def start_login(self, notify=None, *, in_mini=False, fresh=False, resume_mode=False):
         self.require_browser()
@@ -146,6 +219,8 @@ class BrowserWorkflow:
             except hh.HHAttention as exc:
                 result = exc
                 status = "blocked"
+                if isinstance(exc, hh.HHAccessBarrier):
+                    self.record_access_barrier(exc)
             except ServiceError as exc:
                 result = exc
             except asyncio.CancelledError:
@@ -256,6 +331,132 @@ class BrowserWorkflow:
             self.login_task = None
         await self.view.revoke()
 
+    def editor_resume(self):
+        self.require_browser()
+        if not self.account_connected:
+            raise ServiceError("Подключите аккаунт HH, чтобы изменить резюме.")
+        identifier = self.db.get("hh_selected_resume", {}).get("id", "")
+        if not hh.RESUME_ID.fullmatch(f"/resume/{identifier}"):
+            raise ServiceError("Выберите резюме HH в «Аккаунтах».")
+        if self.access_barrier():
+            raise ServiceError("Проверьте доступ HH. Карточку также можно открыть на самом HH.")
+        return identifier
+
+    async def read_editor_sections(self, identifier):
+        if self.lock.locked():
+            raise ServiceError("Браузер занят. Повторите после завершения операции.")
+        async with self.lock:
+            async with self.provider.session(30) as (_, page):
+                return await hh_resume_editor.resume_sections(page, identifier)
+
+    async def open_editor(self, identifier):
+        if self.lock.locked() or (self.login_task and not self.login_task.done()):
+            raise ServiceError("Сначала закройте другое окно HH или дождитесь завершения поиска.")
+        await self.view.start()
+        if not self.view.runner:
+            raise ServiceError("Настройте HTTPS-домен Bothost для окна HH.")
+        self.pause("Автоотклики на паузе на время редактирования резюме.", keep_search=True)
+        ready = asyncio.get_running_loop().create_future()
+        self.login_task = asyncio.create_task(self.editor_window(ready, identifier))
+        try:
+            return await asyncio.shield(ready)
+        except BaseException:
+            if not ready.done():
+                ready.cancel()
+                await self.cancel_login()
+            raise
+
+    async def editor_window(self, ready, identifier):
+        async with self.lock:
+            try:
+                async with self.provider.session(SESSION_SECONDS + 30, interactive=True) as (
+                    context,
+                    page,
+                ):
+                    await hh.open_page(page, f"{hh.HH}/resume/{identifier}")
+                    if identifier not in await hh.owned_resume(page):
+                        raise ServiceError("HH не подтвердил, что открыто ваше выбранное резюме.")
+                    url = await self.view.issue(page)
+                    self.editor_identifier = identifier
+                    ready.set_result(url.replace("/hh-login#", "/mini/hh-login?mode=edit#", 1))
+                    await self.view.check.wait()
+                    await self.provider.save(context)
+                    return {identifier: self.db.get("hh_selected_resume", {}).get("name", "")}
+            except asyncio.CancelledError:
+                if not ready.done():
+                    ready.cancel()
+                raise
+            except (ServiceError, PlaywrightError, TimeoutError) as exc:
+                error = (
+                    exc
+                    if isinstance(exc, ServiceError)
+                    else ServiceError("Окно редактирования HH закрыто. Откройте его снова.")
+                )
+                if not ready.done():
+                    ready.set_exception(error)
+                return error
+            except Exception as exc:
+                log.warning("Не удалось открыть редактор HH (%s)", type(exc).__name__)
+                error = ServiceError("Не удалось открыть редактор HH.")
+                if not ready.done():
+                    ready.set_exception(error)
+                return error
+            finally:
+                self.editor_identifier = ""
+                await self.view.revoke()
+
+    async def edit_resume_fields(self, proposal, kind, index):
+        async with self.view.lock:
+            page = self.current_editor_page(proposal)
+            await hh_resume_editor.fill_change(page, proposal, kind, index)
+
+    def current_editor_page(self, proposal):
+        if (
+            not self.view.page
+            or not self.editor_identifier
+            or self.editor_identifier != proposal["resume_id"]
+            or self.editor_identifier != self.db.get("hh_selected_resume", {}).get("id")
+        ):
+            raise ServiceError("Откройте окно редактирования выбранного резюме HH.")
+        return self.view.page
+
+    async def verify_editor_changes(self, proposal):
+        async with self.view.lock:
+            page = self.current_editor_page(proposal)
+            identifier = self.editor_identifier
+            current = await hh_resume_editor.resume_sections(page, identifier)
+            skills = {hh_resume_editor.normalized(value).casefold() for value in current["skills"]}
+            verified = {
+                "skills": [
+                    index
+                    for index, item in enumerate(proposal["skills"])
+                    if item["name"].casefold() in skills
+                ],
+                "duties": [
+                    index
+                    for index, item in enumerate(proposal["duties"])
+                    if any(
+                        job["company"] == item["company"]
+                        and job["role"] == item["role"]
+                        and hh_resume_editor.normalized(job["duties"])
+                        == hh_resume_editor.normalized(item["text"])
+                        for job in current["jobs"]
+                    )
+                ],
+            }
+            if verified["skills"] or verified["duties"]:
+                _, resume = await hh.read_owned_resume(page, identifier)
+                if self.db.get("hh_selected_resume", {}).get("id") != identifier:
+                    raise ServiceError("Выбранное резюме изменилось. Откройте его заново.")
+                await self.provider.save(page.context)
+                self.db.set_many(
+                    {
+                        "resume": clean_text(resume),
+                        "browser_notice": "Изменения резюме подтверждены на HH. Автоотклики можно включить снова.",
+                    }
+                )
+            return verified
+
     async def refresh_resumes(self, url=None):
         self.require_browser()
         if not self.account_connected:
@@ -303,7 +504,7 @@ class BrowserWorkflow:
                 elif warning:
                     self.db.set("hh_resumes_status", warning)
             except hh.HHAccessBarrier as exc:
-                self.pause(str(exc))
+                self.record_access_barrier(exc)
                 self.db.set("hh_resumes_status", str(exc))
                 raise
             except hh.HHLoginRequired:
@@ -413,6 +614,8 @@ class BrowserWorkflow:
     def application_summary(self, enabled, search, eligible, totals, settings):
         if not self.available:
             return "browser_unavailable", "Включите Chromium в настройках Bothost."
+        if barrier := self.access_barrier():
+            return "access_restricted", barrier["message"]
         if not self.config.persistent:
             return "storage_unavailable", "Для отправки подтвердите постоянное хранилище Bothost."
         if not self.config.auto_send:
@@ -508,6 +711,9 @@ class BrowserWorkflow:
                     yield row
 
     def start_search(self, *, send=False):
+        if barrier := self.access_barrier():
+            self.db.set("hh_access_barrier", barrier)
+            raise ServiceError("Сначала нажмите «Проверить доступ HH» в Mini App.")
         if send:
             self.readiness()
             if not self.account_connected:
@@ -697,6 +903,8 @@ class BrowserWorkflow:
         return False
 
     async def submit_selected(self, bot, row, day):
+        if self.access_barrier():
+            raise ServiceError("Сначала проверьте доступ HH или откройте вакансию на сайте.")
         selected = self.readiness()
         if not self.config.persistent:
             raise ServiceError("Для отправки через HH подключите постоянное хранилище Bothost.")

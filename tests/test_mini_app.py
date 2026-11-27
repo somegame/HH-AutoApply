@@ -651,6 +651,15 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     await page.get_by_role("button", name="Отозвать разрешение Gemini").click()
                     await page.get_by_text("Разрешение для Gemini отозвано.", exact=True).wait_for()
                     assert not db.get("gemini_consent")
+                    db.set("browser_notice", "HH вернул HTTP 403. Операции остановлены.")
+                    await page.get_by_role("button", name="Обновить", exact=True).click()
+                    await page.get_by_role("button", name="Проверить доступ HH").wait_for()
+                    assert not await page.get_by_role("button", name="Включить автоотклики").count()
+                    await page.get_by_role("button", name="Редактор резюме").click()
+                    assert await page.get_by_role(
+                        "heading", name="Навыки и опыт на HH"
+                    ).is_visible()
+                    assert await page.get_by_role("button", name="Открыть резюме в HH").is_enabled()
                     await page.set_viewport_size({"width": 320, "height": 680})
                     assert await page.evaluate("document.documentElement.scrollWidth") == 320
                     await browser.close()

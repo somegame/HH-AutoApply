@@ -147,6 +147,7 @@ def test_related_hh_queries_share_one_bounded_guest_session(monkeypatch):
         monkeypatch.setattr(hh, "read_vacancy", read)
         browser = SimpleNamespace(
             require_browser=lambda: None,
+            access_barrier=lambda: {},
             lock=asyncio.Lock(),
             provider=SimpleNamespace(session=session),
         )

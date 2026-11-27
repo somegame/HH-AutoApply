@@ -49,6 +49,11 @@ class HHAttention(ServiceError):
 class HHAccessBarrier(HHAttention):
     """HH rejected access or requires a CAPTCHA."""
 
+    def __init__(self, message, *, url="", status=None):
+        super().__init__(message)
+        self.url = url
+        self.status = status
+
 
 class HHLoginRequired(HHAttention):
     pass
@@ -107,8 +112,16 @@ async def open_page(page, url, *, login_allowed=False):
         raise HHAttention("Неподдерживаемая ссылка HH.")
     response = await page.goto(url, wait_until="domcontentloaded", timeout=12000)
     if response and response.status in {403, 429, 503}:
-        raise HHAccessBarrier(f"HH вернул HTTP {response.status}. Операции остановлены.")
-    await guard(page, login_allowed=login_allowed)
+        raise HHAccessBarrier(
+            f"HH вернул HTTP {response.status}. Операции остановлены.",
+            url=url,
+            status=response.status,
+        )
+    try:
+        await guard(page, login_allowed=login_allowed)
+    except HHAccessBarrier as exc:
+        exc.url = url
+        raise
     if response and response.status >= 500:
         raise ServiceError(f"HH временно вернул HTTP {response.status}.", 120)
     return response
@@ -506,15 +519,15 @@ async def apply(page, identifier, resume_id, letter, reserve):
     if await already_applied(page):
         return "duplicate"
     control = page.locator(APPLY).first
-    if not await control.is_visible():
-        raise HHQuestions("HH не показал поддерживаемую форму отклика.")
-    href = await control.get_attribute("href")
-    # Open the dedicated form without clicking a control that may submit directly.
-    if (
+    href = await control.get_attribute("href") if await control.is_visible() else None
+    dedicated = (
         href
         and hh_url(urljoin(HH, href))
         and urlsplit(urljoin(HH, href)).path.rstrip("/") == "/applicant/vacancy_response"
-    ):
+    )
+    # An unverified site button can submit directly. Inspect only the dedicated
+    # link or a form already displayed on the known vacancy.
+    if dedicated:
         target = urljoin(HH, href)
         if parse_qs(urlsplit(target).query).get("vacancyId") != [identifier]:
             raise HHQuestions("Нельзя подтвердить принадлежность формы вакансии.")
@@ -525,17 +538,23 @@ async def apply(page, identifier, resume_id, letter, reserve):
         ).get("vacancyId") != [identifier]:
             raise HHQuestions("HH открыл другую страницу вместо проверенной формы отклика.")
     else:
-        raise HHQuestions(
-            "Форма HH не позволяет гарантировать отправку выбранного резюме с письмом."
-        )
-    form = page.locator('[data-qa="vacancy-response-popup-form"]').filter(has=page.locator(SUBMIT))
+        form_url = urlsplit(page.url)
+        if form_url.path.rstrip("/") != f"/vacancy/{identifier}":
+            raise HHQuestions("HH не показал поддерживаемую форму отклика.")
+    form = page.locator('[data-qa="vacancy-response-popup-form"]:visible').filter(
+        has=page.locator(SUBMIT)
+    )
     if not await form.count():
-        form = page.locator('[role="dialog"]').filter(has=page.locator(SUBMIT))
+        form = page.locator('[role="dialog"]:visible').filter(has=page.locator(SUBMIT))
     if await form.count() != 1:
         raise HHQuestions("Требуется ручная проверка формы или анкеты.")
     action = await form.get_attribute("action")
     if action and not hh_url(urljoin(page.url, action)):
         raise HHQuestions("Форма ведёт на сайт работодателя. Отклик требует ручной отправки.")
+    if not dedicated:
+        vacancy_field = form.locator('input[type="hidden"][name="vacancyId"]')
+        if await vacancy_field.count() != 1 or await vacancy_field.input_value() != identifier:
+            raise HHQuestions("Нельзя подтвердить принадлежность формы вакансии.")
     if await form.locator(
         '[data-qa*="question"], select[required]:not([name="resumeId"]), '
         'input[required]:not([name="resumeId"]):not([type="hidden"])'
@@ -566,7 +585,11 @@ async def apply(page, identifier, resume_id, letter, reserve):
         raise HHQuestions("Форма не позволяет вложить сопроводительное письмо.")
     await field.fill(letter)
     await guard(page)
-    if page.url != form_url.geturl() or await field.input_value() != letter:
+    if (
+        page.url != form_url.geturl()
+        or await field.input_value() != letter
+        or (not dedicated and await vacancy_field.input_value() != identifier)
+    ):
         raise HHQuestions("HH изменил форму или текст письма перед отправкой.")
     if not reserve():
         return "limit"

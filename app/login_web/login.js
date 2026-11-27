@@ -1,5 +1,6 @@
 const token = location.hash.slice(1);
 const resumeMode = new URLSearchParams(location.search).get("mode") === "resume";
+const editMode = new URLSearchParams(location.search).get("mode") === "edit";
 history.replaceState(null, "", location.pathname);
 const stage = document.querySelector("#stage");
 const screen = document.querySelector("#screen");
@@ -29,13 +30,16 @@ const closed = {
     "Время входа истекло. Откройте вход заново из списка аккаунтов.",
 };
 const messages = {
-  login: resumeMode ? "Откройте профиль HH, затем своё резюме с кнопкой «Редактировать»." :
+  login: editMode ? "Откройте нужный блок резюме. Сохраните правки на странице HH." :
+    resumeMode ? "Откройте профиль HH, затем своё резюме с кнопкой «Редактировать»." :
     "Войдите на странице HH. После открытия личного кабинета проверка начнётся автоматически.",
   checking: resumeMode ? "Проверяю резюме HH…" : "Проверяю вход в аккаунт HH…",
   retry: resumeMode ? "Откройте карточку своего резюме и нажмите «Загрузить резюме»." :
     "Аккаунт пока не подтверждён. Если вы уже вошли, нажмите «Проверить вход».",
 };
-if (resumeMode) {
+if (editMode) {
+  document.querySelector("header strong").textContent = "Редактор HH";
+} else if (resumeMode) {
   document.querySelector("header strong").textContent = "Выбор резюме";
   check.textContent = "Загрузить резюме";
 }
@@ -156,7 +160,7 @@ async function refresh() {
         frameUrl = next;
         const sms = response.headers.get("X-HH-Sms") === "1";
         stage.hidden = false;
-        check.hidden = sms;
+        check.hidden = sms || editMode;
         if (sms && smsForm.hidden) {
           smsForm.hidden = false;
           smsForm.scrollIntoView({ block: "nearest" });
