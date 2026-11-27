@@ -225,6 +225,135 @@ def test_search_isolated_sources_owner_actions_and_real_storage(mini_config):
     asyncio.run(run())
 
 
+def test_progressive_search_survives_a_slow_source_and_persists_jobs(mini_config, monkeypatch):
+    async def run():
+        db = Database(mini_config.data_dir)
+        slow_hh = asyncio.Event()
+        first_source_saved = asyncio.Event()
+        resume = "Оценка финансового состояния и анализ расходов компании."
+        db.set("resume", resume)
+
+        async def search_source(_, source):
+            if source == "hh":
+                await slow_hh.wait()
+                raise ServiceError("Браузер HH занят.")
+            if source == "superjob":
+                return []
+            return [
+                (
+                    JOB_ID,
+                    dict.fromkeys(URL_FIELDS, "")
+                    | {
+                        "title": "Финансовый аналитик",
+                        "url": f"https://trudvsem.ru/vacancy/card/{JOB}",
+                        "description": "Составлять отчёт о доходах и расходах.",
+                    },
+                )
+            ]
+
+        async def start_worker(_):
+            first_source_saved.set()
+
+        async with httpx.AsyncClient() as upstream:
+            scheduler = Scheduler(mini_config, db, upstream)
+            monkeypatch.setattr(scheduler, "start", start_worker)
+            view = scheduler.browser.view
+            view.mini_app = MiniApp(mini_config, db, scheduler, upstream, SimpleNamespace())
+            monkeypatch.setattr(view.mini_app, "search_source", search_source)
+            await view.start()
+            try:
+                port = view.runner.addresses[0][1]
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    headers = {
+                        "Authorization": "tma " + signed(int(time.time())),
+                        "Origin": PUBLIC_URL,
+                    }
+                    started = await client.post("/mini/api/search-start", headers=headers, json={})
+                    assert started.status_code == 202
+                    identifier = started.json()["search_id"]
+                    url = "/mini/api/search-status"
+                    params = {"search_id": identifier}
+                    assert (await client.get(url, params=params)).status_code == 401
+                    await asyncio.wait_for(first_source_saved.wait(), timeout=2)
+                    run = view.mini_app.searches[identifier]
+                    assert not run.task.done()
+                    partial = (await client.get(url, params=params, headers=headers)).json()
+                    assert not partial["done"] and "hh" in partial["pending_sources"]
+                    assert partial["analysis_pending"] == 1
+                    assert partial["jobs"][0]["analysis_status"] == "queued"
+                    assert json.loads(db.vacancy(JOB_ID)["details"])["auto_discovered"] is True
+                    again = await client.post("/mini/api/search-start", headers=headers, json={})
+                    assert again.json()["search_id"] == identifier
+                    other = await client.post(
+                        "/mini/api/search-start", headers=headers, json={"query": "Экономист"}
+                    )
+                    assert other.status_code == 409
+
+                    db.finish_analysis(
+                        JOB_ID,
+                        "draft",
+                        {
+                            "score": 91,
+                            "skills_score": 84,
+                            "duties": ["Составлять отчёт о доходах и расходах."],
+                            "resume_hash": hashlib.sha256(resume.encode()).hexdigest(),
+                        },
+                        "Письмо",
+                    )
+                    slow_hh.set()
+                    await asyncio.wait_for(run.task, timeout=2)
+                    result = (await client.get(url, params=params, headers=headers)).json()
+                    assert result["done"] and result["analysis_pending"] == 0
+                    assert result["notices"] == [{"source": "hh", "message": "Браузер HH занят."}]
+                    assert result["jobs"][0]["skills_score"] == 84
+                    assert result["jobs"][0]["duties"] == ["Составлять отчёт о доходах и расходах."]
+                    assert result["jobs"][0]["analysis_status"] == "complete"
+                    assert (
+                        await client.get(url, params={"search_id": "gone"}, headers=headers)
+                    ).status_code == 410
+
+                    settings = "/mini/api/auto-settings"
+                    for invalid in (False, 0, -1, 101, "92"):
+                        denied = await client.post(
+                            settings, headers=headers, json={"skills_score": invalid}
+                        )
+                        assert denied.status_code == 400
+                    updated = await client.post(
+                        settings, headers=headers, json={"skills_score": 92}
+                    )
+                    assert updated.json()["auto_settings"]["skills_score"] == 92
+                    assert not db.get("browser_auto_enabled")
+                    assert (
+                        Database(mini_config.data_dir).settings(mini_config)["skills_score"] == 92
+                    )
+            finally:
+                await view.shutdown()
+
+    asyncio.run(run())
+
+
+def test_background_discovery_rechecks_mini_results_and_keeps_edited_letters(mini_config):
+    db = Database(mini_config.data_dir)
+    details = {"source": "mini_hh", "mini_filters": {"salary": 0}}
+    background = {"source": "browser"}
+    assert db.add_discovered("11", details)
+    original = db.vacancy("11")["details"]
+    assert db.finish_analysis("11", "filtered", {"letter": "Прежний результат"}, None)
+    assert db.add_discovered("11", background)
+    assert not db.finish_analysis(
+        "11", "draft", {"letter": "Устаревший черновик"}, "", expected_details=original
+    )
+    row = db.vacancy("11")
+    assert row["status"] == "queued"
+    assert json.loads(row["details"]) == background | {"auto_discovered": True}
+    assert not db.add_discovered("11", details)
+
+    assert db.add_discovered("12", details)
+    assert db.finish_analysis("12", "draft", {"letter": "Исходное письмо"}, "Текст владельца")
+    assert not db.add_discovered("12", background)
+    assert db.vacancy("12")["letter"] == "Текст владельца"
+
+
 def test_verified_hh_account_can_search_and_refresh_resumes_in_mini_app(mini_config, monkeypatch):
     async def run():
         config = replace(mini_config, browser_engine="chromium", groq_key="")
@@ -323,10 +452,20 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
 
     async def run():
         db = Database(mini_config.data_dir)
+        resume = "Готовил управленческую отчётность, строил финансовые модели и проверял бюджеты."
+        db.set_many(
+            {
+                "resume": resume,
+                "hh_session_verified": True,
+                "hh_selected_resume": {"id": "123456789abc", "name": "Финансовый менеджер"},
+            }
+        )
+        config = replace(mini_config, browser_engine="chromium")
         async with httpx.AsyncClient(transport=httpx.MockTransport(mapped_source)) as sources:
-            scheduler = Scheduler(mini_config, db, sources)
+            scheduler = Scheduler(config, db, sources)
+            scheduler.browser.provider.state.write_text("{}")
             view = scheduler.browser.view
-            view.mini_app = MiniApp(mini_config, db, scheduler, sources, SimpleNamespace())
+            view.mini_app = MiniApp(config, db, scheduler, sources, SimpleNamespace())
             await view.start()
             try:
                 port = view.runner.addresses[0][1]
@@ -339,6 +478,7 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                         viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True
                     )
                     tile_requests = []
+                    search_down = False
 
                     async def forward(route):
                         request = route.request
@@ -351,6 +491,9 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                                 + "}};",
                                 content_type="application/javascript",
                             )
+                            return
+                        if search_down and url.path == "/mini/api/search-status":
+                            await route.fulfill(status=504, body="Gateway Timeout")
                             return
                         if url.hostname == "tile.openstreetmap.org":
                             tile_requests.append(url.path)
@@ -375,8 +518,41 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
 
                     await page.route("**/*", forward)
                     await page.goto(PUBLIC_URL + "/mini")
+                    await page.locator("#source").select_option("trudvsem")
                     await page.get_by_role("button", name="Найти", exact=False).click()
                     await page.get_by_role("heading", name="Финансовый менеджер").wait_for()
+                    matches = page.locator("#results")
+                    card = matches.locator('[data-job-id="' + JOB_ID + '"]')
+                    await card.get_by_text("Ожидает анализа Groq", exact=True).wait_for()
+                    search_down = True
+                    await page.get_by_role("button", name="Обновить", exact=True).click()
+                    await page.get_by_text(
+                        "Bothost не дождался ответа бота.", exact=False
+                    ).wait_for()
+                    assert await card.is_visible()
+                    db.finish_analysis(
+                        JOB_ID,
+                        "draft",
+                        {
+                            "score": 98,
+                            "skills_score": 95,
+                            "duties": [
+                                "Готовить отчёты о доходах и расходах.",
+                                "Проверять и обновлять бюджеты.",
+                                "Строить финансовые прогнозы.",
+                            ],
+                            "resume_hash": hashlib.sha256(resume.encode()).hexdigest(),
+                        },
+                        "Письмо работодателю",
+                    )
+                    search_down = False
+                    await page.get_by_role("button", name="Обновить результаты").click()
+                    await card.get_by_text("Оценка Groq", exact=True).wait_for()
+                    await card.get_by_text("95%", exact=True).wait_for()
+                    await card.get_by_text("Лучший вариант", exact=False).wait_for()
+                    await card.get_by_text("Готовить отчёты о доходах и расходах.").wait_for()
+                    await card.get_by_text("Ещё обязанности").click()
+                    assert await card.get_by_text("Строить финансовые прогнозы.").is_visible()
                     assert not tile_requests
                     await page.get_by_role("button", name="Карта", exact=True).click()
                     await page.locator("#job-map .office-pin").last.wait_for()
@@ -384,24 +560,31 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     await page.locator("#job-map .leaflet-tile").first.wait_for()
                     assert tile_requests
                     await page.get_by_role("button", name="Список", exact=True).click()
-                    matches = page.locator("#results")
                     for _ in range(2):
                         await matches.get_by_role("button", name="К сравнению").first.click()
                     await page.get_by_role("button", name="Сравнить", exact=True).click()
                     assert await page.locator("#compare-dialog .compare-card").count() == 2
                     await page.locator("#compare-close").click()
-                    card = matches.locator('[data-job-id="' + JOB_ID + '"]')
                     await card.get_by_role("button", name="Описание").click()
                     await page.get_by_text("Работа с бюджетами", exact=False).wait_for()
                     await page.get_by_role("button", name="Закрыть", exact=True).click()
-                    await card.get_by_role("button", name="Сохранить вакансию", exact=True).click()
-                    await page.get_by_text("Ожидает анализа").wait_for()
+                    await card.get_by_role("button", name="К откликам", exact=True).click()
+                    await page.get_by_role("heading", name="Отклики").wait_for()
                     await (
                         page.get_by_role("navigation")
                         .get_by_role("button", name="Аккаунты")
                         .click()
                     )
                     await page.get_by_role("heading", name="Авито Работа").wait_for()
+                    await page.get_by_role("heading", name="Автоотклики HH").wait_for()
+                    assert await page.get_by_text(
+                        "Сохранение резюме, входа в HH", exact=False
+                    ).is_visible()
+                    await page.get_by_label("Совпадение навыков от, %").fill("91")
+                    await page.get_by_role("button", name="Сохранить порог").click()
+                    await page.get_by_text("Порог навыков сохранён · 91%.").wait_for()
+                    assert db.settings(config)["skills_score"] == 91
+                    assert not db.get("browser_auto_enabled")
                     await page.set_viewport_size({"width": 320, "height": 680})
                     assert await page.evaluate("document.documentElement.scrollWidth") == 320
                     await browser.close()

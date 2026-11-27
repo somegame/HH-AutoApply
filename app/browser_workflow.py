@@ -7,6 +7,7 @@ from contextlib import suppress
 from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as BrowserTimeout
 
 from app import hh_browser as hh
 from app.diagnostics import resource_warning
@@ -16,6 +17,14 @@ from app.services import AUTO_ANALYSIS_POLICY, ServiceError, auto_letter_support
 from app.vacancies import filter_reason, search_links, vacancy_id
 
 log = logging.getLogger(__name__)
+DISCOVERY_BATCH_SIZE = 3
+
+
+def next_query(items, offset, available):
+    for index in (*range(offset, len(items)), *range(offset)):
+        if available(items[index]):
+            return index
+    return None
 
 
 class BrowserWorkflow:
@@ -370,6 +379,8 @@ class BrowserWorkflow:
         if not (self.available and self.db.get("browser_search")) or self.lock.locked():
             return
         now = int(time.time())
+        if now < self.db.get("next_browser_operation", 0):
+            return
         due = now >= self.db.get("next_browser_search", 0)
         auto = (
             self.config.auto_send and self.config.persistent and self.db.get("browser_auto_enabled")
@@ -377,61 +388,128 @@ class BrowserWorkflow:
         row = None
         if auto:
             digest = hashlib.sha256(self.db.get("resume", "").encode()).hexdigest()
-            row = self.db.next_browser_application(policy=AUTO_ANALYSIS_POLICY, resume_hash=digest)
+            row = self.db.next_browser_application(
+                policy=AUTO_ANALYSIS_POLICY,
+                resume_hash=digest,
+                min_skills=settings["skills_score"],
+                min_score=settings["score"],
+            )
         if row and self.db.counts(day)[1] >= settings["limit"]:
             row = None
         if not (due or row):
             return
-        if now < self.db.get("next_browser_operation", 0):
-            return
-        self.db.set("next_browser_operation", now + 60)
-        if due:
-            self.db.set("next_browser_search", now + settings["interval"] * 60)
+        send = row is not None and (not due or self.db.get("browser_send_turn", True))
+        self.db.set_many({"next_browser_operation": now + 60, "browser_send_turn": not send})
+        count = 0
         async with self.lock:
             async with self.provider.session() as (_, page):
-                if row:
+                if send:
                     selected = self.readiness()
                     await hh.verify_resume(page, selected["id"])
                     await self.send_one(bot, page, row, selected, settings, day)
-                    if self.db.get("browser_search"):
-                        self.db.set_many({"browser_failures": 0, "browser_notice": ""})
-                    if due:
-                        self.db.set("next_browser_search", now + 60)
-                    return
-                count = await self.discover(page, settings)
+                else:
+                    count, next_search = await self.discover(page, settings, now)
+                    self.db.set("next_browser_search", next_search)
+            if self.db.get("browser_search"):
                 self.db.set_many({"browser_failures": 0, "browser_notice": ""})
-        if count:
-            await bot.send_message(self.config.owner, f"Найдены новые вакансии на HH: {count}.")
+        if count and now >= self.db.get("next_browser_discovery_notice", 0):
+            self.db.set("next_browser_discovery_notice", now + settings["interval"] * 60)
+            await bot.send_message(
+                self.config.owner, "На HH появились новые вакансии. Откройте список найденных."
+            )
 
-    async def discover(self, page, settings):
-        links = list(search_links(settings, title_only=True))
-        index = self.db.get("browser_query_offset", 0) % len(links)
-        offset = self.db.get("browser_page_offset", 0)
-        identifiers = await hh.search_ids(page, links[index][1])
-        batch = identifiers[offset : offset + 2]
-        if len(batch) < 2 and offset:
-            batch = identifiers[:2]
-            offset = 0
-        added = 0
-        for identifier in batch:
-            if self.db.vacancy(identifier):
-                continue
-            details = await hh.read_vacancy(page, identifier)
-            if details:
-                if await hh.already_applied(page):
-                    if self.db.add(identifier, details):
-                        self.db.transition(identifier, ("queued",), "duplicate")
-                elif self.db.add(identifier, details):
-                    added += 1
-        self.db.set_many(
-            {
-                "browser_query_offset": index + 1,
-                "browser_page_offset": (offset + 2)
-                if index + 1 == len(links) and len(batch) == 2
-                else offset,
+    async def discover(self, page, settings, now):
+        links = [url for _, url in search_links(settings, title_only=True)]
+        signature = hashlib.sha256(json.dumps(links).encode()).hexdigest()
+        scan = self.db.get("browser_scan", {})
+        if scan.get("signature") != signature:
+            scan = {
+                "signature": signature,
+                "head_due": [0] * len(links),
+                "next_pages": [None] * len(links),
+                "head_offset": 0,
+                "page_offset": 0,
+                "prefer_head": True,
+                "pending": [],
             }
-        )
-        return added
+        revision = self.pause_revision
+        if not scan["pending"]:
+            fresh = next_query(scan["head_due"], scan["head_offset"], lambda value: value <= now)
+            older = next_query(scan["next_pages"], scan["page_offset"], bool)
+            if fresh is None and older is None:
+                return 0, min(scan["head_due"])
+            scan_head = fresh is not None and (older is None or scan["prefer_head"])
+            index = fresh if scan_head else older
+            target = links[index] if scan_head else scan["next_pages"][index]
+            pending, following = await hh.search_page(page, target)
+            if scan_head:
+                scan["head_due"][index] = now + settings["interval"] * 60
+                scan["head_offset"] = (index + 1) % len(links)
+            else:
+                scan["page_offset"] = (index + 1) % len(links)
+            if not scan_head or not scan["next_pages"][index]:
+                scan["next_pages"][index] = following
+            scan["pending"] = pending
+            scan["prefer_head"] = not scan_head
+            self.db.set("browser_scan", scan)
+        added = 0
+        detail_reads = 0
+        retries = scan.setdefault("detail_retries", {})
+        for identifier in scan["pending"][:]:
+            if revision != self.pause_revision:
+                break
+            row = self.db.vacancy(identifier)
+            if row is None:
+                if detail_reads == DISCOVERY_BATCH_SIZE:
+                    break
+                detail_reads += 1
+            try:
+                added += await self.save_discovered(page, identifier, row)
+            except (BrowserTimeout, ServiceError) as exc:
+                if isinstance(exc, ServiceError) and not exc.retry:
+                    raise
+                self.defer_search_detail(scan, identifier)
+                raise
+            scan["pending"].pop(0)
+            retries.pop(identifier, None)
+            if row is None:
+                self.db.set("browser_scan", scan)
+        self.db.set("browser_scan", scan)
+        next_search = 0 if scan["pending"] or any(scan["next_pages"]) else min(scan["head_due"])
+        return added, next_search
+
+    def defer_search_detail(self, scan, identifier):
+        attempts = scan["detail_retries"].get(identifier, 0) + 1
+        scan["pending"].pop(0)
+        if attempts < 3:
+            scan["detail_retries"][identifier] = attempts
+            scan["pending"].append(identifier)
+        else:
+            scan["detail_retries"].pop(identifier, None)
+            log.warning("Вакансия HH %s отложена до следующего прохода поиска", identifier)
+        self.db.set("browser_scan", scan)
+
+    async def save_discovered(self, page, identifier, row):
+        if row:
+            details = json.loads(row["details"])
+            if details.get("source") == "mini_hh" and details.get("auto_discovered"):
+                details.pop("mini_filters", None)
+                self.db.add_discovered(identifier, details | {"source": "browser"})
+            return False
+        try:
+            details = await hh.read_vacancy(page, identifier)
+        except hh.HHVacancyUnavailable:
+            log.warning("HH не показал основные поля вакансии %s", identifier)
+            return False
+        if not details:
+            return False
+        duplicate = await hh.already_applied(page)
+        if self.db.add_discovered(identifier, details | {"auto_discovered": True}):
+            if duplicate:
+                self.db.transition(identifier, ("queued",), "duplicate")
+                return False
+            return True
+        return False
 
     async def reconcile(self, identifier):
         self.require_browser()
@@ -486,7 +564,7 @@ class BrowserWorkflow:
         result = json.loads(row["result"] or "{}")
         manual = manual_revision is not None
         allowed_states = ("draft", "approved")
-        effective_settings = settings | details.get("mini_filters", {})
+        effective_settings = settings | (details.get("mini_filters", {}) if manual else {})
         resume_text = self.db.get("resume", "")
         resume_hash = hashlib.sha256(resume_text.encode()).hexdigest()
         if (
@@ -501,7 +579,12 @@ class BrowserWorkflow:
             details.get("source") != "browser"
             or result.get("auto_policy") != AUTO_ANALYSIS_POLICY
             or not auto_letter_supported(
-                result, resume_text, details, settings["score"], row["letter"]
+                result,
+                resume_text,
+                details,
+                settings["score"],
+                row["letter"],
+                skills_threshold=settings["skills_score"],
             )
         ):
             self.db.transition(identifier, allowed_states, "deferred")
@@ -517,7 +600,10 @@ class BrowserWorkflow:
             if (
                 (not manual and not self.db.get("browser_auto_enabled"))
                 or self.pause_revision != revision
+                or current is None
                 or current["letter"] != row["letter"]
+                or current["details"] != row["details"]
+                or current["result"] != row["result"]
                 or self.db.get("hh_selected_resume") != resume
                 or hashlib.sha256(self.db.get("resume", "").encode()).hexdigest() != resume_hash
                 or not self.db.get("groq_consent")

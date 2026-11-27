@@ -11,7 +11,12 @@ from app import hh_browser
 from app.config import Config
 from app.database import Database
 from app.scheduler import Scheduler, local_day
-from app.services import AUTO_ANALYSIS_POLICY, auto_letter_supported, grounded_auto_letter
+from app.services import (
+    AUTO_ANALYSIS_POLICY,
+    ServiceError,
+    auto_letter_supported,
+    grounded_auto_letter,
+)
 from app.vacancies import parse_vacancy
 
 VACANCY_ID = "1200"
@@ -23,6 +28,8 @@ RESUME = f"{EVIDENCE}. Подготовка управленческой отч�
 LETTER = f"Здравствуйте! Меня интересует вакансия «{TITLE}» в компании «{COMPANY}». {EVIDENCE}."
 ANALYSIS = {
     "score": 95,
+    "skills_score": 92,
+    "duties": ["Планировать бюджет и следить за расходами."],
     "reason": "Профиль соответствует требованиям по бюджетированию.",
     "required": ["Управление бюджетом"],
     "missing": [],
@@ -67,6 +74,8 @@ def test_auto_letter_accepts_exact_resume_evidence(vacancy):
     "changes",
     [
         {"score": 79},
+        {"skills_score": 79},
+        {"skills_score": None},
         {"missing": ["Опыт работы в отрасли"]},
         {"evidence": []},
         {"evidence": ["Подготовка управленческой отчётности"]},
@@ -80,6 +89,8 @@ def test_auto_letter_accepts_exact_resume_evidence(vacancy):
     ],
     ids=[
         "score",
+        "skills-score",
+        "unverified-skills",
         "missing-requirement",
         "no-evidence",
         "unrelated-quote",
@@ -94,6 +105,13 @@ def test_auto_letter_accepts_exact_resume_evidence(vacancy):
 )
 def test_auto_letter_builder_rejects_unsupported_model_result(vacancy, changes):
     assert not grounded_auto_letter(ANALYSIS | changes, RESUME, vacancy, 80)
+
+
+def test_skill_threshold_is_independent_of_general_match(vacancy):
+    assert grounded_auto_letter(ANALYSIS, RESUME, vacancy, 95, skills_threshold=92)
+    assert not grounded_auto_letter(ANALYSIS, RESUME, vacancy, 95, skills_threshold=93)
+    old_result = {key: value for key, value in ANALYSIS.items() if key != "skills_score"}
+    assert not grounded_auto_letter(old_result, RESUME, vacancy, 80, skills_threshold=0)
 
 
 def test_auto_letter_rejects_edited_draft(vacancy):
@@ -144,6 +162,8 @@ def test_new_groq_draft_is_the_only_automatic_submission(config, vacancy, monkey
         candidate = json.loads(payload["messages"][1]["content"])
         assert EVIDENCE in candidate["resume"]
         assert candidate["vacancy"]["company"] == COMPANY
+        assert "duties" in payload["messages"][0]["content"]
+        assert "skills_score" in payload["messages"][0]["content"]
         assert b"candidate@example.test" not in request.content
         assert b"hh.ru/vacancy/" not in request.content
         return httpx.Response(
@@ -186,6 +206,8 @@ def test_new_groq_draft_is_the_only_automatic_submission(config, vacancy, monkey
             result = json.loads(draft["result"])
             assert draft["status"] == "draft"
             assert result["auto_policy"] == AUTO_ANALYSIS_POLICY
+            assert result["skills_score"] == 92
+            assert result["duties"] == ANALYSIS["duties"]
             assert result["resume_hash"] == resume_hash
             assert draft["letter"] == result["letter"] == letter
             assert "SAP" not in draft["letter"]
@@ -235,6 +257,89 @@ def test_scheduler_preserves_nonautomatic_choices_for_manual_review(
     assert row["letter"] == analysis["letter"]
     assert "auto_policy" not in result
     assert result["resume_hash"] == hashlib.sha256(RESUME.encode()).hexdigest()
+
+
+def test_temporary_browser_errors_do_not_stop_discovery_or_auto_mode(config, monkeypatch):
+    db = Database(config.data_dir)
+    db.set_many({"browser_search": True, "browser_auto_enabled": True})
+    messages = []
+
+    async def send(*args, **kwargs):
+        messages.append(args)
+
+    async def failing_browser(*args):
+        raise ServiceError("Chromium временно недоступен.", 120)
+
+    async def run():
+        async with httpx.AsyncClient() as client:
+            scheduler = Scheduler(config, db, client)
+            monkeypatch.setattr(scheduler.browser, "tick", failing_browser)
+            for i in range(4):
+                await scheduler.tick_browser(SimpleNamespace(send_message=send))
+                assert db.get("browser_failures") == i + 1
+
+    asyncio.run(run())
+    assert db.get("browser_search") is True
+    assert db.get("browser_auto_enabled") is True
+    assert len(messages) == 1
+
+
+def test_groq_worker_finishes_while_browser_waits(config, vacancy, monkeypatch):
+    db = Database(config.data_dir)
+    db.set_many({"resume": RESUME, "groq_consent": True, "browser_search": True})
+    db.add(VACANCY_ID, vacancy | {"source": "mini_hh"})
+    monkeypatch.setattr("app.scheduler.resource_warning", lambda _directory: None)
+
+    async def run():
+        browser_started = asyncio.Event()
+        browser_waiting = asyncio.Event()
+        analyzed = asyncio.Event()
+
+        async def browser(*args):
+            browser_started.set()
+            await browser_waiting.wait()
+
+        async def send(*args, **kwargs):
+            analyzed.set()
+
+        def response(_request):
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": json.dumps(ANALYSIS)}}]}
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            scheduler = Scheduler(config, db, client)
+            monkeypatch.setattr(scheduler.browser, "tick", browser)
+            await scheduler.start(SimpleNamespace(send_message=send))
+            try:
+                await asyncio.wait_for(browser_started.wait(), timeout=1)
+                await asyncio.wait_for(analyzed.wait(), timeout=1)
+            finally:
+                await scheduler.shutdown()
+
+    asyncio.run(run())
+    assert db.vacancy(VACANCY_ID)["status"] == "draft"
+
+
+def test_restart_refreshes_old_browser_drafts_with_search_running(config, vacancy):
+    db = Database(config.data_dir)
+    db.set_many({"resume": RESUME, "groq_consent": True, "browser_search": True})
+    db.add(VACANCY_ID, vacancy)
+    old_result = {
+        key: value for key, value in ANALYSIS.items() if key not in {"skills_score", "duties"}
+    }
+    old_result.update(analysis_policy="hh-evidence-v2", auto_policy="hh-evidence-v2")
+    db.finish_analysis(VACANCY_ID, "draft", old_result, old_result["letter"])
+
+    async def run():
+        async with httpx.AsyncClient() as client:
+            scheduler = Scheduler(config, db, client)
+            await scheduler.start(None)
+            await scheduler.shutdown()
+
+    asyncio.run(run())
+    assert db.vacancy(VACANCY_ID)["status"] == "queued"
+    assert not db.get("browser_auto_enabled")
 
 
 @pytest.mark.parametrize(

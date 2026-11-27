@@ -181,7 +181,10 @@ class TelegramUI:
         if kind in {"start", "chat"}:
             title = "HH AutoApply · помощник соискателя"
             if not self.config.persistent:
-                title += "\nПредупреждение. Постоянство DATA_DIR не подтверждено. Данные могут исчезнуть при обновлении."
+                title += (
+                    "\nЧтобы сохранить резюме, вход в HH и журнал после обновлений, "
+                    "подключите постоянный диск на Bothost. Автоотклики требуют этого диска."
+                )
             keyboard = menu(self.config.browser_engine == "chromium")
             if kind == "start" and self.config.login_public_url:
                 keyboard = markup(
@@ -553,7 +556,9 @@ class TelegramUI:
         if kind != "errors":
             summary.append(f"Отмечено владельцем сегодня · {used}/{settings['limit']}")
         if not self.config.persistent and kind == "status":
-            summary.append("Постоянство DATA_DIR не подтверждено. История может исчезнуть.")
+            summary.append(
+                "Сохранение резюме, входа в HH и журнала после обновлений пока не подтверждено."
+            )
         await self.answer(update, "\n".join(summary) or "Записей нет.", menu())
 
     async def diagnostics(self, update, kind):
@@ -884,9 +889,15 @@ class TelegramUI:
         ]
         if "score" in result:
             lines.append(f"Оценка Groq · {result['score']}%")
+        if "skills_score" in result:
+            lines.append(f"Совпадение навыков · {result['skills_score']}%")
         if result.get("reason"):
             lines.append(result["reason"])
-        for field, label in (("required", "Требования"), ("missing", "Пробелы")):
+        for field, label in (
+            ("duties", "Что предстоит делать"),
+            ("required", "Требования"),
+            ("missing", "Пробелы"),
+        ):
             if result.get(field):
                 lines.append(f"{label}\n" + "\n".join(result[field])[:650])
         if row["letter"]:
