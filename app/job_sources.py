@@ -1,5 +1,7 @@
 import asyncio
 import re
+from datetime import UTC, datetime
+from itertools import zip_longest
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
@@ -131,8 +133,44 @@ def trudvsem_row(item):
         low=row.get("salary_min"),
         high=row.get("salary_max"),
         schedule=text(row.get("schedule")),
+        format=trudvsem_format(row),
+        published=hh.publication_date(row.get("creation-date")),
+        **trudvsem_office(row.get("addresses")),
         description=description,
     )
+
+
+def trudvsem_office(addresses):
+    entries = addresses.get("address") if isinstance(addresses, dict) else addresses
+    if isinstance(entries, dict):
+        entries = [entries]
+    offices = {}
+    if isinstance(entries, list):
+        for record in entries[:20]:
+            if not isinstance(record, dict):
+                continue
+            location = hh.office_location(record.get("lat"), record.get("lng"), "")
+            address = hh.office_address(record.get("location"), with_point=bool(location))
+            if location:
+                location["address"] = address
+            if location or address:
+                key = (
+                    address.casefold(),
+                    location and location["lat"],
+                    location and location["lon"],
+                )
+                offices[key] = {"address": address, "location": location}
+    return next(iter(offices.values())) if len(offices) == 1 else {"address": "", "location": None}
+
+
+def trudvsem_format(row):
+    for field in ("schedule", "employment"):
+        label = text(row.get(field)).casefold().replace("ё", "е")
+        if label in {"удаленная работа", "дистанционная работа", "работа на дому"}:
+            return "Удалённо"
+        if label in {"гибридный формат", "гибридный формат работы"}:
+            return "Гибрид"
+    return ""
 
 
 def superjob_row(row):
@@ -141,6 +179,20 @@ def superjob_row(row):
     town = row.get("town")
     currency = {"rub": "RUB", "rur": "RUB", "usd": "USD", "eur": "EUR"}.get(
         str(row.get("currency")).lower(), "OTHER"
+    )
+    workplace = row.get("place_of_work")
+    place = workplace.get("id") if isinstance(workplace, dict) else None
+    if type(place) is not int:
+        place = None
+    workplace_label = text(workplace.get("title")) if isinstance(workplace, dict) else ""
+    work_format = {1: "На месте работодателя", 2: "Удалённо", 3: "Разъездная работа"}.get(
+        place, workplace_label
+    )
+    date = row.get("date_published")
+    published = (
+        datetime.fromtimestamp(date, UTC).date().isoformat()
+        if type(date) is int and 0 < date < 4_000_000_000
+        else ""
     )
     return details(
         "superjob",
@@ -152,6 +204,10 @@ def superjob_row(row):
         low=row.get("payment_from"),
         high=row.get("payment_to"),
         currency=currency,
+        format=work_format,
+        published=published,
+        address=hh.office_address(row.get("address")) if place == 1 else "",
+        location=None,
         description=text(row.get("candidat"), 2400),
     )
 
@@ -214,12 +270,33 @@ class JobSources:
         self.browser.require_browser()
         if self.browser.lock.locked():
             raise ServiceError("Браузер HH занят. Можно открыть поиск на сайте.")
-        url = source_url("hh", settings["query"], settings)
+        requested = settings.get("search_queries")
+        related = requested[:3] if isinstance(requested, list) else []
+        queries = list(
+            dict.fromkeys(
+                [
+                    settings["query"],
+                    *(query for query in related if isinstance(query, str) and query.strip()),
+                ]
+            )
+        )[:3]
         async with self.browser.lock:
-            async with self.browser.provider.session(35, guest=True) as (_, page):
-                ids = await hh.search_ids(page, url)
+            async with self.browser.provider.session(
+                45 if len(queries) > 1 else 35, guest=True
+            ) as (_, page):
+                matches = []
+                for query in queries:
+                    matches.append(await hh.search_ids(page, source_url("hh", query, settings)))
+                ids = list(
+                    dict.fromkeys(
+                        identifier
+                        for group in zip_longest(*matches)
+                        for identifier in group
+                        if identifier
+                    )
+                )
                 results = []
-                for identifier in ids[:4]:
+                for identifier in ids[: 6 if len(queries) > 1 else 4]:
                     vacancy = await hh.read_vacancy(page, identifier)
                     if vacancy and not filter_reason(vacancy, settings):
                         results.append((identifier, vacancy))

@@ -100,7 +100,8 @@ function changeTab(tab) {
     else button.removeAttribute("aria-current");
   }
   window.scrollTo(0, 0);
-  if (tab !== "search") refresh().catch(error => showError(error.message));
+  if (tab === "search") renderSearch();
+  else refresh().catch(error => showError(error.message));
 }
 
 function sourceName(key) {
@@ -126,19 +127,31 @@ async function showVacancy(job) {
     el("p", [detail.company, detail.region, detail.salary].filter(Boolean).join(" / "), "muted"),
     el("p", detail.description || "В карточке нет подробного описания.")
   );
+  const assessment = discovery.assessment(job);
+  if (assessment) body.insertBefore(assessment, body.lastChild);
   if (job.url) body.append(action("Карточка на сайте", () => external(job.url)));
   byId("job-dialog").showModal();
 }
 
 function jobCard(job, history) {
   const card = el("article", "", "card");
+  if (job.top) card.classList.add("recommended");
   card.dataset.jobId = job.id;
   const header = el("div", "", "card-header");
   header.append(el("span", sourceName(job.source), "chip"));
   if (job.label) header.append(el("span", job.label, statusClass(job.status)));
+  if (job.top) header.append(el("span", "Лучший вариант", "top-label"));
   card.append(header, el("h3", job.title), el("p", [job.company, job.region].filter(Boolean).join(" · "), "muted"),
     el("p", job.salary || "Зарплата не указана", "salary"));
-  if (Number.isFinite(job.score)) card.append(el("p", "Соответствие резюме " + job.score + "%", "muted"));
+  if (Number.isFinite(job.score) && !Number.isFinite(job.rank?.fit)) {
+    card.append(el("p", "Соответствие резюме " + job.score + "%", "muted"));
+  }
+  const assessment = discovery.assessment(job);
+  if (assessment) card.append(assessment);
+  if (!history) {
+    const route = discovery.routeControls(job);
+    if (route) card.append(route);
+  }
   if (job.reason) card.append(el("p", job.reason, "muted"));
   if (job.letter) {
     const letter = el("details");
@@ -169,6 +182,7 @@ function jobCard(job, history) {
       }
       changeTab("jobs");
     }, true));
+    actions.append(discovery.compareButton(job));
     if (!provider?.in_app_apply) card.append(el("p", "Площадка доступна для поиска. Отправка здесь не подключена.", "muted"));
   } else if (job.can_send && canSend(job)) {
     const button = action("Отправить отклик", async () => {
@@ -211,7 +225,7 @@ function jobCard(job, history) {
 }
 
 function renderSearch() {
-  byId("results").replaceChildren(...searches.map(job => jobCard(job, false)));
+  discovery.render(searches);
 }
 
 function renderJobs() {
@@ -229,7 +243,9 @@ function renderJobs() {
     byId("jobs").replaceChildren(el("p", selectedFilter === "sent" ? "Отправленных откликов пока нет." : "Подготовьте отклик из результатов поиска.", "empty"));
     return;
   }
-  byId("jobs").replaceChildren(...filtered.map(job => jobCard(job, true)));
+  const ordered = selectedFilter === "sent"
+    ? filtered : [...filtered].sort((a, b) => Number(Boolean(b.top)) - Number(Boolean(a.top)));
+  byId("jobs").replaceChildren(...ordered.map(job => jobCard(job, true)));
 }
 
 function resumePicker(label, resumes, active, use) {
@@ -474,12 +490,14 @@ function renderConnections() {
 
 function applyState(next, first = false) {
   state = next;
+  discovery.prepPreferences(state.preferences, first);
   if (!state.hh_login_open && !hhDialog.open) hhWindow = undefined;
   const version = byId("app-version");
   version.hidden = !state.version;
   version.textContent = state.version ? "Версия " + state.version : "";
   if (first) {
     for (const key of ["query", "region", "salary"]) byId(key).value = state.defaults[key];
+    byId("search-related").checked = Boolean(state.defaults.use_related);
     for (const source of state.sources) byId("source").append(new Option(source.name, source.id));
     byId("launch").hidden = true;
     byId("navigation").hidden = byId("panel-search").hidden = false;
@@ -494,6 +512,18 @@ async function refresh(first = false, unchanged = false) {
   applyState(next, first);
 }
 
+const discovery = vacancyDiscovery({
+  byId,
+  el,
+  api,
+  action,
+  makeCard: jobCard,
+  getPreferences: () => state.preferences || {},
+  updateState: preferences => applyState({ ...state, preferences }),
+  showError,
+  showFeedback,
+});
+
 byId("search-form").addEventListener("submit", async event => {
   event.preventDefault();
   showError();
@@ -507,10 +537,15 @@ byId("search-form").addEventListener("submit", async event => {
   try {
     const query = new URLSearchParams(new FormData(event.target));
     if (!query.has("hh_title_only")) query.set("hh_title_only", "false");
+    if (!query.has("include_unknown_commute")) query.set("include_unknown_commute", "false");
+    if (!query.has("include_related")) query.set("include_related", "false");
+    query.set("sort", discovery.resultSort());
     const result = await api("search?" + query);
     searches = result.jobs;
     renderSearch();
-    byId("result-count").textContent = "Найдено: " + searches.length;
+    const duplicates = result.stats?.duplicates || 0;
+    byId("result-count").textContent = "Найдено: " + searches.length +
+      (duplicates ? " · Скрыто дублей: " + duplicates : "");
     byId("search-status").hidden = Boolean(searches.length);
     if (!searches.length) byId("search-status").textContent = "Вакансии не найдены. Попробуйте изменить параметры поиска.";
     for (const notice of result.notices) {

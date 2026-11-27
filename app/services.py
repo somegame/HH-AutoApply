@@ -47,7 +47,11 @@ def clean_text(text):
 
 
 def prepared_input(resume, vacancy, settings):
-    info = {key: clean_text(str(value))[:9000] for key, value in vacancy.items() if key != "url"}
+    info = {
+        key: clean_text(str(value))[:9000]
+        for key, value in vacancy.items()
+        if key not in {"url", "location", "address"}
+    }
     return {
         "resume": clean_text(resume)[:9000],
         "vacancy": info,
