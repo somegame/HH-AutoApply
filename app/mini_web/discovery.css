@@ -15,11 +15,13 @@
 .sort-control select { font-size: .88rem; }
 .compare-toolbar { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 9px 7px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); }
 .compare-toolbar span { color: var(--muted); font-size: .88rem; }
-.card.recommended { border-color: var(--accent); border-inline-start-width: 4px; background: linear-gradient(170deg, var(--soft), var(--surface) 75%); }
-.top-label { color: var(--good); font-size: .81rem; font-weight: 730; }
+.card.recommended { border-color: #d39628; border-inline-start-width: 5px; background: linear-gradient(155deg, #fdf0c8, var(--surface) 60%); }
+.top-label { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 7px; background: #ffd777; color: #372603; font-size: .78rem; font-weight: 760; }
+.top-label span { font-size: .92rem; line-height: 1; }
 .discovery-assessment { display: grid; gap: 7px; min-width: 0; }
-.job-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; border-block: 1px solid var(--line); padding: 8px 0; }
+.job-metrics { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 5px; border-block: 1px solid var(--line); padding: 8px 0; }
 .job-metrics .named-metric + .named-metric { border-inline-start: 1px solid var(--line); padding-inline-start: 9px; }
+.analysis-note { color: var(--muted); font-size: .83rem; font-weight: 650; }
 .job-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px; }
 .trip-chip { padding: 3px 7px; border-radius: 6px; background: var(--soft); color: var(--accent); font-size: .82rem; font-weight: 670; }
 .job-factors, .job-route { margin-top: 2px; border-top: 1px solid var(--line); }
@@ -51,6 +53,9 @@
 .compare-grid { display: grid; gap: 10px; padding: 12px; }
 .compare-card { min-width: 0; display: grid; align-content: start; gap: 6px; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 13px; padding: 11px; background: var(--surface); }
 .compare-card h3 { font-size: 1rem; }
+@media (prefers-color-scheme: dark) {
+  .card.recommended { border-color: #e5ad4c; background: linear-gradient(155deg, #523b22, var(--surface) 65%); }
+}
 @media (min-width: 640px) { .compare-grid { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); } }
 @media (max-width: 360px) {
   .result-toolbar { grid-template-columns: minmax(0, 1fr); }

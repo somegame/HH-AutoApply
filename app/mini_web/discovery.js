@@ -16,6 +16,7 @@ function vacancyDiscovery({ byId, el, api, action, makeCard, getPreferences, upd
   let tileFailed = false;
   let travelDirty = false;
   let previousPreferences;
+  const renderedCards = new WeakMap();
 
   function percent(value) {
     return Number.isFinite(value) ? Math.round(value) : null;
@@ -59,15 +60,25 @@ function vacancyDiscovery({ byId, el, api, action, makeCard, getPreferences, upd
 
   function assessment(job) {
     const rank = job.rank;
-    if (!rank && !job.commute && !address(job) && !job.format && !job.published) return null;
+    const fit = job.analysis_status === "complete" ? percent(job.score) : percent(rank?.fit);
+    const skills = job.analysis_status === "complete" ? percent(job.skills_score) : null;
+    const actual = job.analysis_status === "complete" || (!job.analysis_status && rank?.fit_kind === "groq");
+    const analysisNote = {
+      queued: "Ожидает анализа Groq",
+      retry: "Groq повторит анализ",
+      filtered: "За пределами фильтров поиска",
+      error: "Анализ Groq не завершился",
+      unavailable: "Оценка Groq пока недоступна",
+    }[job.analysis_status];
+    if (!rank && !job.commute && !address(job) && !job.format && !job.published &&
+        fit === null && skills === null && !analysisNote) return null;
     const block = el("div", "", "discovery-assessment");
     const metrics = el("div", "", "job-metrics");
-    if (percent(rank?.score) !== null) metrics.append(namedMetric("Итоговый балл", percent(rank.score), " / 100"));
-    if (percent(rank?.fit) !== null) {
-      metrics.append(namedMetric(rank.fit_kind === "groq" ? "По резюме · Groq" : "По резюме · предварительно",
-        percent(rank.fit), "%"));
-    }
+    if (fit !== null) metrics.append(namedMetric(actual ? "Оценка Groq" : "Предв. оценка", fit, "%"));
+    if (skills !== null) metrics.append(namedMetric("Навыки · Groq", skills, "%"));
+    if (percent(rank?.score) !== null) metrics.append(namedMetric("Рейтинг факторов", percent(rank.score), " / 100"));
     if (metrics.childElementCount) block.append(metrics);
+    if (analysisNote) block.append(el("p", analysisNote, "analysis-note"));
     if (rank?.missing_required) {
       block.append(el("p", "Неподтверждённые обязательные требования: " + rank.missing_required, "muted"));
     }
@@ -258,6 +269,29 @@ function vacancyDiscovery({ byId, el, api, action, makeCard, getPreferences, upd
     drawOffice((offices.find(item => item.job.id === officeId) || offices[0]).job);
   }
 
+  function renderList(ordered) {
+    const results = byId("results");
+    const existing = new Map(Array.from(results.children, card => [card.dataset.jobId, card]));
+    for (const [index, job] of ordered.entries()) {
+      const id = String(job.id);
+      const previous = existing.get(id);
+      existing.delete(id);
+      const fingerprint = JSON.stringify([job, getPreferences()]);
+      let card = previous;
+      if (!previous || renderedCards.get(previous) !== fingerprint) {
+        card = makeCard(job, false);
+        renderedCards.set(card, fingerprint);
+        if (previous) {
+          const opened = new Set(Array.from(previous.querySelectorAll("details[open]"), item => item.className));
+          for (const details of card.querySelectorAll("details")) details.open = opened.has(details.className);
+          previous.replaceWith(card);
+        }
+      }
+      if (results.children[index] !== card) results.insertBefore(card, results.children[index] || null);
+    }
+    for (const card of existing.values()) card.remove();
+  }
+
   function render(list) {
     jobs = Array.isArray(list) ? list : [];
     byId("discovery-tools").hidden = !jobs.length;
@@ -270,7 +304,7 @@ function vacancyDiscovery({ byId, el, api, action, makeCard, getPreferences, upd
     mapPanel.hidden = currentView !== "map" || !jobs.length;
     byId("results").hidden = !mapPanel.hidden;
     if (!mapPanel.hidden) renderMap(ordered);
-    else byId("results").replaceChildren(...ordered.map(job => makeCard(job, false)));
+    else renderList(ordered);
     fillInsights();
     syncCompare();
   }

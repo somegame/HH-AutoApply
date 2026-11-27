@@ -2,10 +2,14 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
+import sqlite3
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
+from uuid import uuid4
 
 from aiohttp import web
 
@@ -23,7 +27,9 @@ from app.vacancies import HH, URL_FIELDS, terms, vacancy_id
 
 STATIC = Path(__file__).with_name("mini_web")
 MAX_AGE = 3600
+SEARCH_TTL = 1800
 EDITABLE = ("draft", "approved", "deferred", "questions")
+log = logging.getLogger(__name__)
 HEADERS = {
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
@@ -63,6 +69,19 @@ def verify_init_data(data, token, owner, *, now=None):
         return False
 
 
+@dataclass
+class Search:
+    prefs: dict
+    criteria: dict
+    overrides: dict
+    order: str
+    include_unknown: bool
+    sources: tuple
+    created: float = field(default_factory=time.monotonic, compare=False)
+    results: dict = field(default_factory=dict, compare=False)
+    task: asyncio.Task | None = field(default=None, compare=False)
+
+
 class MiniApp:
     def __init__(self, config, db, scheduler, client, bot):
         self.config = config
@@ -74,23 +93,32 @@ class MiniApp:
         self.discovery = VacancyDiscovery(config, db, client)
         self.bot = bot
         self.search_lock = asyncio.Lock()
+        self.searches = OrderedDict()
         self.catalog = OrderedDict()
 
     def add_routes(self, app):
+        app.on_shutdown.append(self.shutdown)
         app.add_routes(
             [
                 web.get("/mini", self.asset),
                 web.get("/mini/{asset:(?:app|discovery|leaflet)\\.(?:js|css)}", self.asset),
-                web.get("/mini/api/{command:state|search|vacancy}", self.api),
+                web.get("/mini/api/{command:state|search|search-status|vacancy}", self.api),
                 web.get("/mini/oauth/superjob", self.superjob_callback),
                 web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
                     "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|"
-                    "hh-mode|hh-resumes|hh-browser|superjob|preferences|locate|route}",
+                    "hh-mode|hh-resumes|hh-browser|superjob|preferences|locate|route|"
+                    "search-start|auto-settings}",
                     self.api,
                 ),
             ]
         )
+
+    async def shutdown(self, _app):
+        tasks = [run.task for run in self.searches.values() if run.task and not run.task.done()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def asset(self, request):
         file = request.match_info.get("asset", "index.html")
@@ -148,11 +176,25 @@ class MiniApp:
                 return self.json(self.state())
             if command == "search":
                 return self.json(await self.search(request.query))
+            if command == "search-status":
+                identifier = request.query.get("search_id", "")
+                run = self.searches.get(identifier)
+                if not run or time.monotonic() - run.created > SEARCH_TTL:
+                    return self.json({"error": "Этот поиск устарел. Нажмите «Найти» ещё раз."}, 410)
+                return self.json(self.search_payload(run))
             if command == "vacancy":
                 return self.json(self.vacancy_details(request.query.get("id", "")))
             data = await request.clone(client_max_size=100_000).json()
             if not isinstance(data, dict):
                 raise ValueError("Ожидались данные в виде объекта.")
+            if command == "search-start":
+                return self.start_search(data)
+            if command == "auto-settings":
+                if type(data.get("skills_score")) is not int:
+                    raise ValueError("Введите целый процент совпадения по навыкам.")
+                score = setting("skills_score", str(data["skills_score"]))
+                self.db.set("settings", self.db.get("settings", {}) | {"skills_score": score})
+                return self.json(self.state())
             if command == "job":
                 return self.json(await self.job_action(data))
             if command == "profile":
@@ -234,8 +276,12 @@ class MiniApp:
             return self.json({"error": str(exc)}, 400)
         except (ValueError, ServiceError) as exc:
             return self.json({"error": str(exc)}, 400)
-        except OSError:
-            return self.json({"error": "Хранилище недоступно. Проверьте Volume."}, 500)
+        except (OSError, sqlite3.Error):
+            log.warning("Не удалось прочитать или сохранить данные Mini App")
+            return self.json({"error": "Бот не смог открыть хранилище на Bothost."}, 503)
+        except Exception as exc:
+            log.warning("Ошибка Mini App в %s (%s)", command, type(exc).__name__)
+            return self.json({"error": "Ошибка приложения. Повторите действие."}, 500)
 
     def state(self):
         prefs = self.db.settings(self.config)
@@ -271,6 +317,13 @@ class MiniApp:
             if hh_needs_login and not hh_login_open
             else self.db.get("mini_hh_progress", ""),
             "persistent": self.config.persistent,
+            "storage_persistent": self.config.persistent,
+            "auto_settings": {
+                "skills_score": prefs["skills_score"],
+                "score": prefs["score"],
+            },
+            "analysis_queue": {"pending": counts.get("queued", 0)}
+            | self.scheduler.analysis_status(),
             "hh_send": self.browser.available and self.config.persistent,
             "hh_auto_allowed": self.browser.available
             and self.config.auto_send
@@ -278,6 +331,7 @@ class MiniApp:
             "hh_running": bool(self.db.get("browser_search")),
             "hh_auto": bool(self.db.get("browser_auto_enabled")),
             "hh_notice": self.db.get("browser_notice", ""),
+            "hh_scan_pending": len(self.db.get("browser_scan", {}).get("pending", [])),
             "daily_limit": prefs["limit"],
             "summary": {
                 "total": sum(counts.values()),
@@ -321,7 +375,7 @@ class MiniApp:
 
     def saved(self, row, opts=None, resume=None):
         job = json.loads(row["details"])
-        result = json.loads(row["result"] or "{}")
+        result = self.current_analysis(row)
         site = job.get("source")
         if opts is None:
             opts = self.db.settings(self.config) | self.discovery.preferences()
@@ -338,8 +392,7 @@ class MiniApp:
             "status": row["status"],
             "label": LABELS[row["status"]],
             "letter": row["letter"] or "",
-            "score": result.get("score"),
-            "reason": row["error"] or result.get("reason") or "",
+            **self.analysis_fields(row, result, resume),
             "can_edit": row["status"] in EDITABLE and bool(row["letter"]),
             "can_send": site in {"browser", "mini_hh", "superjob"}
             and row["status"] in {"draft", "approved"}
@@ -361,7 +414,7 @@ class MiniApp:
                     for key in ("location", "address", "format", "published")
                     if live.get(key)
                 }
-            return detail, json.loads(row["result"] or "{}")
+            return detail, self.current_analysis(row)
         if live:
             return live, None
         raise ServiceError("Вакансия устарела. Обновите поиск.")
@@ -388,20 +441,31 @@ class MiniApp:
                 "format",
             )
         }
-        return fields | self.discovery.enriched(detail, opts, self.db.get("resume", ""), analysis)
+        resume = self.db.get("resume", "")
+        return (
+            fields
+            | self.discovery.enriched(detail, opts, resume, analysis)
+            | self.analysis_fields(self.db.vacancy(identifier), analysis, resume)
+        )
 
-    async def search(self, query):
+    def search_options(self, query):
         prefs = self.db.settings(self.config)
-        criteria = {
-            key: setting(key, query.get(key, str(prefs[key])))
-            for key in ("query", "region", "salary")
-        }
+        criteria = {}
+        for key in ("query", "region", "salary"):
+            value = query.get(key, prefs[key])
+            if not isinstance(value, str) and not (key == "salary" and type(value) is int):
+                raise ValueError("Проверьте должность, регион и минимальную зарплату.")
+            criteria[key] = setting(key, str(value))
+
+        def enabled(key, default):
+            return query.get(key, default) in (True, "true")
+
         criteria["unknown_salary"] = criteria["salary"] == 0 or prefs["unknown_salary"]
         prefs |= criteria
-        prefs["hh_title_only"] = query.get("hh_title_only", "true") == "true"
+        prefs["hh_title_only"] = enabled("hh_title_only", True)
         variants = [prefs["query"]]
         seen_queries = {prefs["query"].casefold()}
-        if query.get("include_related", str(prefs["use_related"]).lower()) == "true":
+        if enabled("include_related", prefs["use_related"]):
             for candidate in terms(prefs["related"]):
                 if candidate.casefold() not in seen_queries:
                     variants.append(candidate)
@@ -409,62 +473,156 @@ class MiniApp:
                 if len(variants) == 3:
                     break
         prefs["search_queries"] = variants
-        options = prefs | self.discovery.preferences()
         overrides = {"salary": criteria["salary"]}
         if "preferred_format" in query:
             overrides["preferred_format"] = preferred_format(query["preferred_format"])
         if "max_commute" in query:
             overrides["max_commute"] = commute_limit(query["max_commute"])
-        options |= overrides
         order = query.get("sort", "best")
-        if order not in ORDERS:
+        if not isinstance(order, str) or order not in ORDERS:
             raise ValueError("Выберите сортировку.")
-        include_unknown = query.get("include_unknown_commute", "true") == "true"
+        include_unknown = enabled("include_unknown_commute", True)
         source = query.get("source", "all")
-        if source != "all" and source not in SOURCES:
+        if not isinstance(source, str) or (source != "all" and source not in SOURCES):
             raise ValueError("Неизвестный источник.")
-        if self.search_lock.locked():
-            raise ServiceError("Поиск уже выполняется.")
         keys = SEARCH_SOURCES if source == "all" else (source,)
-        if query.get("apply_only") == "true":
+        if enabled("apply_only", False):
             applicable = {item["id"] for item in self.directory(prefs) if item["in_app_apply"]}
             keys = tuple(key for key in keys if key in applicable)
+        return Search(prefs, criteria, overrides, order, include_unknown, keys)
+
+    def start_search(self, query):
+        run = self.search_options(query)
+        for identifier, existing in reversed(self.searches.items()):
+            if existing.task and not existing.task.done():
+                if run == existing:
+                    return self.json({"search_id": identifier}, 202)
+                return self.json(
+                    {"error": "Предыдущий поиск ещё идёт. Повторите через несколько секунд."}, 409
+                )
+        if self.search_lock.locked():
+            return self.json({"error": "Поиск уже выполняется."}, 409)
+        identifier = uuid4().hex
+        self.searches[identifier] = run
+        while len(self.searches) > 4:
+            self.searches.popitem(last=False)
+        run.task = asyncio.create_task(self.collect_search(run, enqueue=True))
+        return self.json({"search_id": identifier}, 202)
+
+    async def search(self, query):
+        run = self.search_options(query)
+        if self.search_lock.locked():
+            raise ServiceError("Поиск уже выполняется.")
+        await self.collect_search(run, enqueue=False)
+        return self.search_payload(run)
+
+    async def collect_search(self, run, *, enqueue):
+        async def fetch(key):
+            try:
+                async with asyncio.timeout(70 if key == "hh" else 20):
+                    results = await self.search_source(run.prefs, key)
+                for identifier, data in results:
+                    self.catalog[identifier] = (time.monotonic(), data, run.criteria, run.overrides)
+                    self.catalog.move_to_end(identifier)
+                    if enqueue and data.get("description", "").strip():
+                        source = "mini_hh" if key == "hh" else key
+                        self.db.add_discovered(
+                            identifier, data | {"source": source, "mini_filters": run.criteria}
+                        )
+                while len(self.catalog) > 150:
+                    self.catalog.popitem(last=False)
+                if enqueue and results:
+                    self.db.set("processing", True)
+                    await self.scheduler.start(self.bot)
+                run.results[key] = results
+            except TimeoutError:
+                run.results[key] = "Площадка долго отвечает. Её можно проверить ещё раз."
+            except ServiceError as exc:
+                run.results[key] = str(exc)
+            except (OSError, sqlite3.Error):
+                log.warning("Не удалось сохранить результаты поиска для %s", key)
+                run.results[key] = "Бот не смог сохранить результат на Bothost."
+            except Exception as exc:
+                log.warning("Ошибка поиска %s (%s)", key, type(exc).__name__)
+                run.results[key] = "Площадка временно недоступна."
+
         async with self.search_lock:
-            results = await asyncio.gather(
-                *(self.search_source(prefs, key) for key in keys), return_exceptions=True
-            )
+            await asyncio.gather(*(fetch(key) for key in run.sources))
+
+    @staticmethod
+    def current_analysis(row):
+        if row is None or row["status"] == "queued":
+            return None
+        return json.loads(row["result"] or "{}")
+
+    @staticmethod
+    def analysis_fields(row, result, resume):
+        result = result or {}
+        # Scores must correspond to the resume currently used by the owner.
+        verified = (
+            bool(resume)
+            and result.get("resume_hash") == hashlib.sha256(resume.encode()).hexdigest()
+            and type(result.get("score")) is int
+            and row is not None
+            and row["status"] != "queued"
+        )
+        status = row["status"] if row else None
+        if verified:
+            state = "complete"
+        elif status == "queued":
+            state = "retry" if row["error"] else "queued"
+        else:
+            state = status if status in {"filtered", "error"} else "unavailable"
+        return {
+            "analysis_status": state,
+            "score": result["score"] if verified else None,
+            "skills_score": result.get("skills_score") if verified else None,
+            "duties": result.get("duties", []) if verified else [],
+            "reason": (row["error"] if row else None)
+            or result.get("filter_reason")
+            or (result.get("reason") if verified else None)
+            or "",
+        }
+
+    def search_payload(self, run):
+        options = run.prefs | self.discovery.preferences() | run.overrides
         jobs = []
         notices = []
         seen = set()
         resume = self.db.get("resume", "")
-        for key, result in zip(keys, results, strict=True):
-            if isinstance(result, BaseException):
-                message = (
-                    str(result)
-                    if isinstance(result, ServiceError)
-                    else "Источник временно недоступен."
-                )
-                notices.append({"source": key, "message": message})
+        rows = self.db.vacancies(
+            {
+                identifier
+                for results in run.results.values()
+                if isinstance(results, list)
+                for identifier, _ in results
+            }
+        )
+        for key in run.sources:
+            result = run.results.get(key)
+            if result is None:
+                continue
+            if isinstance(result, str):
+                notices.append({"source": key, "message": result})
                 continue
             for identifier, data in result:
-                self.catalog[identifier] = (time.monotonic(), data, criteria, overrides)
-                self.catalog.move_to_end(identifier)
                 if identifier in seen:
                     continue
                 seen.add(identifier)
-                row = self.db.vacancy(identifier)
-                analysis = json.loads(row["result"] or "{}") if row else None
+                row = rows.get(identifier)
+                analysis = self.current_analysis(row)
                 meta = self.discovery.enriched(data, options, resume, analysis)
                 travel = meta["commute"]
                 limit = options["max_commute"]
                 if limit and (
-                    (not travel and not include_unknown)
+                    (not travel and not run.include_unknown)
                     or (travel and travel["max_minutes"] > limit)
                 ):
                     continue
                 job = (
                     data
                     | meta
+                    | self.analysis_fields(row, analysis, resume)
                     | {
                         "id": identifier,
                         "source": key,
@@ -473,8 +631,6 @@ class MiniApp:
                     }
                 )
                 jobs.append(job)
-        while len(self.catalog) > 150:
-            self.catalog.popitem(last=False)
         unique = []
         duplicate_keys = set()
         for job in sort_ranked(jobs, "best"):
@@ -487,10 +643,21 @@ class MiniApp:
         top = mark_top(unique)
         for job in unique:
             job.pop("description", None)
+        pending = sum(job["status"] == "queued" for job in unique)
         return {
-            "jobs": sort_ranked(unique, order),
+            "jobs": sort_ranked(unique, run.order),
             "notices": notices,
-            "sources": self.directory(prefs),
+            "sources": self.directory(run.prefs),
+            "done": len(run.results) == len(run.sources),
+            "pending_sources": [key for key in run.sources if key not in run.results],
+            "analysis_pending": pending,
+            "analysis_queue": {"pending": pending} | self.scheduler.analysis_status(),
+            "analysis_running": bool(
+                resume
+                and self.config.groq_key
+                and self.db.get("groq_consent", False)
+                and self.db.get("processing", True)
+            ),
             "stats": {
                 "salary_known": sum(bool(job["salary_max"]) for job in unique),
                 "commute_known": sum(job["commute"] is not None for job in unique),

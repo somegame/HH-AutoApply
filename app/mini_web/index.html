@@ -61,7 +61,11 @@
         </details>
       </form>
       <div class="section-title"><h2>Вакансии</h2><span id="result-count" class="counter"></span></div>
-      <p id="search-status" class="empty" role="status">Нажмите «Найти», чтобы увидеть вакансии по вашим параметрам.</p>
+      <div id="search-update" class="empty search-update">
+        <p id="search-status" role="status">Нажмите «Найти», чтобы увидеть вакансии по вашим параметрам.</p>
+        <button id="search-retry" type="button" class="secondary" hidden>Обновить результаты</button>
+      </div>
+      <div id="notices" class="stack notices"></div>
       <div id="discovery-tools" class="discovery-tools" hidden>
         <div id="search-insights" class="search-insights" aria-label="Сводка по вакансиям"></div>
         <div class="result-toolbar">
@@ -91,7 +95,6 @@
         <div id="job-map" aria-label="Адреса вакансий на карте" hidden></div>
         <div id="job-map-office" class="stack"></div>
       </section>
-      <div id="notices" class="stack notices"></div>
     </section>
 
     <section id="panel-jobs" hidden>
@@ -106,6 +109,7 @@
         <button type="button" data-filter="draft">В работе</button>
         <button type="button" data-filter="sent">Отправленные</button>
       </div>
+      <p id="analysis-status" class="notice" role="status" hidden></p>
       <p id="jobs-setup" class="notice" role="status" hidden></p>
       <div id="jobs" class="stack results"></div>
       <details class="extension">
@@ -126,6 +130,24 @@
 
     <section id="panel-connections" hidden>
       <div class="section-title"><h2>Аккаунты</h2></div>
+      <section id="hh-auto-card" class="card hh-auto-card" aria-labelledby="hh-auto-title" hidden>
+        <div class="card-header"><h3 id="hh-auto-title">Автоотклики HH</h3><span id="hh-auto-state" class="status"></span></div>
+        <form id="hh-auto-form" class="stack">
+          <label for="hh-skills-score">Совпадение навыков от, %</label>
+          <div class="skill-threshold">
+            <input id="hh-skills-score" type="number" inputmode="numeric" min="1" max="100" step="1" required
+              aria-describedby="hh-skills-help">
+            <button id="save-hh-skills" type="submit" class="secondary">Сохранить порог</button>
+          </div>
+          <p id="hh-skills-help" class="muted"></p>
+        </form>
+        <p id="hh-auto-help" class="muted" hidden></p>
+        <details id="hh-storage-help" hidden>
+          <summary>Как сохранить данные при обновлении</summary>
+          <p class="muted">В настройках бота на Bothost проверьте постоянный диск (Volume) и путь к нему. Укажите этот путь в <code>DATA_DIR</code> и добавьте <code>PERSISTENT_STORAGE=true</code>, если диск сохраняется при обновлениях.</p>
+        </details>
+        <div id="hh-auto-controls" class="actions"></div>
+      </section>
       <div id="connections" class="stack"></div>
       <form id="travel-form" class="profile travel-profile" autocomplete="off">
         <h3 id="travel-title">Дорога до работы</h3>

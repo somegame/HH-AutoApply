@@ -98,6 +98,34 @@ class Database:
                 return bool(changed)
             return False
 
+    def add_discovered(self, vacancy_id, details):
+        details = details | {"auto_discovered": True}
+        with self.connection() as db:
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO vacancies(id,details,status,found_at) VALUES(?,?,?,?)",
+                (vacancy_id, json.dumps(details), "queued", int(time.time())),
+            ).rowcount
+            if inserted:
+                self.event(db, vacancy_id, "queued")
+                return True
+            if details["source"] == "browser":
+                # An earlier Mini App search may have used different thresholds. Let the
+                # recurring HH search re-evaluate untouched results under its own settings.
+                promoted = db.execute(
+                    """UPDATE vacancies SET details=?,status='queued',result=NULL,letter=NULL,
+                       analyzed_at=NULL,error=NULL,attempts=0,retry_at=0
+                       WHERE id=? AND status IN ('queued','draft','filtered','error')
+                       AND sent_day IS NULL
+                       AND (status<>'draft' OR letter=json_extract(result, '$.letter'))
+                       AND json_extract(details, '$.auto_discovered')=1
+                       AND json_extract(details, '$.source')='mini_hh'""",
+                    (json.dumps(details), vacancy_id),
+                ).rowcount
+                if promoted:
+                    self.event(db, vacancy_id, "queued")
+                    return True
+            return False
+
     @staticmethod
     def event(db, vacancy_id, action):
         db.execute(
@@ -108,6 +136,14 @@ class Database:
     def vacancy(self, vacancy_id):
         with self.connection() as db:
             return db.execute("SELECT * FROM vacancies WHERE id=?", (vacancy_id,)).fetchone()
+
+    def vacancies(self, identifiers):
+        if not identifiers:
+            return {}
+        values = ",".join("?" for _ in identifiers)
+        with self.connection() as db:
+            rows = db.execute(f"SELECT * FROM vacancies WHERE id IN ({values})", tuple(identifiers))
+            return {row["id"]: row for row in rows}
 
     def page(self, statuses, page, size=5):
         values = ",".join("?" for _ in statuses)
@@ -126,25 +162,43 @@ class Database:
                 (int(time.time()),),
             ).fetchone()
 
-    def finish_analysis(self, vacancy_id, status, result, letter):
+    def finish_analysis(self, vacancy_id, status, result, letter, *, expected_details=None):
         with self.connection() as db:
             changed = db.execute(
                 """UPDATE vacancies SET status=?,result=?,letter=?,analyzed_at=?,error=NULL
-                   WHERE id=? AND status='queued'""",
-                (status, json.dumps(result), letter, int(time.time()), vacancy_id),
+                   WHERE id=? AND status='queued' AND (? IS NULL OR details=?)""",
+                (
+                    status,
+                    json.dumps(result),
+                    letter,
+                    int(time.time()),
+                    vacancy_id,
+                    expected_details,
+                    expected_details,
+                ),
             ).rowcount
             if changed:
                 self.event(db, vacancy_id, status)
+            return bool(changed)
 
-    def failure(self, vacancy_id, attempt, message, delay):
+    def failure(self, vacancy_id, attempt, message, delay, *, expected_details=None):
         with self.connection() as db:
             status = "queued" if delay else "error"
-            db.execute(
+            changed = db.execute(
                 """UPDATE vacancies SET status=?,attempts=?,retry_at=?,error=?
-                   WHERE id=? AND status='queued'""",
-                (status, attempt, int(time.time()) + delay, message, vacancy_id),
-            )
-            self.event(db, vacancy_id, "analysis_error")
+                   WHERE id=? AND status='queued' AND (? IS NULL OR details=?)""",
+                (
+                    status,
+                    attempt,
+                    int(time.time()) + delay,
+                    message,
+                    vacancy_id,
+                    expected_details,
+                    expected_details,
+                ),
+            ).rowcount
+            if changed:
+                self.event(db, vacancy_id, "analysis_error")
 
     def transition(
         self, vacancy_id, previous, status, *, day=None, limit=None, letter=None, error=None
@@ -179,7 +233,7 @@ class Database:
                 self.event(db, vacancy_id, status)
             return "ok" if changed else "stale"
 
-    def next_browser_application(self, *, policy=None, resume_hash=None):
+    def next_browser_application(self, *, policy=None, resume_hash=None, min_score=0, min_skills=0):
         with self.connection() as db:
             if policy is not None:
                 return db.execute(
@@ -187,9 +241,13 @@ class Database:
                        AND json_extract(details, '$.source')='browser'
                        AND json_extract(result, '$.auto_policy')=?
                        AND json_extract(result, '$.resume_hash')=?
+                       AND json_type(result, '$.score')='integer'
+                       AND json_type(result, '$.skills_score')='integer'
+                       AND json_extract(result, '$.score')>=?
+                       AND json_extract(result, '$.skills_score')>=?
                        AND letter=json_extract(result, '$.letter')
                        ORDER BY found_at,id LIMIT 1""",
-                    (policy, resume_hash),
+                    (policy, resume_hash, min_score, min_skills),
                 ).fetchone()
             return db.execute(
                 """SELECT * FROM vacancies WHERE status='approved'

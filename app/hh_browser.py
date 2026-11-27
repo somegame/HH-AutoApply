@@ -58,6 +58,10 @@ class HHResumeUnavailable(HHAttention):
     pass
 
 
+class HHVacancyUnavailable(ServiceError):
+    pass
+
+
 class HHQuestions(ServiceError):
     pass
 
@@ -105,6 +109,9 @@ async def open_page(page, url, *, login_allowed=False):
     if response and response.status in {403, 429, 503}:
         raise HHAccessBarrier(f"HH вернул HTTP {response.status}. Операции остановлены.")
     await guard(page, login_allowed=login_allowed)
+    if response and response.status >= 500:
+        raise ServiceError(f"HH временно вернул HTTP {response.status}.", 120)
+    return response
 
 
 async def dashboard_authenticated(page):
@@ -386,14 +393,17 @@ async def office_metadata(page, identifier):
     return {"published": published, "address": address, "location": location}
 
 
-async def search_ids(page, url):
-    await open_page(page, url)
+async def search_results(page, url, *, limit=None):
+    response = await open_page(page, url)
+    if response and response.status in {404, 410} and "page" in parse_qs(urlsplit(url).query):
+        return []
     links = page.locator('a[data-qa="serp-item__title"]')
     if not await links.count():
         await page.wait_for_timeout(800)
         await guard(page)
     found = []
-    for href in await links.evaluate_all("(links) => links.slice(0, 30).map(link => link.href)"):
+    hrefs = await links.evaluate_all("(links) => links.map(link => link.href)")
+    for href in hrefs[:limit]:
         try:
             found.append(vacancy_id(href))
         except ValueError:
@@ -408,10 +418,46 @@ async def search_ids(page, url):
     return list(dict.fromkeys(found))
 
 
+async def search_ids(page, url):
+    return await search_results(page, url, limit=30)
+
+
+async def search_page(page, url):
+    identifiers = await search_results(page, url)
+    if not identifiers:
+        return identifiers, None
+    next_link = page.locator(
+        'a[data-qa="pager-next"][href]:visible, [data-qa="pager-next"] a[href]:visible, '
+        'a[rel="next"][href]:visible'
+    ).first
+    if not await next_link.count():
+        return identifiers, None
+    href = await next_link.get_attribute("href")
+    if not href:
+        return identifiers, None
+    try:
+        target = urljoin(page.url, href)
+        parsed = urlsplit(target)
+        current = parse_qs(urlsplit(url).query)
+        following = parse_qs(parsed.query)
+        if (
+            hh_url(target)
+            and parsed.path.rstrip("/") == "/search/vacancy"
+            and following.get("text") == current.get("text")
+            and int(following.get("page", ["0"])[0]) == int(current.get("page", ["0"])[0]) + 1
+        ):
+            return identifiers, target
+    except ValueError:
+        pass
+    return identifiers, None
+
+
 async def read_vacancy(page, identifier):
     url = f"{HH}/vacancy/{identifier}"
-    await open_page(page, url)
-    if await page.locator('[data-qa="vacancy-archive"]').first.is_visible():
+    response = await open_page(page, url)
+    if (response and response.status in {404, 410}) or await page.locator(
+        '[data-qa="vacancy-archive"]'
+    ).first.is_visible():
         return None
     with suppress(BrowserTimeout):
         await asyncio.gather(
@@ -436,7 +482,7 @@ async def read_vacancy(page, identifier):
         values[key] = await visible_text(page, selector, 9000 if key == "description" else 180)
     values.update(url=url, source="browser")
     if not values["title"] or not values["company"] or not values["description"]:
-        raise HHAttention("Структура карточки HH изменилась. Операции остановлены.")
+        raise HHVacancyUnavailable("HH не показал основные поля этой вакансии.")
     if values["salary"]:
         amount = salary(values["salary"])
         if not amount:

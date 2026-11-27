@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 
 from app.local_browser import public_login_url
 
-VERSION = "6.3.0"
+VERSION = "6.4.0"
+DEFAULT_GROQ_DAILY_LIMIT = 50
 RELATED = (
     "Финансовый аналитик;Финансовый контролёр;Экономист;Менеджер по финансам;"
     "Специалист по бюджетированию;Специалист по управленческой отчётности;"
@@ -25,7 +26,8 @@ FIELDS = {
     "format": "Формат работы",
     "schedule": "График",
     "experience": "Опыт",
-    "score": "Минимальный процент",
+    "score": "Минимальный общий балл Groq",
+    "skills_score": "Совпадение по навыкам для автоотклика",
     "limit": "Суточный лимит отметок",
     "interval": "Интервал, мин",
     "employers": "Исключаемые работодатели",
@@ -35,7 +37,13 @@ FIELDS = {
     "tone": "Тон письма",
     "length": "Длина письма",
 }
-NUMBERS = {"salary": (0, 100_000_000), "score": (0, 100), "limit": (1, 100), "interval": (5, 1440)}
+NUMBERS = {
+    "salary": (0, 100_000_000),
+    "score": (0, 100),
+    "skills_score": (1, 100),
+    "limit": (1, 100),
+    "interval": (5, 1440),
+}
 BOOLEANS = {"use_related", "unknown_salary"}
 OPTIONAL = {"related", "employers", "excluded", "required"}
 
@@ -90,6 +98,7 @@ class Config:
     superjob_key: str = ""
     superjob_client_id: str = ""
     ors_key: str = ""
+    groq_daily_limit: int = DEFAULT_GROQ_DAILY_LIMIT
 
     @classmethod
     def load(cls):
@@ -132,6 +141,7 @@ class Config:
             ("salary", "MIN_SALARY", "150000"),
             ("currency", "CURRENCY", "RUB"),
             ("score", "MIN_SCORE", "80"),
+            ("skills_score", "MIN_SKILL_SCORE", "80"),
             ("limit", "DAILY_LIMIT", "100"),
             ("interval", "SEARCH_INTERVAL_MINUTES", "30"),
         ):
@@ -153,6 +163,14 @@ class Config:
                 raise ValueError("PORT должен быть целым числом.") from None
             if not 1 <= port <= 65535:
                 raise ValueError("PORT должен быть от 1 до 65535.")
+        groq_daily_limit = env.get("GROQ_DAILY_LIMIT", str(DEFAULT_GROQ_DAILY_LIMIT)).strip()
+        if (
+            not groq_daily_limit.isascii()
+            or not groq_daily_limit.isdigit()
+            or len(groq_daily_limit) > 4
+            or not 1 <= int(groq_daily_limit) <= 1000
+        ):
+            raise ValueError("GROQ_DAILY_LIMIT должен быть целым числом от 1 до 1000.")
         return cls(
             token,
             int(owner),
@@ -171,4 +189,5 @@ class Config:
             env.get("SUPERJOB_API_KEY", "").strip(),
             env.get("SUPERJOB_CLIENT_ID", "").strip(),
             env.get("ORS_API_KEY", "").strip(),
+            int(groq_daily_limit),
         )

@@ -17,6 +17,11 @@ let hhWindow;
 let loadingHHResumes = false;
 let profileDirty = false;
 let searches = [];
+let activeSearch;
+let lastSearchQuery;
+let searchTimer;
+let startingSearch = false;
+let skillsDirty = false;
 
 const modes = {
   browser: "Поиск и отклики",
@@ -53,14 +58,37 @@ function external(url) {
 }
 
 async function api(command, payload) {
-  const response = await fetch("/mini/api/" + command, {
-    method: payload === undefined ? "GET" : "POST",
-    headers: { Authorization: "tma " + auth, "Content-Type": "application/json" },
-    body: payload === undefined ? undefined : JSON.stringify(payload),
-    cache: "no-store",
-  });
+  const searchRequest = command === "search-start" || command.startsWith("search-status?");
+  const controller = searchRequest ? new AbortController() : undefined;
+  const timer = controller && window.setTimeout(() => controller.abort(), 10000);
+  let response;
+  try {
+    response = await fetch("/mini/api/" + command, {
+      method: payload === undefined ? "GET" : "POST",
+      headers: { Authorization: "tma " + auth, "Content-Type": "application/json" },
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+      cache: "no-store",
+      signal: controller?.signal,
+    });
+  } catch (error) {
+    throw new Error(error.name === "AbortError" ? "Обновление заняло слишком много времени." :
+      "Не удалось связаться с ботом. Проверьте интернет-соединение.");
+  } finally {
+    window.clearTimeout(timer);
+  }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || "Сервер не ответил. Попробуйте ещё раз.");
+  if (!response.ok) {
+    const fallback = {
+      401: "Сессия Telegram истекла. Откройте приложение из чата с ботом заново.",
+      429: "Слишком много запросов. Попробуйте немного позже.",
+      502: "Bothost пока не может связаться с ботом.",
+      503: "Бот временно недоступен.",
+      504: "Bothost не дождался ответа бота.",
+    };
+    const error = new Error(data?.error || fallback[response.status] || "Не удалось выполнить запрос. Попробуйте ещё раз.");
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -124,13 +152,34 @@ async function showVacancy(job) {
   byId("job-dialog-title").textContent = detail.title;
   const body = byId("job-description-body");
   body.replaceChildren(
-    el("p", [detail.company, detail.region, detail.salary].filter(Boolean).join(" / "), "muted"),
-    el("p", detail.description || "В карточке нет подробного описания.")
+    el("p", [detail.company, detail.region, detail.salary].filter(Boolean).join(" · "), "muted"),
   );
-  const assessment = discovery.assessment(job);
-  if (assessment) body.insertBefore(assessment, body.lastChild);
+  const current = { ...job, ...detail, rank: detail.rank || job.rank };
+  const duties = jobDuties(current, true);
+  const assessment = discovery.assessment(current);
+  if (assessment) body.append(assessment);
+  if (duties) body.append(duties);
+  body.append(el("p", detail.description || "В карточке нет подробного описания."));
   if (job.url) body.append(action("Карточка на сайте", () => external(job.url)));
   byId("job-dialog").showModal();
+}
+
+function jobDuties(job, full = false) {
+  if (!Array.isArray(job.duties) || !job.duties.length) return null;
+  const section = el("div", "", "job-duties");
+  section.append(el("h4", "Что предстоит делать"));
+  const list = el("ul");
+  const shown = full ? job.duties.length : 2;
+  list.append(...job.duties.slice(0, shown).map(duty => el("li", duty)));
+  section.append(list);
+  if (job.duties.length > shown) {
+    const more = el("details", "", "extra-duties");
+    const remaining = el("ul");
+    remaining.append(...job.duties.slice(shown).map(duty => el("li", duty)));
+    more.append(el("summary", "Ещё обязанности"), remaining);
+    section.append(more);
+  }
+  return section;
 }
 
 function jobCard(job, history) {
@@ -140,14 +189,19 @@ function jobCard(job, history) {
   const header = el("div", "", "card-header");
   header.append(el("span", sourceName(job.source), "chip"));
   if (job.label) header.append(el("span", job.label, statusClass(job.status)));
-  if (job.top) header.append(el("span", "Лучший вариант", "top-label"));
+  if (job.top) {
+    const badge = el("span", "", "top-label");
+    const star = el("span", "★");
+    star.setAttribute("aria-hidden", "true");
+    badge.append(star, "Лучший вариант");
+    header.prepend(badge);
+  }
   card.append(header, el("h3", job.title), el("p", [job.company, job.region].filter(Boolean).join(" · "), "muted"),
     el("p", job.salary || "Зарплата не указана", "salary"));
-  if (Number.isFinite(job.score) && !Number.isFinite(job.rank?.fit)) {
-    card.append(el("p", "Соответствие резюме " + job.score + "%", "muted"));
-  }
   const assessment = discovery.assessment(job);
   if (assessment) card.append(assessment);
+  const duties = jobDuties(job);
+  if (duties) card.append(duties);
   if (!history) {
     const route = discovery.routeControls(job);
     if (route) card.append(route);
@@ -228,13 +282,26 @@ function renderSearch() {
   discovery.render(searches);
 }
 
+function queueExplanation(queue) {
+  if (queue?.processing === false) return "Анализ приостановлен.";
+  if (queue?.groq_limit > 0 && queue.groq_used >= queue.groq_limit) {
+    return "Дневной лимит Groq исчерпан. Бот продолжит анализ после обновления лимита.";
+  }
+  return queue?.groq_notice || "";
+}
+
 function renderJobs() {
   const filtered = state.jobs.filter(job => selectedFilter === "all" || (selectedFilter === "sent") === sent.has(job.status));
   byId("total-count").textContent = state.summary.total;
   byId("sent-count").textContent = state.summary.sent;
   byId("today-count").textContent = state.summary.today + " / " + state.daily_limit;
+  const analysis = byId("analysis-status");
+  const queue = state.analysis_queue;
+  analysis.hidden = !(queue?.pending > 0);
+  analysis.textContent = queue?.pending > 0 ?
+    ["В очереди на анализ Groq · " + queue.pending + ".", queueExplanation(queue)].filter(Boolean).join(" ") : "";
   const setup = byId("jobs-setup");
-  setup.hidden = !state.jobs.some(job => job.status === "queued") || Boolean(state.resume && state.consent && state.groq);
+  setup.hidden = !(queue?.pending || state.jobs.some(job => job.status === "queued")) || Boolean(state.resume && state.consent && state.groq);
   setup.replaceChildren(
     el("span", "Для писем нужен профиль и согласие на анализ. "),
     action("Открыть профиль", () => changeTab("connections"))
@@ -332,26 +399,48 @@ async function loadHHResumes() {
     "Откройте своё резюме в HH или вставьте ссылку на него.");
 }
 
-function renderHHAuto(card, operations) {
-  if (state.hh_auto || !state.hh_resume || !state.resume) return;
-  if (!state.consent) {
-    card.append(el("p", "Чтобы включить автоотклики, сохраните согласие на анализ опыта в профиле.", "muted"));
-    operations.append(action("Настроить письма", () => byId("consent").focus()));
-  } else if (!state.groq) {
-    card.append(el("p", "Для автооткликов нужно настроить ключ Groq.", "muted"));
-  } else if (!state.persistent) {
-    card.append(el("p", "Для автооткликов нужно постоянное хранилище Bothost.", "muted"));
-  } else if (!state.hh_auto_allowed) {
-    card.append(el("p", "Для автооткликов нужно включить AUTO_SEND в настройках бота.", "muted"));
-  } else {
+function renderHHAuto() {
+  const card = byId("hh-auto-card");
+  card.hidden = !state.hh_connected || state.hh_login_open || !state.auto_settings;
+  if (card.hidden) return;
+  const persistent = state.storage_persistent ?? state.persistent;
+  const status = byId("hh-auto-state");
+  const help = byId("hh-auto-help");
+  const operations = byId("hh-auto-controls");
+  status.textContent = state.hh_auto ? "Включены" : "Выключены";
+  status.className = state.hh_auto ? "status good" : "status";
+  if (!skillsDirty) byId("hh-skills-score").value = state.auto_settings.skills_score;
+  byId("hh-skills-help").textContent = "Groq сверяет навыки с резюме. Для автоотклика также нужны " +
+    "общая оценка от " + state.auto_settings.score + "% и подтверждённые обязательные требования.";
+  byId("hh-storage-help").hidden = persistent;
+  const blockers = [
+    !persistent && "Сохранение резюме, входа в HH и журнала после обновления пока не подтверждено. Автоотклики доступны с постоянным диском.",
+    !(state.hh_resume && state.resume) && "Выберите резюме в аккаунте HH.",
+    !state.consent && "В профиле разрешите Groq анализировать ваш опыт и готовить письма.",
+    !state.groq && "Добавьте ключ Groq в настройки бота на Bothost.",
+    persistent && !state.hh_auto_allowed && "Разрешите автоотклики в настройках бота на Bothost (AUTO_SEND).",
+  ].filter(Boolean);
+  help.hidden = !blockers.length;
+  help.textContent = blockers.join(" ");
+  operations.replaceChildren();
+  if (state.hh_auto) {
+    operations.append(action("Оставить только поиск", async () => {
+      applyState(await api("hh-mode", { mode: "search" }));
+      showFeedback("Автоотклики выключены. Поиск продолжается.");
+    }));
+  } else if (!blockers.length) {
     operations.append(action("Включить автоотклики", async () => {
-      const message = "Разрешить отправлять резюме и письма работодателям HH? Лимит на день: " + state.daily_limit;
+      const message = "Отправлять резюме и письма работодателям HH при совпадении навыков от " +
+        state.auto_settings.skills_score + "%? Суточный лимит · " + state.daily_limit;
       if (await confirmAction(message)) {
         applyState(await api("hh-mode", { mode: "auto", confirm: true }));
         showFeedback("Автоотклики HH включены.");
       }
-    }));
+    }, true));
+  } else if (!state.consent) {
+    operations.append(action("Открыть профиль для писем", () => byId("consent").focus()));
   }
+  operations.hidden = !operations.childElementCount;
 }
 
 function renderHH(card, operations) {
@@ -366,6 +455,7 @@ function renderHH(card, operations) {
   if (!connected && state.hh_progress) card.append(el("p", state.hh_progress, "muted"));
   if (state.hh_running) {
     card.append(el("p", state.hh_auto ? "Автоотклики включены" : "Фоновый поиск включён", "muted"));
+    card.append(el("p", "Фоновый поиск использует сохранённые фильтры. Для разового поиска можно изменить параметры на вкладке «Поиск».", "muted"));
     if (!state.hh_login_open) operations.append(action("Найденные вакансии", () => changeTab("jobs")));
   }
   if (state.hh_notice && connected && !state.hh_login_open) {
@@ -419,7 +509,6 @@ function renderHH(card, operations) {
       showHHResumeBound(await api("resume", { id }));
     }));
   }
-  if (connected) renderHHAuto(card, operations);
   if (state.hh_running) operations.append(action("Остановить поиск", async () => {
     await api("hh-mode", { mode: "stop" });
     await refresh();
@@ -458,6 +547,7 @@ function renderSuperjob(card, operations) {
 }
 
 function renderConnections() {
+  renderHHAuto();
   const cards = [];
   for (const source of state.sources) {
     const card = el("article", "", "card");
@@ -480,7 +570,6 @@ function renderConnections() {
       state.resume ? "Резюме сохранено." :
       state.hh_connected ? "Выберите резюме HH для подготовки писем." : "Подключите HH, чтобы загрузить резюме из аккаунта.",
     !state.groq ? "Для писем нужно настроить Groq." : "",
-    !state.persistent ? "Для отправки подключите постоянное хранилище Bothost." : "",
   ].filter(Boolean).join(" ");
   if (!profileDirty) {
     byId("resume").value = state.resume;
@@ -524,42 +613,148 @@ const discovery = vacancyDiscovery({
   showFeedback,
 });
 
-byId("search-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  showError();
+function searchUpdate(message = "", retryLabel = "") {
+  const status = byId("search-status");
+  const retry = byId("search-retry");
+  if (status.textContent !== message) status.textContent = message;
+  byId("search-update").hidden = !message;
+  retry.hidden = !retryLabel;
+  retry.textContent = retryLabel;
+}
+
+function searchButton(busy) {
   const submit = byId("search-submit");
-  submit.disabled = true;
-  submit.textContent = "Ищу…";
-  byId("search-status").textContent = "Ищу по выбранным источникам…";
-  byId("search-status").hidden = false;
-  notices.replaceChildren();
-  byId("result-count").textContent = "";
-  try {
-    const query = new URLSearchParams(new FormData(event.target));
-    if (!query.has("hh_title_only")) query.set("hh_title_only", "false");
-    if (!query.has("include_unknown_commute")) query.set("include_unknown_commute", "false");
-    if (!query.has("include_related")) query.set("include_related", "false");
-    query.set("sort", discovery.resultSort());
-    const result = await api("search?" + query);
-    searches = result.jobs;
-    renderSearch();
+  submit.disabled = busy;
+  submit.textContent = busy ? "Ищу…" : "Найти";
+}
+
+function showSearchResults(search, result) {
+  const jobs = result.jobs;
+  if (jobs.length || result.done) {
+    // Compare with the last response so local map and comparison edits are kept until new results arrive.
+    const snapshot = JSON.stringify(jobs);
+    if (snapshot !== search.jobsSnapshot) {
+      const previous = new Map(searches.map(job => [job.id, job]));
+      searches = jobs.map(job => {
+        const earlier = previous.get(job.id);
+        return JSON.stringify(earlier) === JSON.stringify(job) ? earlier : job;
+      });
+      search.jobsSnapshot = snapshot;
+      renderSearch();
+    }
     const duplicates = result.stats?.duplicates || 0;
     byId("result-count").textContent = "Найдено: " + searches.length +
       (duplicates ? " · Скрыто дублей: " + duplicates : "");
-    byId("search-status").hidden = Boolean(searches.length);
-    if (!searches.length) byId("search-status").textContent = "Вакансии не найдены. Попробуйте изменить параметры поиска.";
-    for (const notice of result.notices) {
+  }
+  const notes = JSON.stringify(result.notices);
+  if (search.noticeSnapshot !== notes) {
+    notices.replaceChildren(...result.notices.map(notice => {
       const node = el("div", "", "source-note");
       node.append(el("p", sourceName(notice.source) + " · " + notice.message, "muted"));
       node.append(action("Аккаунты", () => changeTab("connections")));
-      notices.append(node);
+      return node;
+    }));
+    search.noticeSnapshot = notes;
+  }
+  if (!result.done) {
+    const sources = Array.isArray(result.pending_sources) ? result.pending_sources.map(sourceName).join(", ") : "";
+    const progress = sources ? "Поиск продолжается · " + sources + "." : "Ищу по выбранным площадкам…";
+    searchUpdate(progress + (!jobs.length && searches.length ? " Пока показаны предыдущие результаты." : ""));
+  } else if (result.analysis_pending > 0) {
+    const explanation = queueExplanation(result.analysis_queue) || (result.analysis_running
+      ? "Оценки появятся по мере обработки." : "Проверьте настройки анализа в аккаунтах.");
+    searchUpdate("В очереди Groq · " + result.analysis_pending + ". " + explanation);
+  } else if (jobs.length) {
+    searchUpdate();
+  } else {
+    searchUpdate(result.notices.length ? "Вакансий пока нет. Проверьте сообщения площадок ниже." :
+      "Вакансии не найдены. Попробуйте изменить параметры поиска.");
+  }
+}
+
+function scheduleSearchPoll(search, delay) {
+  window.clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(() => pollSearch(search), delay);
+}
+
+async function pollSearch(search) {
+  if (activeSearch !== search || search.polling || startingSearch) return;
+  window.clearTimeout(searchTimer);
+  if (document.visibilityState !== "visible") return;
+  search.polling = true;
+  try {
+    const result = await api("search-status?" + new URLSearchParams({ search_id: search.id }));
+    if (activeSearch !== search || startingSearch) return;
+    search.failures = 0;
+    searchButton(!result.done);
+    showSearchResults(search, result);
+    if (!result.done) scheduleSearchPoll(search, 2000);
+    else if (result.analysis_pending > 0) {
+      const working = result.analysis_running && !queueExplanation(result.analysis_queue);
+      scheduleSearchPoll(search, working ? 12000 : 30000);
     }
   } catch (error) {
-    showError(error.message);
-    byId("search-status").textContent = "Выполните поиск повторно.";
+    if (activeSearch !== search) return;
+    if (error.status === 410 || error.status === 404) {
+      activeSearch = undefined;
+      searchButton(false);
+      searchUpdate(error.message, "Повторить поиск");
+      return;
+    }
+    if ([401, 403].includes(error.status)) {
+      activeSearch = undefined;
+      searchButton(false);
+      searchUpdate(error.message);
+      return;
+    }
+    search.failures += 1;
+    searchUpdate(search.failures < 3 ? error.message + " Пытаюсь обновить результаты." :
+      error.message + " Результаты можно обновить вручную.", "Обновить результаты");
+    if (search.failures < 3) scheduleSearchPoll(search, 3000 * search.failures);
+    else searchButton(false);
   } finally {
-    submit.disabled = false;
-    submit.textContent = "Найти";
+    search.polling = false;
+  }
+}
+
+async function beginSearch(query) {
+  if (startingSearch) return;
+  startingSearch = true;
+  showError();
+  showFeedback();
+  searchButton(true);
+  searchUpdate(searches.length ? "Ищу вакансии. Пока показаны предыдущие результаты." : "Ищу по выбранным площадкам…");
+  lastSearchQuery = query;
+  try {
+    const result = await api("search-start", query);
+    if (!result.search_id) throw new Error("Бот не подтвердил начало поиска.");
+    activeSearch = { id: result.search_id, failures: 0 };
+    notices.replaceChildren();
+  } catch (error) {
+    searchButton(false);
+    const retryLabel = [401, 403].includes(error.status) ? "" : "Повторить поиск";
+    searchUpdate(error.message, retryLabel);
+    return;
+  } finally {
+    startingSearch = false;
+  }
+  await pollSearch(activeSearch);
+}
+
+byId("search-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const query = Object.fromEntries(new FormData(event.target));
+  for (const flag of ["hh_title_only", "include_unknown_commute", "include_related"]) {
+    if (!(flag in query)) query[flag] = "false";
+  }
+  query.sort = discovery.resultSort();
+  beginSearch(query);
+});
+byId("search-retry").addEventListener("click", () => {
+  if (byId("search-retry").textContent === "Повторить поиск" && lastSearchQuery) beginSearch(lastSearchQuery);
+  else if (activeSearch) {
+    activeSearch.failures = 0;
+    pollSearch(activeSearch);
   }
 });
 
@@ -605,6 +800,32 @@ byId("profile-form").addEventListener("submit", async event => {
   }
 });
 
+byId("hh-auto-form").addEventListener("input", () => { skillsDirty = true; });
+byId("hh-auto-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const save = byId("save-hh-skills");
+  const field = byId("hh-skills-score");
+  if (save.disabled) return;
+  showError();
+  showFeedback();
+  save.disabled = field.readOnly = true;
+  try {
+    const threshold = field.valueAsNumber;
+    if (!Number.isInteger(threshold) || threshold < 1 || threshold > 100) {
+      throw new Error("Укажите целый процент от 1 до 100.");
+    }
+    const next = await api("auto-settings", { skills_score: threshold });
+    skillsDirty = false;
+    if (next.sources) applyState(next);
+    else await refresh();
+    showFeedback("Порог навыков сохранён · " + threshold + "%.");
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    save.disabled = field.readOnly = false;
+  }
+});
+
 byId("hh-resume-url-form").addEventListener("submit", async event => {
   event.preventDefault();
   const button = byId("save-hh-resume-url");
@@ -641,7 +862,11 @@ for (const button of document.querySelectorAll("#jobs-filters button")) {
   });
 }
 byId("reload").addEventListener("click", () => {
-  if (auth) refresh(!state).catch(error => showError(error.message));
+  if (!auth) return;
+  if (activeSearch && selectedTab === "search") {
+    activeSearch.failures = 0;
+    pollSearch(activeSearch);
+  } else refresh(!state).catch(error => showError(error.message));
 });
 byId("close-hh").addEventListener("click", () => hhDialog.close());
 byId("close-hh-resume-url").addEventListener("click", () => hhResumeUrlDialog.close());
@@ -676,9 +901,9 @@ window.addEventListener("message", event => {
   }
 });
 document.addEventListener("visibilitychange", () => {
-  if (state && document.visibilityState === "visible" && selectedTab === "connections") {
-    refresh(false, true).catch(() => {});
-  }
+  if (!state || document.visibilityState !== "visible") return;
+  if (activeSearch && selectedTab === "search") pollSearch(activeSearch);
+  if (selectedTab === "connections") refresh(false, true).catch(() => {});
 });
 if (auth) {
   tg.ready();

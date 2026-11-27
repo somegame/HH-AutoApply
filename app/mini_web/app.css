@@ -78,11 +78,12 @@ button.primary, button.secondary { min-height: 44px; border-radius: 10px; paddin
 .actions { margin-top: 5px; }
 .empty, .notice, .source-note { border-radius: 12px; padding: 12px 14px; background: var(--surface); border: 1px solid var(--line); color: var(--muted); }
 .empty { border-style: dashed; }
+.search-update { display: grid; justify-items: start; gap: 8px; margin-bottom: 10px; }
 .notice { margin-bottom: 12px; }
 #error, #feedback { position: sticky; top: var(--top); z-index: 1; }
 .notice-error { color: var(--danger); border-inline-start: 4px solid var(--danger); }
 .notice-success { color: var(--good); border-inline-start: 4px solid var(--good); }
-.notices { margin-top: 12px; }
+.notices:not(:empty) { margin-bottom: 12px; }
 .summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-block: 1px solid var(--line); margin-bottom: 15px; }
 .summary div { display: grid; padding: 10px 6px 10px 12px; }
 .summary div + div { border-inline-start: 1px solid var(--line); }
@@ -94,6 +95,16 @@ button.primary, button.secondary { min-height: 44px; border-radius: 10px; paddin
 .letter, .job-body { white-space: pre-wrap; overflow-wrap: anywhere; }
 .letter { padding: 10px; background: var(--paper); border-radius: 9px; }
 .letter-editor textarea { margin-bottom: 6px; }
+.job-duties { display: grid; gap: 4px; padding: 8px 10px; border-radius: 9px; background: var(--paper); white-space: normal; }
+.job-duties h4 { margin: 0; font-size: .9rem; }
+.job-duties ul { margin: 0; padding-inline-start: 1.15rem; font-size: .88rem; }
+.job-duties li + li { margin-top: 2px; }
+.job-duties .extra-duties summary { padding: 4px 0; color: var(--accent); font-size: .84rem; }
+.hh-auto-card { gap: 10px; margin-bottom: 12px; }
+.hh-auto-card form { gap: 5px; }
+.skill-threshold { display: grid; grid-template-columns: minmax(58px, 86px) minmax(0, 1fr); gap: 8px; align-items: center; }
+.skill-threshold input { font-variant-numeric: tabular-nums; }
+.skill-threshold button { justify-self: start; }
 .profile, .extension { padding: 14px; margin-top: 15px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
 .profile { display: grid; gap: 8px; }
 .app-version { margin: 12px 0 0; text-align: end; }

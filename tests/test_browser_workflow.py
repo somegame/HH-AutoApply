@@ -1,15 +1,30 @@
 import asyncio
+import json
 import shutil
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from playwright.async_api import async_playwright
 
 from app import hh_browser
+from app.browser_workflow import BrowserWorkflow
 from app.database import Database
+from app.services import ServiceError
+from app.vacancies import search_links
 
 RESUME = "1a2b3c4d5e6f7a8b"
 VACANCY = "1200"
+SEARCH_SETTINGS = {
+    "query": "Финансовый менеджер",
+    "region": "Москва",
+    "salary": 150_000,
+    "currency": "RUB",
+    "interval": 5,
+    "use_related": False,
+    "unknown_salary": False,
+}
 
 
 def test_persistent_attempt_recovery_and_reconciliation(tmp_path):
@@ -86,20 +101,183 @@ def test_submit_requires_letter_resume_and_confirmation(scenario):
     assert bool(reserved) == (scenario in {"sent", "unknown", "limit"})
     assert bool(submissions) == (scenario in {"sent", "unknown"})
     if submissions:
-        from urllib.parse import parse_qs, urlsplit
-
         assert parse_qs(urlsplit(submissions[0]).query) == {
             "resumeId": [RESUME],
             "letter": [letter],
         }
 
 
-def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
+def test_background_pagination_takes_all_ids_and_only_valid_next_links():
+    executable = shutil.which("chromium") or shutil.which("google-chrome")
+    if not executable:
+        pytest.skip("Chromium для проверки страниц поиска не установлен.")
+
+    async def respond(route):
+        title = parse_qs(urlsplit(route.request.url).query)["text"][0]
+        href = {
+            "valid": "/search/vacancy?text=valid&page=1",
+            "external": "https://example.com/search/vacancy?text=external&page=1",
+            "bad_query": "/search/vacancy?text=other&page=1",
+            "backward": "/search/vacancy?text=backward&page=0",
+        }[title]
+        links = "".join(
+            f'<a data-qa="serp-item__title" href="/vacancy/{i}">Вакансия</a>'
+            for i in range(100, 135)
+        )
+        next_link = f'<a data-qa="pager-next" href="{href}">Дальше</a>'
+        await route.fulfill(body=links + next_link, content_type="text/html; charset=utf-8")
+
+    async def run():
+        async with async_playwright() as driver:
+            browser = await driver.chromium.launch(executable_path=executable)
+            page = await browser.new_page()
+            await page.route("**/*", respond)
+            for title in ("valid", "external", "bad_query", "backward"):
+                url = f"https://hh.ru/search/vacancy?text={title}"
+                identifiers, following = await hh_browser.search_page(page, url)
+                assert identifiers == [str(i) for i in range(100, 135)]
+                assert following == (url + "&page=1" if title == "valid" else None)
+            await browser.close()
+
+    asyncio.run(run())
+
+
+def test_discovery_checkpoints_pages_across_restart_and_picks_up_new_vacancies(
+    tmp_path, monkeypatch
+):
+    db = Database(tmp_path)
+    config = SimpleNamespace(data_dir=tmp_path)
+    settings = SEARCH_SETTINGS
+    first = next(search_links(settings, title_only=True))[1]
+    older = first + "&page=1"
+    pages = []
+    viewed = []
+
+    async def search_page(page, url):
+        pages.append(url)
+        if pages == [first]:
+            return ["100", "101", "102", "103", "104"], older
+        if url == older:
+            return ["104", "107", "105"], None
+        return ["106", "100"], None
+
+    async def read(page, identifier):
+        viewed.append(identifier)
+        if identifier == "107":
+            raise hh_browser.HHVacancyUnavailable("HH не показал основные поля этой вакансии.")
+        return {"source": "browser", "title": "Бухгалтер"}
+
+    async def duplicate(page):
+        return viewed[-1] == "104"
+
+    monkeypatch.setattr(hh_browser, "search_page", search_page)
+    monkeypatch.setattr(hh_browser, "read_vacancy", read)
+    monkeypatch.setattr(hh_browser, "already_applied", duplicate)
+
+    async def run():
+        before = BrowserWorkflow(config, db)
+        assert await before.discover(None, settings, 100) == (3, 0)
+        after = BrowserWorkflow(config, Database(tmp_path))
+        assert await after.discover(None, settings, 160) == (1, 0)
+        assert await after.discover(None, settings, 220) == (1, 400)
+        assert await after.discover(None, settings, 280) == (0, 400)
+        assert await after.discover(None, settings, 400) == (1, 700)
+
+    asyncio.run(run())
+    assert pages == [first, older, first]
+    assert viewed == ["100", "101", "102", "103", "104", "107", "105", "106"]
+    assert db.vacancy("107") is None
+    assert db.vacancy("104")["status"] == "duplicate"
+    assert json.loads(db.vacancy("106")["details"])["auto_discovered"] is True
+
+
+def test_slow_card_retries_without_blocking_other_cards_in_page(tmp_path, monkeypatch):
+    db = Database(tmp_path)
+    config = SimpleNamespace(data_dir=tmp_path)
+    viewed = []
+
+    async def search_page(page, url):
+        return ["100", "101", "102"], None
+
+    async def read(page, identifier):
+        viewed.append(identifier)
+        if identifier == "100":
+            raise ServiceError("Вакансия временно недоступна.", 120)
+        return {"source": "browser", "title": "Бухгалтер"}
+
+    async def duplicate(page):
+        return False
+
+    monkeypatch.setattr(hh_browser, "search_page", search_page)
+    monkeypatch.setattr(hh_browser, "read_vacancy", read)
+    monkeypatch.setattr(hh_browser, "already_applied", duplicate)
+
+    async def run():
+        flow = BrowserWorkflow(config, db)
+        with pytest.raises(ServiceError):
+            await flow.discover(None, SEARCH_SETTINGS, 100)
+        assert db.get("browser_scan")["pending"] == ["101", "102", "100"]
+        restarted = BrowserWorkflow(config, Database(tmp_path))
+        for now in (220, 340):
+            with pytest.raises(ServiceError):
+                await restarted.discover(None, SEARCH_SETTINGS, now)
+        assert db.get("browser_scan")["pending"] == []
+        assert await restarted.discover(None, SEARCH_SETTINGS, 350) == (0, 400)
+
+    asyncio.run(run())
+    assert viewed == ["100", "101", "102", "100", "100"]
+    assert db.vacancy("101")["status"] == db.vacancy("102")["status"] == "queued"
+
+
+def test_browser_alternates_sending_with_due_discovery(tmp_path, monkeypatch):
+    config = SimpleNamespace(
+        data_dir=tmp_path, browser_engine="chromium", auto_send=True, persistent=True
+    )
+    db = Database(tmp_path)
+    db.set_many({"browser_search": True, "browser_auto_enabled": True})
+    settings = {"score": 80, "skills_score": 85, "limit": 20}
+    actions = []
+    flow = BrowserWorkflow(config, db)
+
+    @asynccontextmanager
+    async def session():
+        yield None, None
+
+    def next_application(**query):
+        assert query["min_skills"] == 85
+        return {"id": VACANCY}
+
+    async def verify(page, identifier):
+        assert identifier == RESUME
+
+    async def send(*args):
+        actions.append("send")
+
+    async def discover(*args):
+        actions.append("discover")
+        return 0, 0
+
+    monkeypatch.setattr(db, "next_browser_application", next_application)
+    monkeypatch.setattr(flow.provider, "session", session)
+    monkeypatch.setattr(flow, "readiness", lambda: {"id": RESUME})
+    monkeypatch.setattr(flow, "send_one", send)
+    monkeypatch.setattr(flow, "discover", discover)
+    monkeypatch.setattr(hh_browser, "verify_resume", verify)
+
+    async def run():
+        for _ in range(4):
+            db.set("next_browser_operation", 0)
+            await flow.tick(None, settings, "2026-11-26")
+
+    asyncio.run(run())
+    assert actions == ["send", "discover", "send", "discover"]
+
+
+@pytest.mark.parametrize("raise_threshold", [False, True])
+def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch, raise_threshold):
     import hashlib
-    from contextlib import asynccontextmanager
     from zoneinfo import ZoneInfo
 
-    from app.browser_workflow import BrowserWorkflow
     from app.config import Config
     from app.services import AUTO_ANALYSIS_POLICY, grounded_auto_letter
     from app.vacancies import parse_vacancy
@@ -133,6 +311,8 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
     db.add(VACANCY, details | {"source": "browser"})
     result = {
         "score": 95,
+        "skills_score": 95,
+        "duties": ["Управлять бюджетом и готовить финансовые прогнозы."],
         "reason": "Есть подтверждённый опыт.",
         "required": ["Бюджетирование"],
         "missing": [],
@@ -157,6 +337,10 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
     async def apply(page, vacancy_id, resume_id, application_letter, reserve):
         assert resume_id == RESUME
         assert application_letter == letter
+        if raise_threshold:
+            db.set("settings", {"skills_score": 96})
+            assert not reserve()
+            return "limit"
         assert reserve()
         sends.append(vacancy_id)
         return "unknown"
@@ -174,7 +358,12 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
         await flow.tick(SimpleNamespace(send_message=message), config.defaults, "2026-11-26")
 
     asyncio.run(run())
-    assert sends == [VACANCY]
-    assert db.vacancy(VACANCY)["status"] == "unknown"
-    assert not db.get("browser_auto_enabled")
-    assert len(messages) == 1
+    if raise_threshold:
+        assert sends == messages == []
+        assert db.vacancy(VACANCY)["status"] == "approved"
+        assert db.get("browser_auto_enabled")
+    else:
+        assert sends == [VACANCY]
+        assert db.vacancy(VACANCY)["status"] == "unknown"
+        assert not db.get("browser_auto_enabled")
+        assert len(messages) == 1

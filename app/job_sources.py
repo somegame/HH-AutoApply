@@ -268,8 +268,6 @@ class JobSources:
 
     async def search_hh(self, settings):
         self.browser.require_browser()
-        if self.browser.lock.locked():
-            raise ServiceError("Браузер HH занят. Можно открыть поиск на сайте.")
         requested = settings.get("search_queries")
         related = requested[:3] if isinstance(requested, list) else []
         queries = list(
@@ -280,7 +278,11 @@ class JobSources:
                 ]
             )
         )[:3]
-        async with self.browser.lock:
+        try:
+            await asyncio.wait_for(self.browser.lock.acquire(), timeout=15)
+        except TimeoutError:
+            raise ServiceError("Браузер HH занят. Повторите поиск чуть позже.") from None
+        try:
             async with self.browser.provider.session(
                 45 if len(queries) > 1 else 35, guest=True
             ) as (_, page):
@@ -301,3 +303,5 @@ class JobSources:
                     if vacancy and not filter_reason(vacancy, settings):
                         results.append((identifier, vacancy))
                 return results
+        finally:
+            self.browser.lock.release()

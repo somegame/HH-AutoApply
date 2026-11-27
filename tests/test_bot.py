@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime
 from io import BytesIO
 from types import SimpleNamespace
@@ -25,6 +26,8 @@ CARD = (
 )
 RESULT = {
     "score": 90,
+    "skills_score": 85,
+    "duties": ["Готовить управленческие отчёты.", "Планировать бюджет."],
     "reason": "Есть подтверждённый навык.",
     "required": ["Бюджетирование"],
     "missing": [],
@@ -125,9 +128,18 @@ def test_owner_guard(config, uid, chat, expected):
 
 def test_schema_and_redaction():
     assert validate(RESULT, PROFESSIONAL) == RESULT
-    for bad in ({"score": 100}, RESULT | {"score": True}, RESULT | {"evidence": ["ложь"]}):
+    for bad in (
+        {"score": 100},
+        RESULT | {"score": True},
+        RESULT | {"skills_score": False},
+        RESULT | {"skills_score": 101},
+        RESULT | {"duties": [""]},
+        RESULT | {"evidence": ["ложь"]},
+    ):
         with pytest.raises(ServiceError):
             validate(bad, PROFESSIONAL)
+    result = validate(RESULT | {"duties": ["Писать на name@example.org."]}, PROFESSIONAL)
+    assert result["duties"] == []
     assert "example.org" not in clean_text("name@example.org")
     assert "555" not in clean_text("+7 (555) 123-45-67")
 
@@ -197,17 +209,111 @@ def test_groq_backoff_is_persisted(config):
     db.set("resume", PROFESSIONAL)
     db.set("groq_consent", True)
 
+    calls = []
+
     async def run():
         def response(req):
+            calls.append(req.url.path)
             return httpx.Response(429, headers={"Retry-After": "120"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            await Scheduler(config, db, client).tick(None)
+            restarted = Scheduler(config, db, client)
+            await restarted.tick(None)
+            assert restarted.analysis_status()["groq_retry_at"] == db.get("next_groq")
+
+    asyncio.run(run())
+    assert len(calls) == 1
+    assert db.pending()["id"] == vacancy
+    assert db.vacancy(vacancy)["attempts"] == 0
+    assert "429" in db.get("groq_notice")
+
+
+def test_incomplete_groq_result_retries_without_blocking_other_jobs(config):
+    db = Database(config.data_dir)
+    _, details = parse_vacancy(CARD)
+    db.add("1200", details)
+    db.add("1300", details | {"title": "Финансовый аналитик"})
+    db.set_many({"resume": PROFESSIONAL, "groq_consent": True})
+
+    def response(request):
+        payload = json.loads(request.content)
+        data = json.loads(payload["messages"][1]["content"])
+        result = RESULT if data["vacancy"]["title"] == "Финансовый аналитик" else {"score": 99}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(result)}}]})
+
+    async def send(*args, **kwargs):
+        pass
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            scheduler = Scheduler(config, db, client)
+            telegram = SimpleNamespace(send_message=send)
+            await scheduler.tick(telegram)
+            assert db.vacancy("1200")["attempts"] == 1
+            assert db.pending()["id"] == "1300"
+            db.set("next_groq", 0)
+            await scheduler.tick(telegram)
+
+    asyncio.run(run())
+    assert db.vacancy("1200")["status"] == "queued"
+    assert db.vacancy("1300")["status"] == "draft"
+
+
+def test_discovered_job_retains_groq_duties_when_excluded_by_filters(config):
+    db = Database(config.data_dir)
+    identifier, details = parse_vacancy(CARD)
+    db.add(identifier, details | {"source": "mini_hh", "auto_discovered": True})
+    db.set_many(
+        {
+            "resume": PROFESSIONAL,
+            "groq_consent": True,
+            "settings": {"salary": 300000},
+        }
+    )
+
+    async def run():
+        def response(_request):
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": json.dumps(RESULT)}}]}
+            )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
             await Scheduler(config, db, client).tick(None)
 
     asyncio.run(run())
-    assert db.pending() is None
-    assert db.vacancy(vacancy)["attempts"] == 1
-    assert db.get("next_groq") >= db.vacancy(vacancy)["retry_at"]
+    row = db.vacancy(identifier)
+    result = json.loads(row["result"])
+    assert row["status"] == "filtered"
+    assert result["duties"] == RESULT["duties"]
+    assert result["skills_score"] == RESULT["skills_score"]
+    assert result["filter_reason"] and not row["letter"]
+
+
+def test_groq_queue_resumes_automatically_the_next_day(config, monkeypatch):
+    config = replace(config, groq_daily_limit=1)
+    db = Database(config.data_dir)
+    _, details = parse_vacancy(CARD)
+    db.add("1200", details | {"auto_discovered": True})
+    db.add("1300", details | {"title": "Финансовый аналитик", "auto_discovered": True})
+    db.set_many({"resume": PROFESSIONAL, "groq_consent": True})
+    monkeypatch.setattr("app.scheduler.local_day", lambda _config: "2026-11-27")
+
+    def response(_request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(RESULT)}}]})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
+            scheduler = Scheduler(config, db, client)
+            await scheduler.tick(None)
+            db.set("next_groq", 0)
+            await scheduler.tick(None)
+            assert db.vacancy("1300")["status"] == "queued"
+            monkeypatch.setattr("app.scheduler.local_day", lambda _config: "2026-11-28")
+            await scheduler.tick(None)
+
+    asyncio.run(run())
+    assert db.vacancy("1300")["status"] == "draft"
 
 
 def test_telegram_polling_owner_flow(config):
