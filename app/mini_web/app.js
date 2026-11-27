@@ -150,7 +150,7 @@ function confirmAction(message) {
   return Promise.resolve(window.confirm(message));
 }
 
-function changeTab(tab) {
+function changeTab(tab, reload = true) {
   showError();
   showFeedback();
   selectedTab = tab;
@@ -162,7 +162,7 @@ function changeTab(tab) {
   }
   window.scrollTo(0, 0);
   if (tab === "search") renderSearch();
-  else return refresh().catch(error => showError(error.message));
+  else if (reload) return refresh().catch(error => showError(error.message));
 }
 
 function sourceName(key) {
@@ -575,7 +575,8 @@ function renderHHAuto() {
   const persistent = state.storage_persistent ?? state.persistent;
   const status = byId("hh-auto-state");
   const operations = byId("hh-auto-controls");
-  status.textContent = state.hh_access_restricted ? "Доступ ограничен" : state.hh_auto ? "Включены" : "Выключены";
+  const restricted = state.hh_access_restricted || state.hh_resume_access_restricted;
+  status.textContent = restricted ? "Доступ ограничен" : state.hh_auto ? "Включены" : "Выключены";
   status.className = state.hh_auto ? "status good" : "status";
   if (!skillsDirty) byId("hh-skills-score").value = state.auto_settings.skills_score;
   byId("hh-skills-help").textContent = "Анализ сверяет навыки с резюме. Для автоотклика также нужны " +
@@ -591,14 +592,16 @@ function renderHHAuto() {
   statusText("hh-auto-help", state.hh_application?.message || "");
   activityList("hh-auto-blockers", blockers);
   operations.replaceChildren();
-  if (state.hh_access_restricted) {
-    operations.append(action("Проверить доступ HH", async () => {
-      const next = await api("hh-check", {});
+  if (restricted) {
+    const scope = state.hh_access_restricted ? "vacancy" : "resume";
+    operations.append(action(scope === "resume" ? "Проверить доступ к резюме" : "Проверить доступ HH", async () => {
+      const next = await api("hh-check", { scope });
       applyState(next);
       showFeedback(next.hh_access_restored ?
-        "Страница открывается. Теперь можно включить автоотклики." :
+        "Доступ к проверенной странице восстановлен." :
         "HH по-прежнему ограничивает доступ из браузера бота.");
     }, true));
+    operations.append(action("Встроенные автоотклики на HH", () => external("https://hh.ru/")));
     const source = state.sources.find(item => item.id === "hh");
     if (source) operations.append(action("Открыть вакансии на HH", () => external(source.url)));
     operations.append(action("Добавить вакансию по ссылке", () => openImport()));
@@ -716,6 +719,19 @@ function renderSuperjob(card, operations) {
         await api("superjob", { action: "resume", id });
         await refresh();
       }));
+    }
+    if (account.auto_notice) card.append(el("p", account.auto_notice, "muted"));
+    if (account.auto_enabled) {
+      operations.append(action("Остановить автоотклики SuperJob", async () => {
+        applyState(await api("superjob", { action: "auto", enabled: false }));
+      }));
+    } else if (account.auto_allowed && account.selected && aiReady()) {
+      operations.append(action("Включить автоотклики SuperJob", async () => {
+        const name = account.resumes[account.selected] || "выбранное резюме";
+        if (!await confirmAction("Проверить резюме «" + name +
+          "» и включить автоотклики SuperJob по сохранённым фильтрам?")) return;
+        applyState(await api("superjob", { action: "auto", enabled: true, confirm: true }));
+      }, true));
     }
     operations.append(action("Отключить", async () => {
       if (await confirmAction("Отключить аккаунт SuperJob?")) {
@@ -946,10 +962,12 @@ function renderHHEditor() {
   const busy = state.hh_editor_pending;
   byId("hh-editor-resume").textContent = state.hh_resume;
   const prepare = byId("hh-editor-prepare");
-  prepare.disabled = Boolean(busy || !state.hh_connected || state.hh_access_restricted || !aiReady());
+  const blocked = state.hh_resume_access_restricted ?? state.hh_access_restricted;
+  byId("hh-editor-access").hidden = !state.hh_can_check_resume || !state.hh_connected;
+  prepare.disabled = Boolean(busy || !state.hh_connected || blocked || !aiReady());
   statusText("hh-editor-status", busy ? "Читаю опыт на HH и подбираю правки…" :
     state.hh_editor_error ||
-    (state.hh_access_restricted ? "Проверьте доступ или откройте карточку на самом HH." :
+    (blocked ? "Проверьте доступ или откройте карточку на самом HH." :
       !aiReady() ? "Разрешите анализ в Groq или Gemini." :
       plan ? "Проверьте предложения и выберите правку для вашего резюме HH." : ""));
   const changes = byId("hh-editor-changes");
@@ -970,7 +988,7 @@ function renderHHEditor() {
         const proof = kind === "skills" ? [item.quote] : item.proof.map(point => point.quote);
         block.append(el("p", "Из исходных обязанностей\n" + proof.join("\n"), "muted"));
         const buttons = el("div", "", "actions");
-        if (!verified && !busy && state.hh_connected && !state.hh_access_restricted) {
+        if (!verified && !busy && state.hh_connected && !blocked) {
           buttons.append(action("Открыть поле на HH", () => openHHEditor(kind, index), true));
         }
         if (navigator.clipboard) buttons.append(action("Скопировать", async () => {
@@ -1034,6 +1052,9 @@ function applyState(next, first = false) {
     }
     byId("launch").hidden = true;
     byId("navigation").hidden = byId("panel-search").hidden = false;
+    if (new URLSearchParams(window.location.search).get("tab") === "jobs") {
+      changeTab("jobs", false);
+    }
   }
   if (selectedTab === "jobs") renderJobs();
   if (selectedTab === "connections") renderConnections();
@@ -1272,6 +1293,21 @@ byId("resume-studio-jump").addEventListener("click", () => {
   dataAccessSection(state.hh_resume_id ? "hh-editor-title" : "resume-studio-title");
 });
 byId("hh-editor-native").addEventListener("click", () => external(state.hh_resume_url));
+byId("hh-editor-access").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const next = await api("hh-check", { scope: "resume" });
+    applyState(next);
+    statusText("hh-editor-status", next.hh_access_restored ?
+      "Ваше резюме открывается. Можно запустить разбор." :
+      "HH ограничивает доступ к резюме. Откройте карточку на сайте.");
+  } catch (error) {
+    statusText("hh-editor-status", error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
 byId("hh-editor-prepare").addEventListener("click", async () => {
   const button = byId("hh-editor-prepare");
   button.disabled = true;

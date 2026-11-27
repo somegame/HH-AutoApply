@@ -146,3 +146,43 @@ def test_403_stops_autoapply_and_check_only_reopens_the_affected_page(tmp_path, 
         assert not db.get("browser_auto_enabled")
 
     asyncio.run(run())
+
+
+def test_vacancy_403_keeps_resume_editor_separate_without_reenabling_applications(
+    tmp_path, monkeypatch
+):
+    async def run():
+        config = SimpleNamespace(data_dir=tmp_path, browser_engine="chromium")
+        db = Database(tmp_path)
+        workflow = BrowserWorkflow(config, db)
+        workflow.provider.state.touch()
+        db.set_many({"hh_session_verified": True, "hh_selected_resume": {"id": RESUME}})
+        monkeypatch.setattr(workflow, "require_browser", lambda: None)
+        workflow.record_access_barrier(
+            hh.HHAccessBarrier(
+                "HTTP 403",
+                status=403,
+                url="https://hh.ru/vacancy/101",
+            )
+        )
+        assert workflow.editor_resume() == RESUME
+        with pytest.raises(ServiceError, match="Проверить доступ HH"):
+            workflow.start_search(send=True)
+        workflow.record_access_barrier(
+            hh.HHAccessBarrier(
+                "HTTP 403",
+                status=403,
+                url=f"https://hh.ru/resume/{RESUME}",
+            )
+        )
+        with pytest.raises(ServiceError, match="Проверьте доступ"):
+            workflow.editor_resume()
+        read = AsyncMock(return_value={"jobs": [], "skills": []})
+        monkeypatch.setattr(workflow, "read_editor_sections", read)
+        assert await workflow.check_resume_access()
+        read.assert_awaited_once_with(RESUME)
+        assert not workflow.resume_access_barrier()
+        assert workflow.access_barrier()["step"] == "vacancy"
+        assert not db.get("browser_auto_enabled")
+
+    asyncio.run(run())

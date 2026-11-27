@@ -28,6 +28,7 @@ from app.vacancies import filter_reason, search_links, vacancy_id
 
 log = logging.getLogger(__name__)
 DISCOVERY_BATCH_SIZE = 3
+VACANCY_STEPS = {"search", "vacancy", "application"}
 ACCESS_STEPS = {
     "search": "при открытии поиска",
     "vacancy": "при открытии вакансии",
@@ -96,6 +97,13 @@ class BrowserWorkflow:
             return {"status": int(match[1]), "step": "", "message": notice}
         return {}
 
+    def resume_access_barrier(self):
+        barrier = self.access_barrier()
+        scoped = self.db.get("hh_resume_barrier", {})
+        if barrier.get("status") == 403 and barrier.get("step") in VACANCY_STEPS:
+            return scoped
+        return barrier or scoped
+
     def record_access_barrier(self, error):
         path = urlsplit(error.url).path.rstrip("/")
         step = ""
@@ -110,11 +118,34 @@ class BrowserWorkflow:
         prefix = f"HH вернул HTTP {error.status}" if error.status else "HH ограничил доступ"
         message = f"{prefix} {ACCESS_STEPS[step]}." if step else f"{prefix}."
         message += " Отклики поставлены на паузу."
-        self.db.set(
-            "hh_access_barrier",
-            {"status": error.status, "step": step, "message": message, "url": error.url},
-        )
+        record = {"status": error.status, "step": step, "message": message, "url": error.url}
+        if step == "resume" and error.status == 403:
+            self.db.set("hh_resume_barrier", record)
+            existing = self.access_barrier()
+            if existing.get("status") == 403 and existing.get("step") in VACANCY_STEPS:
+                self.pause(existing["message"])
+                return
+        self.db.set("hh_access_barrier", record)
         self.pause(message)
+
+    async def check_resume_access(self):
+        barrier = self.resume_access_barrier()
+        if barrier.get("step") not in ("resume", None) or (
+            barrier and barrier.get("status") != 403
+        ):
+            raise ServiceError("Сначала восстановите общий доступ к HH.")
+        identifier = self.editor_resume(check=True)
+        try:
+            await self.read_editor_sections(identifier)
+        except hh.HHAccessBarrier as exc:
+            self.record_access_barrier(exc)
+            return False
+        current = self.access_barrier()
+        values = {"hh_resume_barrier": {}}
+        if current.get("step") == "resume" and current.get("status") == 403:
+            values |= {"hh_access_barrier": {}, "browser_notice": "Резюме HH открывается."}
+        self.db.set_many(values)
+        return True
 
     async def check_access(self):
         self.require_browser()
@@ -149,6 +180,8 @@ class BrowserWorkflow:
                 "next_browser_operation": 0,
             }
         )
+        if barrier.get("step") == "resume":
+            self.db.set("hh_resume_barrier", {})
         return True
 
     async def start_login(self, notify=None, *, in_mini=False, fresh=False, resume_mode=False):
@@ -331,14 +364,14 @@ class BrowserWorkflow:
             self.login_task = None
         await self.view.revoke()
 
-    def editor_resume(self):
+    def editor_resume(self, *, check=False):
         self.require_browser()
         if not self.account_connected:
             raise ServiceError("Подключите аккаунт HH, чтобы изменить резюме.")
         identifier = self.db.get("hh_selected_resume", {}).get("id", "")
         if not hh.RESUME_ID.fullmatch(f"/resume/{identifier}"):
             raise ServiceError("Выберите резюме HH в «Аккаунтах».")
-        if self.access_barrier():
+        if not check and self.resume_access_barrier():
             raise ServiceError("Проверьте доступ HH. Карточку также можно открыть на самом HH.")
         return identifier
 
@@ -614,7 +647,7 @@ class BrowserWorkflow:
     def application_summary(self, enabled, search, eligible, totals, settings):
         if not self.available:
             return "browser_unavailable", "Включите Chromium в настройках Bothost."
-        if barrier := self.access_barrier():
+        if barrier := self.access_barrier() or self.resume_access_barrier():
             return "access_restricted", barrier["message"]
         if not self.config.persistent:
             return "storage_unavailable", "Для отправки подтвердите постоянное хранилище Bothost."
@@ -715,6 +748,8 @@ class BrowserWorkflow:
             self.db.set("hh_access_barrier", barrier)
             raise ServiceError("Сначала нажмите «Проверить доступ HH» в Mini App.")
         if send:
+            if self.resume_access_barrier():
+                raise ServiceError("Сначала проверьте доступ к резюме HH.")
             self.readiness()
             if not self.account_connected:
                 raise ServiceError("Подключите аккаунт HH для автооткликов.")
@@ -903,7 +938,7 @@ class BrowserWorkflow:
         return False
 
     async def submit_selected(self, bot, row, day):
-        if self.access_barrier():
+        if self.access_barrier() or self.resume_access_barrier():
             raise ServiceError("Сначала проверьте доступ HH или откройте вакансию на сайте.")
         selected = self.readiness()
         if not self.config.persistent:

@@ -786,6 +786,15 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     assert not await imported.count()
                     await page.set_viewport_size({"width": 320, "height": 680})
                     assert await page.evaluate("document.documentElement.scrollWidth") == 320
+                    await page.goto(PUBLIC_URL + "/mini?tab=jobs")
+                    await page.get_by_role("button", name="Отклики", exact=True).wait_for()
+                    assert (
+                        await page.locator("#navigation [data-tab=jobs]").get_attribute(
+                            "aria-current"
+                        )
+                        == "page"
+                    )
+                    await imported.wait_for()
                     await browser.close()
             finally:
                 await scheduler.shutdown()
