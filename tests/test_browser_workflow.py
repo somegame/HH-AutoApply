@@ -101,6 +101,7 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
 
     from app.browser_workflow import BrowserWorkflow
     from app.config import Config
+    from app.services import AUTO_ANALYSIS_POLICY, grounded_auto_letter
     from app.vacancies import parse_vacancy
 
     monkeypatch.setenv("TELEGRAM_TOKEN", "12345:synthetic")
@@ -115,7 +116,8 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr("app.browser_workflow.resource_warning", lambda _: None)
     config = Config.load()
     db = Database(tmp_path)
-    resume_text = "Подготовка управленческой отчётности и бюджетирование."
+    evidence = "Подготовка управленческой отчётности и бюджетирование"
+    resume_text = f"{evidence}."
     db.set_many(
         {
             "hh_selected_resume": {"id": RESUME, "name": "Финансовый менеджер"},
@@ -129,15 +131,19 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
         "Описание: Управление бюджетом, отчётность и финансовые прогнозы на квартал."
     )
     db.add(VACANCY, details | {"source": "browser"})
-    db.finish_analysis(
-        VACANCY,
-        "approved",
-        {
-            "score": 95,
-            "resume_hash": hashlib.sha256(resume_text.encode()).hexdigest(),
-        },
-        "Письмо",
-    )
+    result = {
+        "score": 95,
+        "reason": "Есть подтверждённый опыт.",
+        "required": ["Бюджетирование"],
+        "missing": [],
+        "letter": f"Рассматриваю вакансию «Финансовый менеджер» в компании «Пример». {evidence}.",
+        "evidence": [evidence],
+        "analysis_policy": AUTO_ANALYSIS_POLICY,
+        "auto_policy": AUTO_ANALYSIS_POLICY,
+        "resume_hash": hashlib.sha256(resume_text.encode()).hexdigest(),
+    }
+    letter = grounded_auto_letter(result, resume_text, details, config.defaults["score"])
+    db.finish_analysis(VACANCY, "approved", result | {"letter": letter}, letter)
     messages = []
     sends = []
 
@@ -148,8 +154,9 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch):
     async def verify(page, identifier):
         assert identifier == RESUME
 
-    async def apply(page, vacancy_id, resume_id, letter, reserve):
+    async def apply(page, vacancy_id, resume_id, application_letter, reserve):
         assert resume_id == RESUME
+        assert application_letter == letter
         assert reserve()
         sends.append(vacancy_id)
         return "unknown"

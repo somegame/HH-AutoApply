@@ -114,6 +114,8 @@ dialog::backdrop { background: #0f263aad; }
 .dialog-head { display: flex; justify-content: space-between; align-items: center; gap: 9px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
 .dialog-head h2 { font-size: 1.12rem; }
 dialog iframe { width: 100%; border: 0; display: block; height: min(630px, calc(100dvh - 92px - var(--top) - var(--bottom))); }
+.dialog-form { display: grid; gap: 9px; padding: 15px; overflow-wrap: anywhere; }
+.form-error { color: var(--danger); }
 .job-body { display: grid; gap: 12px; padding: 15px; }
 .oauth-result { margin: 24px auto; }
 @media (min-width: 640px) { .results { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; } }

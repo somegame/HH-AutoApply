@@ -200,7 +200,7 @@ def test_failed_login_check_keeps_session_until_success(tmp_path, monkeypatch):
 
         async def serve(route):
             path = urlsplit(route.request.url).path
-            if path == "/applicant/resumes":
+            if path.rstrip("/") == "/applicant/resumes":
                 visits.append(path)
                 if "test_session=on" not in (await route.request.all_headers()).get("cookie", ""):
                     await route.fulfill(status=302, headers={"location": "/account/login"})
@@ -362,7 +362,7 @@ def test_mobile_owned_hh_resume_is_bound_without_using_the_resume_list(tmp_path,
         async def serve(route):
             path = urlsplit(route.request.url).path
             html = "<input autofocus>"
-            if path == "/applicant/resumes":
+            if path.rstrip("/") == "/applicant/resumes":
                 list_visits.append(path)
                 await route.fulfill(status=503)
                 return

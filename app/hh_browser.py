@@ -13,13 +13,26 @@ TITLE = '[data-qa="vacancy-title"]'
 COMPANY = '[data-qa="vacancy-company-name"]'
 APPLY = '[data-qa="vacancy-response-link-top"]'
 SUBMIT = '[data-qa="vacancy-response-popup-submit-button"]'
-LETTER = 'textarea[data-qa="vacancy-response-popup-form-letter-input"]'
+LETTER = 'textarea[data-qa="vacancy-response-popup-form-letter-input"], textarea[name="letter"]'
+LETTER_TOGGLE = 'button[type="button"][data-qa="vacancy-response-popup-add-letter"]'
 RESPONSE = '[data-qa="vacancy-response-link-view-response"]'
 RESUME_LINK = 'a[href*="/resume/"]'
 RESUME_ID = re.compile(r"/(?:applicant/resumes?/|resume/)([a-f0-9]{12,64})/?$", re.I)
 RESUME_TITLE = '[data-qa="resume-block-title"], [data-qa="resume-title"], h1'
 RESUME_EDIT = (
     '[data-qa="resume-edit"], [data-qa="resume-edit-button"], a[href^="/applicant/resume/edit"]'
+)
+RESUMES_URL = f"{HH}/applicant/resumes/"
+RESUME_LIST_PATHS = {"/applicant/resumes", "/applicant/resume", "/applicant/profile"}
+RESUME_SECTIONS = (
+    '[data-qa="resume-block-experience"], [data-qa="resume-block-skills"], '
+    '[data-qa="resume-block-keyskills"], [data-qa="resume-block-education"], '
+    '[data-qa="resume-block-title"], [data-qa="resume-personal-specialization"], '
+    '[data-qa="resume-block-skills-content"], [data-qa="resume-block-experience-content"], '
+    '[data-qa="resume-block-languages"], [data-qa="resume-block-about"]'
+)
+RESUME_HEADINGS = re.compile(
+    r"^(Опыт работы|Ключевые навыки|Навыки|Образование|Языки|О себе)$", re.I
 )
 DASHBOARD_PATHS = {"", "/applicant/profile"}
 DASHBOARD_METRICS = ("Просмотры", "Отклики", "Автопоиски")
@@ -117,13 +130,13 @@ async def dashboard_authenticated(page):
 
 
 async def authorized_resumes(page):
-    await open_page(page, HH + "/applicant/resumes")
+    await open_page(page, RESUMES_URL)
     owned = await owned_resume(page)
     if owned:
         return owned
-    if urlsplit(page.url).path.rstrip("/") not in {"/applicant/resumes", "/applicant/resume"}:
+    if urlsplit(page.url).path.rstrip("/") not in RESUME_LIST_PATHS:
         raise HHResumeUnavailable("HH не открыл личную страницу резюме.")
-    links = page.locator(f'{RESUME_LINK}, a[href*="/applicant/resumes/"]')
+    links = page.locator(f'{RESUME_LINK}:visible, a[href*="/applicant/resumes/"]:visible')
     try:
         await links.first.wait_for(state="visible", timeout=5000)
     except BrowserTimeout:
@@ -135,12 +148,27 @@ async def authorized_resumes(page):
         href = await item.get_attribute("href")
         target = urljoin(HH, href or "")
         match = RESUME_ID.fullmatch(urlsplit(target).path)
-        name = (await item.inner_text()).strip()
+        name = (
+            (await item.inner_text()).strip() or await item.get_attribute("aria-label") or ""
+        ).strip()
         if hh_url(target) and match and name:
             items[match[1]] = name[:90]
     if not items:
         raise HHResumeUnavailable("HH пока не показал список резюме.")
     return items
+
+
+def resume_identifier(value):
+    if not isinstance(value, str) or not 0 < len(value) <= 1500:
+        raise HHResumeUnavailable("Вставьте ссылку на своё резюме HH.")
+    try:
+        url = value.strip()
+        match = RESUME_ID.fullmatch(urlsplit(url).path)
+        if match and hh_url(url):
+            return match[1]
+    except ValueError:
+        pass
+    raise HHResumeUnavailable("Нужна ссылка на карточку резюме на hh.ru.")
 
 
 async def owned_resume(page):
@@ -174,17 +202,49 @@ async def verify_resume(page, identifier):
 
 async def read_resume(page, identifier):
     await verify_resume(page, identifier)
-    sections = page.locator(
-        '[data-qa="resume-block-experience"], [data-qa="resume-block-skills"], '
-        '[data-qa="resume-block-keyskills"], [data-qa="resume-block-education"], '
-        '[data-qa="resume-block-title"], [data-qa="resume-personal-specialization"], '
-        '[data-qa="resume-block-skills-content"], [data-qa="resume-block-experience-content"]'
-    )
+    if resume_identifier(page.url) != identifier:
+        raise HHResumeUnavailable("HH открыл другую страницу вместо выбранного резюме.")
+    return await professional_resume_text(page)
+
+
+async def read_owned_resume(page, identifier):
+    owned = await owned_resume(page)
+    if identifier not in owned:
+        raise HHResumeUnavailable(
+            "Не удалось подтвердить, что это резюме принадлежит подключённому аккаунту."
+        )
+    resume = await professional_resume_text(page)
+    if identifier not in await owned_resume(page):
+        raise HHResumeUnavailable("Карточка резюме изменилась во время чтения. Откройте её снова.")
+    return owned[identifier], resume
+
+
+async def professional_resume_text(page):
     result = []
-    for element in await sections.all():
+    for element in await page.locator(RESUME_SECTIONS).all():
         if await element.is_visible():
             result.append((await element.inner_text())[:3500])
-    text = "\n".join(result).strip()
+    if len("\n".join(result).strip()) < 60:
+        for heading in await page.get_by_role("heading", name=RESUME_HEADINGS).all():
+            if not await heading.is_visible():
+                continue
+            semantic = heading.locator("xpath=ancestor::section[1]")
+            parent = heading.locator("..")
+            blocks = (semantic,) if await semantic.count() else (parent, parent.locator(".."))
+            for block in blocks:
+                if (
+                    await block.get_by_role("heading", level=1).count()
+                    or await block.get_by_role(
+                        "heading",
+                        name=re.compile(r"^(Контакты|Личные данные|Контактная информация)$", re.I),
+                    ).count()
+                ):
+                    continue
+                body = (await block.inner_text()).strip()
+                if 26 <= len(body) <= 3500 and body != (await heading.inner_text()).strip():
+                    result.append(body)
+                    break
+    text = "\n".join(dict.fromkeys(result)).strip()
     if len(text) < 60:
         raise ServiceError("Не удалось прочитать профессиональные разделы резюме HH.")
     return text[:9000]
@@ -290,16 +350,16 @@ async def apply(page, identifier, resume_id, letter, reserve):
     if (
         href
         and hh_url(urljoin(HH, href))
-        and urlsplit(urljoin(HH, href)).path == "/applicant/vacancy_response"
+        and urlsplit(urljoin(HH, href)).path.rstrip("/") == "/applicant/vacancy_response"
     ):
         target = urljoin(HH, href)
         if parse_qs(urlsplit(target).query).get("vacancyId") != [identifier]:
             raise HHQuestions("Нельзя подтвердить принадлежность формы вакансии.")
         await open_page(page, target)
         form_url = urlsplit(page.url)
-        if form_url.path != "/applicant/vacancy_response" or parse_qs(form_url.query).get(
-            "vacancyId"
-        ) != [identifier]:
+        if form_url.path.rstrip("/") != "/applicant/vacancy_response" or parse_qs(
+            form_url.query
+        ).get("vacancyId") != [identifier]:
             raise HHQuestions("HH открыл другую страницу вместо проверенной формы отклика.")
     else:
         raise HHQuestions(
@@ -313,7 +373,10 @@ async def apply(page, identifier, resume_id, letter, reserve):
     action = await form.get_attribute("action")
     if action and not hh_url(urljoin(page.url, action)):
         raise HHQuestions("Форма ведёт на сайт работодателя. Отклик требует ручной отправки.")
-    if await form.locator('[data-qa*="question"], select[required]').count():
+    if await form.locator(
+        '[data-qa*="question"], select[required]:not([name="resumeId"]), '
+        'input[required]:not([name="resumeId"]):not([type="hidden"])'
+    ).count():
         raise HHQuestions("Работодатель просит ответить на вопросы.")
     choice = form.locator(f'input[type="radio"][value="{resume_id}"]')
     selected = form.locator(f'input[type="hidden"][name="resumeId"][value="{resume_id}"]')
@@ -328,10 +391,20 @@ async def apply(page, identifier, resume_id, letter, reserve):
         raise HHQuestions("В форме не удалось подтвердить выбранное резюме HH.")
     field = form.locator(LETTER)
     send = form.locator(SUBMIT)
+    if not await field.first.is_visible():
+        toggle = form.locator(LETTER_TOGGLE).or_(
+            form.get_by_role(
+                "button", name=re.compile(r"^Добавить сопроводительное письмо$", re.I)
+            ).and_(form.locator('button[type="button"]'))
+        )
+        if await toggle.count() == 1 and await toggle.is_visible():
+            await toggle.click()
     if await field.count() != 1 or not await field.is_visible() or not await send.is_enabled():
         raise HHQuestions("Форма не позволяет вложить сопроводительное письмо.")
     await field.fill(letter)
     await guard(page)
+    if page.url != form_url.geturl() or await field.input_value() != letter:
+        raise HHQuestions("HH изменил форму или текст письма перед отправкой.")
     if not reserve():
         return "limit"
     await send.click(timeout=3500)

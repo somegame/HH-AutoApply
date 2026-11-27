@@ -83,7 +83,7 @@ def test_dashboard_login_saves_hh_session_without_loading_resume_list(hh_config,
         async def serve(route):
             path = urlsplit(route.request.url).path
             headers = await route.request.all_headers()
-            if path == "/applicant/resumes":
+            if path.rstrip("/") == "/applicant/resumes":
                 resume_visits.append(path)
                 return await route.fulfill(
                     status=503, body="<h1>Service unavailable</h1>", content_type="text/html"
@@ -129,7 +129,7 @@ def test_dashboard_login_saves_hh_session_without_loading_resume_list(hh_config,
 
             with pytest.raises(hh.HHAccessBarrier, match="503"):
                 await workflow.refresh_resumes()
-            assert resume_visits == ["/applicant/resumes"]
+            assert resume_visits == ["/applicant/resumes/"]
             assert workflow.account_connected
             assert db.get("hh_needs_login") is False
             assert "503" in db.get("hh_resumes_status")

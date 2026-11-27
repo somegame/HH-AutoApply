@@ -8,13 +8,13 @@ HISTORY = ("reported", "rejected", "filtered", "duplicate", "sent")
 LABELS = {
     "queued": "Ожидает анализа",
     "draft": "Подготовлен черновик",
-    "approved": "Готов к ручной отправке",
+    "approved": "Письмо готово",
     "deferred": "Отложена",
     "unknown": "Результат неизвестен",
     "reported": "Отправка отмечена владельцем",
     "filtered": "Не подходит",
     "rejected": "Отклонена владельцем",
-    "questions": "Требуются ответы",
+    "questions": "Нужно проверить форму HH",
     "error": "Ошибка анализа",
     "duplicate": "Отклик уже есть на HH",
     "sending": "Отправляется через HH",
@@ -146,7 +146,9 @@ class Database:
             )
             self.event(db, vacancy_id, "analysis_error")
 
-    def transition(self, vacancy_id, previous, status, *, day=None, limit=None, letter=None):
+    def transition(
+        self, vacancy_id, previous, status, *, day=None, limit=None, letter=None, error=None
+    ):
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if (
@@ -160,21 +162,60 @@ class Database:
                 return "limit"
             states = ",".join("?" for _ in previous)
             changed = db.execute(
-                f"""UPDATE vacancies SET status=?,letter=COALESCE(?,letter),sent_day=?,sent_at=?
+                f"""UPDATE vacancies SET status=?,letter=COALESCE(?,letter),sent_day=?,sent_at=?,
+                    error=COALESCE(?,error)
                     WHERE id=? AND status IN ({states})""",
-                (status, letter, day, int(time.time()) if day else None, vacancy_id, *previous),
+                (
+                    status,
+                    letter,
+                    day,
+                    int(time.time()) if day else None,
+                    error,
+                    vacancy_id,
+                    *previous,
+                ),
             ).rowcount
             if changed:
                 self.event(db, vacancy_id, status)
             return "ok" if changed else "stale"
 
-    def next_browser_application(self):
+    def next_browser_application(self, *, policy=None, resume_hash=None):
         with self.connection() as db:
+            if policy is not None:
+                return db.execute(
+                    """SELECT * FROM vacancies WHERE status IN ('draft', 'approved')
+                       AND json_extract(details, '$.source')='browser'
+                       AND json_extract(result, '$.auto_policy')=?
+                       AND json_extract(result, '$.resume_hash')=?
+                       AND letter=json_extract(result, '$.letter')
+                       ORDER BY found_at,id LIMIT 1""",
+                    (policy, resume_hash),
+                ).fetchone()
             return db.execute(
                 """SELECT * FROM vacancies WHERE status='approved'
                    AND json_extract(details, '$.source')='browser'
                    ORDER BY found_at,id LIMIT 1"""
             ).fetchone()
+
+    def refresh_auto_drafts(self, policy, resume_hash):
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT id FROM vacancies WHERE status IN ('draft', 'approved')
+                   AND json_extract(details, '$.source')='browser'
+                   AND found_at>=? AND sent_day IS NULL
+                   AND letter=json_extract(result, '$.letter')
+                   AND (COALESCE(json_extract(result, '$.analysis_policy'), '')<>?
+                        OR COALESCE(json_extract(result, '$.resume_hash'), '')<>?)
+                   ORDER BY found_at DESC,id LIMIT 25""",
+                (int(time.time()) - 7 * 86400, policy, resume_hash),
+            ).fetchall()
+            for row in rows:
+                db.execute(
+                    """UPDATE vacancies SET status='queued',attempts=0,retry_at=0,error=NULL
+                       WHERE id=? AND status IN ('draft', 'approved')""",
+                    (row["id"],),
+                )
+                self.event(db, row["id"], "queued")
 
     def complete_browser_application(self, vacancy_id, status, *, previous="sending"):
         with self.connection() as db:
@@ -187,10 +228,26 @@ class Database:
 
     def recover_browser_applications(self):
         with self.connection() as db:
-            rows = db.execute("SELECT id FROM vacancies WHERE status='sending'").fetchall()
+            rows = db.execute(
+                """SELECT id,json_extract(details, '$.source') AS source
+                   FROM vacancies WHERE status='sending'"""
+            ).fetchall()
             db.execute("UPDATE vacancies SET status='unknown' WHERE status='sending'")
             for row in rows:
                 self.event(db, row["id"], "unknown")
+            if any(row["source"] in {"browser", "mini_hh"} for row in rows):
+                db.executemany(
+                    "INSERT OR REPLACE INTO state VALUES (?,?)",
+                    (
+                        ("browser_auto_enabled", json.dumps(False)),
+                        (
+                            "browser_notice",
+                            json.dumps(
+                                "После перезапуска проверьте результат незавершённого отклика HH."
+                            ),
+                        ),
+                    ),
+                )
 
     def cached(self, key):
         with self.connection() as db:

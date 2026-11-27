@@ -1,4 +1,5 @@
 const token = location.hash.slice(1);
+const resumeMode = new URLSearchParams(location.search).get("mode") === "resume";
 history.replaceState(null, "", location.pathname);
 const stage = document.querySelector("#stage");
 const screen = document.querySelector("#screen");
@@ -19,16 +20,25 @@ let timer;
 let gesture;
 
 const closed = {
-  done: "Вход подтверждён. Сессия HH сохранена.",
-  failed: "Вход не завершился. Проверьте статус аккаунта в Telegram.",
-  blocked: "HH остановил вход. Проверьте статус аккаунта в Telegram.",
-  expired: "Время входа истекло. Откройте вход заново из списка аккаунтов.",
+  done: resumeMode ? "Резюме HH загружено." : "Вход подтверждён. Сессия HH сохранена.",
+  failed: resumeMode ? "Резюме не загрузилось. Проверьте сообщение в «Аккаунтах»." :
+    "Вход не завершился. Проверьте статус аккаунта в Telegram.",
+  blocked: resumeMode ? "HH ограничил доступ к резюме. Проверьте сообщение в «Аккаунтах»." :
+    "HH остановил вход. Проверьте статус аккаунта в Telegram.",
+  expired: resumeMode ? "Окно выбора закрылось. Откройте его заново из «Аккаунтов»." :
+    "Время входа истекло. Откройте вход заново из списка аккаунтов.",
 };
 const messages = {
-  login: "Войдите на странице HH. После открытия личного кабинета проверка начнётся автоматически.",
-  checking: "Проверяю вход в аккаунт HH…",
-  retry: "Аккаунт пока не подтверждён. Если вы уже вошли, нажмите «Проверить вход».",
+  login: resumeMode ? "Откройте профиль HH, затем своё резюме с кнопкой «Редактировать»." :
+    "Войдите на странице HH. После открытия личного кабинета проверка начнётся автоматически.",
+  checking: resumeMode ? "Проверяю резюме HH…" : "Проверяю вход в аккаунт HH…",
+  retry: resumeMode ? "Откройте карточку своего резюме и нажмите «Загрузить резюме»." :
+    "Аккаунт пока не подтверждён. Если вы уже вошли, нажмите «Проверить вход».",
 };
+if (resumeMode) {
+  document.querySelector("header strong").textContent = "Выбор резюме";
+  check.textContent = "Загрузить резюме";
+}
 
 function end(state) {
   if (window.parent !== window) window.parent.postMessage({ hhLogin: state }, location.origin);
