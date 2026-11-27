@@ -1,6 +1,6 @@
 "use strict";
 
-function vacancyDiscovery({ byId, el, api, action, makeCard, getPreferences, updateState, showError, showFeedback }) {
+function vacancyDiscovery({ byId, el, api, action, providerName, makeCard, getPreferences, updateState, showError, showFeedback }) {
   const compareIds = new Set();
   const sort = byId("result-sort");
   const compareDialog = byId("compare-dialog");
@@ -62,20 +62,22 @@ function vacancyDiscovery({ byId, el, api, action, makeCard, getPreferences, upd
     const rank = job.rank;
     const fit = job.analysis_status === "complete" ? percent(job.score) : percent(rank?.fit);
     const skills = job.analysis_status === "complete" ? percent(job.skills_score) : null;
-    const actual = job.analysis_status === "complete" || (!job.analysis_status && rank?.fit_kind === "groq");
+    const rankedProvider = providerName(rank?.fit_kind);
+    const actual = job.analysis_status === "complete" || (!job.analysis_status && Boolean(rankedProvider));
+    const provider = providerName(job.analysis_provider) || rankedProvider || "Groq";
     const analysisNote = {
-      queued: "Ожидает анализа Groq",
-      retry: "Groq повторит анализ",
+      queued: "Ожидает анализа",
+      retry: "Анализ будет повторён",
       filtered: "За пределами фильтров поиска",
-      error: "Анализ Groq не завершился",
-      unavailable: "Оценка Groq пока недоступна",
+      error: "Анализ не завершился",
+      unavailable: "Оценка пока недоступна",
     }[job.analysis_status];
     if (!rank && !job.commute && !address(job) && !job.format && !job.published &&
         fit === null && skills === null && !analysisNote) return null;
     const block = el("div", "", "discovery-assessment");
     const metrics = el("div", "", "job-metrics");
-    if (fit !== null) metrics.append(namedMetric(actual ? "Оценка Groq" : "Предв. оценка", fit, "%"));
-    if (skills !== null) metrics.append(namedMetric("Навыки · Groq", skills, "%"));
+    if (fit !== null) metrics.append(namedMetric(actual ? "Оценка " + provider : "Предв. оценка", fit, "%"));
+    if (skills !== null) metrics.append(namedMetric("Навыки · " + provider, skills, "%"));
     if (percent(rank?.score) !== null) metrics.append(namedMetric("Рейтинг факторов", percent(rank.score), " / 100"));
     if (metrics.childElementCount) block.append(metrics);
     if (analysisNote) block.append(el("p", analysisNote, "analysis-note"));

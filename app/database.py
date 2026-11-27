@@ -1,7 +1,7 @@
 import json
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 ACTIVE = ("queued", "draft", "approved", "deferred", "unknown", "questions", "error", "sending")
 HISTORY = ("reported", "rejected", "filtered", "duplicate", "sent")
@@ -233,47 +233,98 @@ class Database:
                 self.event(db, vacancy_id, status)
             return "ok" if changed else "stale"
 
-    def next_browser_application(self, *, policy=None, resume_hash=None, min_score=0, min_skills=0):
+    def browser_candidates(self, *, policy, resume_hash, min_score, min_skills):
         with self.connection() as db:
-            if policy is not None:
-                return db.execute(
-                    """SELECT * FROM vacancies WHERE status IN ('draft', 'approved')
-                       AND json_extract(details, '$.source')='browser'
-                       AND json_extract(result, '$.auto_policy')=?
-                       AND json_extract(result, '$.resume_hash')=?
-                       AND json_type(result, '$.score')='integer'
-                       AND json_type(result, '$.skills_score')='integer'
-                       AND json_extract(result, '$.score')>=?
-                       AND json_extract(result, '$.skills_score')>=?
-                       AND letter=json_extract(result, '$.letter')
-                       ORDER BY found_at,id LIMIT 1""",
-                    (policy, resume_hash, min_score, min_skills),
-                ).fetchone()
+            yield from db.execute(
+                """SELECT * FROM vacancies WHERE status IN ('draft', 'approved')
+                   AND sent_day IS NULL AND json_extract(details, '$.source')='browser'
+                   AND json_extract(result, '$.auto_policy')=?
+                   AND json_extract(result, '$.resume_hash')=?
+                   AND json_type(result, '$.score')='integer'
+                   AND json_type(result, '$.skills_score')='integer'
+                   AND json_extract(result, '$.score')>=?
+                   AND json_extract(result, '$.skills_score')>=?
+                   AND letter=json_extract(result, '$.letter')
+                   ORDER BY found_at,id""",
+                (policy, resume_hash, min_score, min_skills),
+            )
+
+    def next_browser_application(self, *, policy=None, resume_hash=None, min_score=0, min_skills=0):
+        if policy is not None:
+            candidates = self.browser_candidates(
+                policy=policy, resume_hash=resume_hash, min_score=min_score, min_skills=min_skills
+            )
+            with closing(candidates) as rows:
+                return next(rows, None)
+        with self.connection() as db:
             return db.execute(
                 """SELECT * FROM vacancies WHERE status='approved'
                    AND json_extract(details, '$.source')='browser'
                    ORDER BY found_at,id LIMIT 1"""
             ).fetchone()
 
-    def refresh_auto_drafts(self, policy, resume_hash):
+    def refresh_auto_drafts(self, policy, resume_hash, *, min_score=None):
         with self.connection() as db:
             rows = db.execute(
-                """SELECT id FROM vacancies WHERE status IN ('draft', 'approved')
+                """SELECT id FROM vacancies WHERE status IN ('draft', 'approved', 'filtered')
                    AND json_extract(details, '$.source')='browser'
-                   AND found_at>=? AND sent_day IS NULL
-                   AND letter=json_extract(result, '$.letter')
-                   AND (COALESCE(json_extract(result, '$.analysis_policy'), '')<>?
-                        OR COALESCE(json_extract(result, '$.resume_hash'), '')<>?)
+                   AND found_at>=:recent AND sent_day IS NULL
+                   AND (
+                       (status IN ('draft','approved') AND letter=json_extract(result, '$.letter')
+                        AND (COALESCE(json_extract(result, '$.analysis_policy'), '')<>:policy
+                             OR COALESCE(json_extract(result, '$.resume_hash'), '')<>:digest))
+                       OR (status='filtered' AND :min_score IS NOT NULL
+                           AND json_type(result, '$.score')='integer'
+                           AND (COALESCE(json_extract(result, '$.resume_hash'), '')<>:digest
+                                OR (json_extract(result, '$.score')>=:min_score
+                                    AND json_extract(result, '$.filter_reason') IS NULL
+                                    AND COALESCE(json_extract(result, '$.analysis_threshold'),101)
+                                        > :min_score)))
+                   )
                    ORDER BY found_at DESC,id LIMIT 25""",
-                (int(time.time()) - 7 * 86400, policy, resume_hash),
+                {
+                    "recent": int(time.time()) - 7 * 86400,
+                    "policy": policy,
+                    "digest": resume_hash,
+                    "min_score": min_score,
+                },
             ).fetchall()
             for row in rows:
                 db.execute(
                     """UPDATE vacancies SET status='queued',attempts=0,retry_at=0,error=NULL
-                       WHERE id=? AND status IN ('draft', 'approved')""",
+                       WHERE id=? AND status IN ('draft', 'approved', 'filtered')""",
                     (row["id"],),
                 )
                 self.event(db, row["id"], "queued")
+
+    def hh_application_overview(self, day):
+        hh_sources = "json_extract(details, '$.source') IN ('browser','mini_hh','hh')"
+        with self.connection() as db:
+            totals = db.execute(
+                f"""SELECT count(*) FILTER(WHERE status='sent') AS confirmed_total,
+                           count(*) FILTER(WHERE status='sent' AND sent_day=?) AS confirmed_today,
+                           count(*) FILTER(WHERE sent_day=? AND status<>'reported') AS attempted_today,
+                           count(*) FILTER(WHERE status='queued') AS pending,
+                           count(*) FILTER(WHERE status='unknown') AS unknown
+                    FROM vacancies WHERE {hh_sources}""",
+                (day, day),
+            ).fetchone()
+            used = db.execute("SELECT count(*) FROM vacancies WHERE sent_day=?", (day,)).fetchone()[
+                0
+            ]
+            recent = db.execute(
+                f"""SELECT id, json_extract(details, '$.title') AS title, status,
+                           COALESCE(sent_at, analyzed_at, found_at) AS at
+                    FROM vacancies WHERE {hh_sources}
+                    AND status IN ('sent','unknown','questions','duplicate')
+                    ORDER BY at DESC,id DESC LIMIT 6"""
+            ).fetchall()
+            examples = db.execute(
+                f"""SELECT * FROM vacancies WHERE {hh_sources}
+                    AND status NOT IN ('sent','reported','duplicate','rejected','sending')
+                    ORDER BY found_at DESC,id DESC LIMIT 201"""
+            ).fetchall()
+        return dict(totals) | {"used_today": used, "recent": list(map(dict, recent))}, examples
 
     def complete_browser_application(self, vacancy_id, status, *, previous="sending"):
         with self.connection() as db:

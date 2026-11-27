@@ -245,7 +245,7 @@ def test_browser_alternates_sending_with_due_discovery(tmp_path, monkeypatch):
 
     def next_application(**query):
         assert query["min_skills"] == 85
-        return {"id": VACANCY}
+        yield {"id": VACANCY}
 
     async def verify(page, identifier):
         assert identifier == RESUME
@@ -257,7 +257,8 @@ def test_browser_alternates_sending_with_due_discovery(tmp_path, monkeypatch):
         actions.append("discover")
         return 0, 0
 
-    monkeypatch.setattr(db, "next_browser_application", next_application)
+    monkeypatch.setattr(db, "browser_candidates", next_application)
+    monkeypatch.setattr(flow, "application_block", lambda *_: (None, ""))
     monkeypatch.setattr(flow.provider, "session", session)
     monkeypatch.setattr(flow, "readiness", lambda: {"id": RESUME})
     monkeypatch.setattr(flow, "send_one", send)
@@ -299,6 +300,7 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch, 
     db.set_many(
         {
             "hh_selected_resume": {"id": RESUME, "name": "Финансовый менеджер"},
+            "hh_session_verified": True,
             "resume": resume_text,
             "groq_consent": True,
         }
@@ -350,6 +352,7 @@ def test_browser_worker_sends_once_and_pauses_on_unknown(tmp_path, monkeypatch, 
 
     async def run():
         flow = BrowserWorkflow(config, db)
+        flow.provider.state.write_text('{"cookies":[],"origins":[]}')
         monkeypatch.setattr(flow.provider, "session", session)
         monkeypatch.setattr(hh_browser, "verify_resume", verify)
         monkeypatch.setattr(hh_browser, "apply", apply)

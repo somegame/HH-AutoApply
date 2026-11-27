@@ -18,10 +18,11 @@ from app.database import LABELS
 from app.discovery import VacancyDiscovery, commute_limit, preferred_format
 from app.hh_browser import HHLoginRequired
 from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, source_vacancy_id, text
-from app.ranking import ORDERS, duplicate_key, mark_top, sort_ranked
+from app.ranking import ORDERS, duplicate_key, mark_top, normalized, sort_ranked
 from app.resume import checked
+from app.resume_studio import build_resume, has_resume_evidence
 from app.scheduler import local_day
-from app.services import ServiceError
+from app.services import ServiceError, ai_allowed, clean_text
 from app.superjob import SuperJob
 from app.vacancies import HH, URL_FIELDS, terms, vacancy_id
 
@@ -86,6 +87,7 @@ class MiniApp:
     def __init__(self, config, db, scheduler, client, bot):
         self.config = config
         self.db = db
+        self.client = client
         self.scheduler = scheduler
         self.browser = scheduler.browser
         self.sources = JobSources(config, self.browser, client)
@@ -95,6 +97,8 @@ class MiniApp:
         self.search_lock = asyncio.Lock()
         self.searches = OrderedDict()
         self.catalog = OrderedDict()
+        self.resume_task = None
+        self.resume_error = ""
 
     def add_routes(self, app):
         app.on_shutdown.append(self.shutdown)
@@ -102,13 +106,15 @@ class MiniApp:
             [
                 web.get("/mini", self.asset),
                 web.get("/mini/{asset:(?:app|discovery|leaflet)\\.(?:js|css)}", self.asset),
-                web.get("/mini/api/{command:state|search|search-status|vacancy}", self.api),
+                web.get(
+                    "/mini/api/{command:state|search|search-status|vacancy|resume-studio}", self.api
+                ),
                 web.get("/mini/oauth/superjob", self.superjob_callback),
                 web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
                     "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|"
                     "hh-mode|hh-resumes|hh-browser|superjob|preferences|locate|route|"
-                    "search-start|auto-settings}",
+                    "search-start|auto-settings|resume-studio|ai-consent}",
                     self.api,
                 ),
             ]
@@ -116,6 +122,8 @@ class MiniApp:
 
     async def shutdown(self, _app):
         tasks = [run.task for run in self.searches.values() if run.task and not run.task.done()]
+        if self.resume_task and not self.resume_task.done():
+            tasks.append(self.resume_task)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -184,6 +192,8 @@ class MiniApp:
                 return self.json(self.search_payload(run))
             if command == "vacancy":
                 return self.json(self.vacancy_details(request.query.get("id", "")))
+            if command == "resume-studio" and request.method == "GET":
+                return self.json(self.resume_studio_state())
             data = await request.clone(client_max_size=100_000).json()
             if not isinstance(data, dict):
                 raise ValueError("Ожидались данные в виде объекта.")
@@ -199,6 +209,18 @@ class MiniApp:
                 return self.json(await self.job_action(data))
             if command == "profile":
                 return self.json(self.save_profile(data))
+            if command == "resume-studio":
+                return self.resume_studio_action(data)
+            if command == "ai-consent":
+                consent = data.get("gemini")
+                if type(consent) is not bool:
+                    raise ValueError("Укажите согласие на Gemini.")
+                if consent and not self.config.gemini_key:
+                    raise ValueError("Добавьте GEMINI_API_KEY в Bothost.")
+                self.db.set("gemini_consent", consent)
+                if not ai_allowed(self.config, self.db):
+                    self.browser.pause("Разрешение на анализ отключено.", keep_search=True)
+                return self.json(self.state())
             if command == "preferences":
                 return self.json({"preferences": self.discovery.configure(data)})
             if command == "locate":
@@ -304,7 +326,11 @@ class MiniApp:
             "jobs": jobs,
             "resume": resume,
             "consent": self.db.get("groq_consent", False),
+            **self.resume_studio_state(),
             "groq": bool(self.config.groq_key),
+            "gemini": bool(self.config.gemini_key),
+            "gemini_consent": self.db.get("gemini_consent", False),
+            "ai_available": ai_allowed(self.config, self.db),
             "resumes": self.db.get("hh_resume_choices", {}),
             "hh_resume": hh_resume.get("name", ""),
             "hh_resume_id": hh_resume.get("id", ""),
@@ -332,6 +358,7 @@ class MiniApp:
             "hh_auto": bool(self.db.get("browser_auto_enabled")),
             "hh_notice": self.db.get("browser_notice", ""),
             "hh_scan_pending": len(self.db.get("browser_scan", {}).get("pending", [])),
+            "hh_application": self.browser.application_status(),
             "daily_limit": prefs["limit"],
             "summary": {
                 "total": sum(counts.values()),
@@ -576,6 +603,7 @@ class MiniApp:
         return {
             "analysis_status": state,
             "score": result["score"] if verified else None,
+            "analysis_provider": result.get("analysis_provider", "groq") if verified else None,
             "skills_score": result.get("skills_score") if verified else None,
             "duties": result.get("duties", []) if verified else [],
             "reason": (row["error"] if row else None)
@@ -653,10 +681,7 @@ class MiniApp:
             "analysis_pending": pending,
             "analysis_queue": {"pending": pending} | self.scheduler.analysis_status(),
             "analysis_running": bool(
-                resume
-                and self.config.groq_key
-                and self.db.get("groq_consent", False)
-                and self.db.get("processing", True)
+                resume and ai_allowed(self.config, self.db) and self.db.get("processing", True)
             ),
             "stats": {
                 "salary_known": sum(bool(job["salary_max"]) for job in unique),
@@ -689,10 +714,169 @@ class MiniApp:
         if resume != self.db.get("resume", ""):
             self.browser.pause("Данные резюме изменены.", keep_search=True)
             values["hh_selected_resume"] = {}
-        if not consent:
+        if not consent and not (self.config.gemini_key and self.db.get("gemini_consent")):
             self.browser.pause("Разрешение на анализ отключено.", keep_search=True)
         self.db.set_many(values)
         return self.state()
+
+    def resume_studio_state(self):
+        stored = self.db.get("resume_studio")
+        draft = (
+            {key: value for key, value in stored.items() if key != "profile_hash"}
+            if stored
+            else None
+        )
+        status = "ready" if draft else "idle"
+        if self.resume_task and not self.resume_task.done():
+            status = "processing"
+        elif self.resume_error:
+            status = "error"
+        return {
+            "resume_studio": draft,
+            "resume_studio_status": {"status": status, "message": self.resume_error},
+        }
+
+    def resume_studio_action(self, data):
+        action = data.get("action")
+        resume = self.db.get("resume", "")
+        digest = hashlib.sha256(resume.encode()).hexdigest()
+        if action == "adopt" and data.get("confirm") is True:
+            if self.browser.account_connected or self.db.get("hh_selected_resume"):
+                raise ServiceError(
+                    "Сначала обновите резюме на HH, затем загрузите его заново в приложении."
+                )
+            draft = self.db.get("resume_studio", {})
+            if draft.get("profile_hash") != digest or not draft.get("text"):
+                raise ServiceError("Подготовьте свежий черновик для текущего профиля.")
+            return self.json(
+                self.save_profile(
+                    {"resume": draft["text"], "consent": self.db.get("groq_consent", False)}
+                )
+            )
+        if action != "generate":
+            raise ValueError("Выберите действие с резюме.")
+        if self.resume_task and not self.resume_task.done():
+            return self.json(self.resume_studio_state(), 202)
+        mode, target, facts = data.get("mode"), data.get("target"), data.get("facts", "")
+        if mode not in ("improve", "build"):
+            raise ValueError("Выберите режим редактирования резюме.")
+        if (
+            not isinstance(target, str)
+            or not 2 <= len(target.strip()) <= 120
+            or len(target.splitlines()) != 1
+            or not isinstance(facts, str)
+            or len(facts) > 8000
+        ):
+            raise ValueError("Укажите должность одной строкой и до 8 000 символов опыта.")
+        target = clean_text(target).strip()
+        if sum(char.isalpha() for char in target) < 2 or "[скрыто]" in target:
+            raise ValueError("Укажите название специальности без контактов.")
+        use_provider = has_resume_evidence(resume, facts)
+        if use_provider:
+            if not self.config.ai_configured:
+                raise ServiceError("Добавьте ключ Groq или Gemini в Bothost.")
+            if data.get("consent") is True and self.config.groq_key:
+                self.db.set("groq_consent", True)
+            if not ai_allowed(self.config, self.db):
+                raise ServiceError(
+                    "Разрешите Groq или Gemini обработать профессиональные сведения."
+                )
+        self.resume_error = ""
+        self.resume_task = asyncio.create_task(
+            self.generate_resume(resume, digest, target, facts, mode, use_provider)
+        )
+        return self.json(self.resume_studio_state(), 202)
+
+    def resume_vacancy_sample(self, target):
+        words = {word[:6] for word in normalized(target).split() if len(word) > 2}
+        matching = []
+        for row in self.db.page((), 0, size=100)[:100]:
+            vacancy = json.loads(row["details"])
+            title = vacancy.get("title", "")
+            overlap = words & {word[:6] for word in normalized(title).split()}
+            if overlap:
+                matching.append((len(overlap), vacancy, row))
+        sample, seen = [], set()
+        for _, vacancy, row in sorted(matching, key=lambda item: item[0], reverse=True):
+            key = duplicate_key(vacancy) or row["id"]
+            if key in seen:
+                continue
+            seen.add(key)
+            result = self.current_analysis(row) or {}
+            sample.append(
+                {
+                    "title": clean_text(vacancy["title"])[:120],
+                    "required": result.get("required", []),
+                    "keywords": clean_text(vacancy.get("description", ""))[:420],
+                }
+            )
+            if len(sample) >= 8:
+                break
+        return sample
+
+    async def generate_resume(self, resume, digest, target, facts, mode, use_provider):
+        try:
+            sample = self.resume_vacancy_sample(target)
+            inputs = {
+                "resume": resume,
+                "target": target,
+                "facts": facts,
+                "mode": mode,
+                "vacancy_sample": sample,
+            }
+            provider = ""
+
+            async def complete(prompt, payload, **options):
+                nonlocal provider
+                completed = await self.scheduler.try_ai(
+                    lambda service: service.complete(prompt, payload, **options), int(time.time())
+                )
+                if completed is None:
+                    raise ServiceError(
+                        "Лимит доступных моделей исчерпан или они временно недоступны."
+                    )
+                provider, response = completed
+                return response
+
+            if use_provider:
+                async with asyncio.timeout(60):
+                    async with self.scheduler.ai_lock:
+                        delay = self.scheduler.ai_request_delay(int(time.time()))
+                        if delay and delay <= 12:
+                            await asyncio.sleep(delay)
+                        if (
+                            not ai_allowed(self.config, self.db)
+                            or self.db.get("resume", "") != resume
+                        ):
+                            raise ServiceError("Профиль изменился. Запустите подготовку заново.")
+                        result = await build_resume(
+                            self.client, self.config, complete=complete, **inputs
+                        )
+            else:
+                result = await build_resume(self.client, self.config, **inputs)
+            if self.db.get("resume", "") != resume or (
+                use_provider and not ai_allowed(self.config, self.db)
+            ):
+                raise ServiceError("Профиль изменился. Запустите подготовку заново.")
+            self.db.set(
+                "resume_studio",
+                result
+                | {
+                    "profile_hash": digest,
+                    "target": target,
+                    "mode": mode,
+                    "created": int(time.time()),
+                    "sample_count": len(sample) if use_provider else 0,
+                    "provider": provider,
+                },
+            )
+        except (ValueError, ServiceError) as exc:
+            self.resume_error = str(exc)
+        except TimeoutError:
+            self.resume_error = "Модель долго отвечает. Попробуйте подготовить черновик ещё раз."
+        except Exception as exc:
+            log.warning("Не удалось подготовить резюме (%s)", type(exc).__name__)
+            self.resume_error = "Не удалось подготовить черновик. Повторите попытку."
 
     async def connect_hh(self, *, fresh=False, resume_mode=False):
         if not self.browser.available:

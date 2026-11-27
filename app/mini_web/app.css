@@ -102,11 +102,27 @@ button.primary, button.secondary { min-height: 44px; border-radius: 10px; paddin
 .job-duties .extra-duties summary { padding: 4px 0; color: var(--accent); font-size: .84rem; }
 .hh-auto-card { gap: 10px; margin-bottom: 12px; }
 .hh-auto-card form { gap: 5px; }
+.hh-activity-counts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.hh-activity-counts div { display: flex; flex-direction: column-reverse; gap: 3px; padding: 8px; background: var(--paper); border-radius: 8px; }
+.hh-activity-counts dt { color: var(--muted); font-size: .78rem; line-height: 1.25; }
+.hh-activity-counts dd { margin: 0; font-weight: 750; font-variant-numeric: tabular-nums; }
+.hh-activity-list { margin: 0; padding-inline-start: 1.2rem; }
+.hh-activity-list + .hh-activity-list, .hh-activity-list li + li { margin-top: 5px; }
+#hh-activity-verification { color: var(--warning); }
+#hh-activity-details summary { min-height: 44px; }
 .skill-threshold { display: grid; grid-template-columns: minmax(58px, 86px) minmax(0, 1fr); gap: 8px; align-items: center; }
 .skill-threshold input { font-variant-numeric: tabular-nums; }
 .skill-threshold button { justify-self: start; }
 .profile, .extension { padding: 14px; margin-top: 15px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
 .profile { display: grid; gap: 8px; }
+.resume-studio-jump { min-height: 44px; padding: 0 2px; border: 0; background: transparent; color: var(--accent); font-size: .89rem; font-weight: 650; }
+.resume-studio-field { display: grid; gap: 5px; }
+.resume-studio-result { display: grid; gap: 9px; margin-top: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+.resume-studio-result h4, .resume-studio-result h5 { margin: 0; font-size: .95rem; }
+.resume-studio-result ul { margin: 4px 0 0; padding-inline-start: 1.2rem; }
+.resume-studio-result li + li { margin-top: 4px; }
+.resume-studio-result textarea { line-height: 1.56; }
+.resume-studio-check { justify-self: start; }
 .app-version { margin: 12px 0 0; text-align: end; }
 .extension form { padding: 5px 0; }
 nav { position: fixed; z-index: 2; inset: auto 0 0; margin: 0 auto; max-width: 780px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 7px 10px calc(6px + var(--bottom)); background: var(--surface); border-top: 1px solid var(--line); }

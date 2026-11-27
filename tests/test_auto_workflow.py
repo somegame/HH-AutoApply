@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from app import hh_browser
+from app.browser_workflow import BrowserWorkflow
 from app.config import Config
 from app.database import Database
 from app.scheduler import Scheduler, local_day
@@ -135,6 +136,7 @@ def test_new_groq_draft_is_the_only_automatic_submission(config, vacancy, monkey
     db.set_many(
         {
             "hh_selected_resume": {"id": RESUME_ID, "name": TITLE},
+            "hh_session_verified": True,
             "resume": resume,
             "groq_consent": True,
         }
@@ -195,6 +197,7 @@ def test_new_groq_draft_is_the_only_automatic_submission(config, vacancy, monkey
     async def run():
         async with httpx.AsyncClient(transport=httpx.MockTransport(groq_response)) as client:
             scheduler = Scheduler(config, db, client)
+            scheduler.browser.provider.state.write_text('{"cookies":[],"origins":[]}')
             bot = SimpleNamespace(send_message=message)
             monkeypatch.setattr(scheduler.browser.provider, "check_installation", lambda: None)
             monkeypatch.setattr(scheduler.browser.provider, "session", session)
@@ -223,6 +226,99 @@ def test_new_groq_draft_is_the_only_automatic_submission(config, vacancy, monkey
     assert submissions == [VACANCY_ID]
     assert db.vacancy(VACANCY_ID)["status"] == "sent"
     assert db.vacancy("1100")["status"] == db.vacancy("1101")["status"] == "approved"
+
+
+def test_application_diagnostics_counts_only_confirmations_and_explains_blocks(config, vacancy):
+    db = Database(config.data_dir)
+    day = local_day(config)
+    flow = BrowserWorkflow(config, db)
+    db.set_many(
+        {
+            "resume": RESUME,
+            "groq_consent": True,
+            "hh_selected_resume": {"id": RESUME_ID, "name": TITLE},
+            "hh_session_verified": True,
+            "browser_auto_enabled": True,
+            "browser_search": True,
+        }
+    )
+    flow.provider.state.write_text('{"cookies":[],"origins":[]}')
+    digest = hashlib.sha256(RESUME.encode()).hexdigest()
+    letter = grounded_auto_letter(ANALYSIS, RESUME, vacancy, 80)
+    result = ANALYSIS | {
+        "resume_hash": digest,
+        "analysis_policy": AUTO_ANALYSIS_POLICY,
+        "analysis_threshold": 80,
+        "auto_policy": AUTO_ANALYSIS_POLICY,
+        "letter": letter,
+    }
+    for identifier, status, data, result_change in (
+        ("1", "draft", vacancy, {}),
+        ("2", "draft", vacancy, {"skills_score": 72}),
+        ("3", "draft", vacancy, {"missing": ["Опыт работы в отрасли"]}),
+        ("4", "draft", vacancy | {"region": "Казань"}, {}),
+        ("5", "draft", vacancy, {"resume_hash": "outdated"}),
+        ("6", "draft", vacancy, {}),
+        ("7", "draft", vacancy, {}),
+    ):
+        db.add(identifier, data)
+        db.finish_analysis(identifier, status, result | result_change, letter)
+    db.add("8", vacancy)
+    assert db.transition("6", ("draft",), "sending", day=day, limit=100) == "ok"
+    db.complete_browser_application("6", "sent")
+    assert db.transition("7", ("draft",), "sending", day=day, limit=100) == "ok"
+    db.complete_browser_application("7", "unknown")
+
+    status = flow.application_status()
+    assert status["eligible"] == 1
+    assert status["pending"] == 1
+    assert status["confirmed_today"] == status["confirmed_total"] == 1
+    assert status["attempted_today"] == 2
+    assert status["unknown"] == 1
+    assert status["blocked"] == {
+        "analysis_pending": 1,
+        "unknown_outcome": 1,
+        "stale_analysis": 1,
+        "search_filters": 1,
+        "missing_requirements": 1,
+        "skills_below_threshold": 1,
+    }
+    assert {row["status"] for row in status["recent"]} == {"sent", "unknown"}
+
+
+def test_lowered_overall_threshold_requeues_recent_card_while_auto_is_enabled(
+    config, vacancy, monkeypatch
+):
+    db = Database(config.data_dir)
+    flow = BrowserWorkflow(config, db)
+    monkeypatch.setattr(flow, "require_browser", lambda: None)
+    flow.provider.state.write_text('{"cookies":[],"origins":[]}')
+    db.set_many(
+        {
+            "resume": RESUME,
+            "groq_consent": True,
+            "hh_selected_resume": {"id": RESUME_ID, "name": TITLE},
+            "hh_session_verified": True,
+            "settings": {"score": 96},
+        }
+    )
+    digest = hashlib.sha256(RESUME.encode()).hexdigest()
+    result = ANALYSIS | {
+        "resume_hash": digest,
+        "analysis_policy": AUTO_ANALYSIS_POLICY,
+        "analysis_threshold": 96,
+        "letter": "",
+    }
+    for identifier in ("1", "2"):
+        db.add(identifier, vacancy)
+    db.finish_analysis("1", "filtered", result, None)
+    db.finish_analysis("2", "filtered", result | {"filter_reason": "Работодатель исключён."}, None)
+    flow.start_search(send=True)
+    assert db.vacancy("1")["status"] == "filtered"
+    db.set_many({"settings": {"score": 80}, "next_browser_search": 2**40})
+    asyncio.run(flow.tick(None, db.settings(config), local_day(config)))
+    assert db.vacancy("1")["status"] == "queued"
+    assert db.vacancy("2")["status"] == "filtered"
 
 
 @pytest.mark.parametrize(

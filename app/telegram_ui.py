@@ -550,6 +550,7 @@ class TelegramUI:
                     f"Напоминания — {reminder}",
                     f"Анализ — {'включён' if self.db.get('processing', True) else 'остановлен'}",
                     f"Согласие на Groq — {'дано' if self.db.get('groq_consent') else 'требуется'}",
+                    f"Gemini — {'разрешён' if self.db.get('gemini_consent') else 'выключен'}",
                     f"Резюме — {'загружено' if self.db.get('resume') else 'требуется'}",
                 ]
             )
@@ -585,6 +586,11 @@ class TelegramUI:
                     f"Планировщик · {'работает' if self.scheduler.task and not self.scheduler.task.done() else 'остановлен'}"
                 )
                 lines.extend(f"{row['id']} · {row['error']}" for row in self.db.errors())
+                if self.config.gemini_key:
+                    gemini = self.scheduler.provider_status("gemini")
+                    lines.append(f"Gemini за сутки · {gemini['used']}/{gemini['limit']}")
+                    if gemini["notice"]:
+                        lines.append(gemini["notice"])
             if kind in {"diagnose", "groq"}:
                 try:
                     await self.scheduler.groq.check()
@@ -739,6 +745,7 @@ class TelegramUI:
             {
                 "resume": checked(text),
                 "groq_consent": False,
+                "gemini_consent": False,
                 "hh_selected_resume": {},
                 "browser_auto_enabled": False,
                 "browser_search": False,
@@ -888,7 +895,8 @@ class TelegramUI:
             LABELS[status],
         ]
         if "score" in result:
-            lines.append(f"Оценка Groq · {result['score']}%")
+            provider = "Gemini" if result.get("analysis_provider") == "gemini" else "Groq"
+            lines.append(f"Оценка {provider} · {result['score']}%")
         if "skills_score" in result:
             lines.append(f"Совпадение навыков · {result['skills_score']}%")
         if result.get("reason"):
