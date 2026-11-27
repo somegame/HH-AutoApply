@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from app.local_browser import public_login_url
 
-VERSION = "6.5.1"
+VERSION = "6.6.0"
 DEFAULT_GROQ_DAILY_LIMIT = 50
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_DAILY_LIMIT = 50
@@ -113,6 +113,8 @@ class Config:
     gemini_key: str = ""
     gemini_model: str = DEFAULT_GEMINI_MODEL
     gemini_daily_limit: int = DEFAULT_GEMINI_DAILY_LIMIT
+    habr_client_id: str = ""
+    habr_client_secret: str = ""
 
     @property
     def ai_configured(self):
@@ -210,4 +212,6 @@ class Config:
             env.get("GEMINI_API_KEY", "").strip(),
             gemini_model,
             gemini_daily_limit,
+            env.get("HABR_CLIENT_ID", "").strip(),
+            env.get("HABR_CLIENT_SECRET", "").strip(),
         )

@@ -38,7 +38,12 @@ def build(config, db, client, *, telegram_request=None):
                 db.set("resume", await read_upload(path.name, path.read_bytes()))
             except (OSError, ValueError):
                 log.warning("Не удалось прочитать локальный resume.txt")
-        if db.get("browser_search") or db.get("processing", True) or db.get("reminders", False):
+        if (
+            db.get("browser_search")
+            or db.get("processing", True)
+            or db.get("reminders", False)
+            or any(db.get("hub_sources", {}).values())
+        ):
             await scheduler.start(app.bot)
 
     async def shutdown(app):

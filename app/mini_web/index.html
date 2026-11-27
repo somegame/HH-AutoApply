@@ -130,21 +130,25 @@
         <button type="button" data-filter="draft">В работе</button>
         <button type="button" data-filter="sent">Отправленные</button>
       </div>
+      <div class="journal-source">
+        <label for="journal-source">Площадка</label>
+        <select id="journal-source"><option value="all">Все площадки</option></select>
+      </div>
       <p id="analysis-status" class="notice" role="status" hidden></p>
       <p id="jobs-setup" class="notice" role="status" hidden></p>
       <div id="jobs" class="stack results"></div>
-      <details class="extension">
+      <details id="import-vacancy" class="extension">
         <summary>Добавить вакансию по ссылке</summary>
         <form id="import-form" class="stack" autocomplete="off">
           <label for="job-url">Ссылка на вакансию</label>
           <input id="job-url" name="url" type="url" required maxlength="600" placeholder="https://…">
           <label for="job-title">Должность</label>
-          <input id="job-title" name="title" required maxlength="180">
+          <input id="job-title" name="title" maxlength="180" placeholder="Можно взять из первой строки описания">
           <label for="job-company">Работодатель</label>
           <input id="job-company" name="company" maxlength="180">
-          <label for="job-description">Описание для сопроводительного</label>
+          <label for="job-description">Описание для анализа и письма</label>
           <textarea id="job-description" name="description" maxlength="5200" rows="3"></textarea>
-          <button class="primary" type="submit">Сохранить вакансию</button>
+          <button class="primary" type="submit">Сохранить в журнал</button>
         </form>
       </details>
     </section>

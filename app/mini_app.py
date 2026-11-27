@@ -17,8 +17,16 @@ from app import hh_resume_editor
 from app.config import VERSION, setting
 from app.database import LABELS
 from app.discovery import VacancyDiscovery, commute_limit, preferred_format
+from app.habr import HabrAccount
 from app.hh_browser import HHAccessBarrier, HHLoginRequired
-from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, source_vacancy_id, text
+from app.job_sources import (
+    ACCOUNT_URLS,
+    SEARCH_SOURCES,
+    SOURCES,
+    source_url,
+    source_vacancy_id,
+    text,
+)
 from app.ranking import ORDERS, duplicate_key, mark_top, normalized, sort_ranked
 from app.resume import checked
 from app.resume_studio import build_resume, has_resume_evidence
@@ -91,8 +99,10 @@ class MiniApp:
         self.client = client
         self.scheduler = scheduler
         self.browser = scheduler.browser
-        self.sources = JobSources(config, self.browser, client)
+        self.hub = scheduler.hub
+        self.sources = self.hub.sources
         self.superjob = SuperJob(config, db, client)
+        self.habr = HabrAccount(config, db, client)
         self.discovery = VacancyDiscovery(config, db, client)
         self.bot = bot
         self.search_lock = asyncio.Lock()
@@ -114,11 +124,12 @@ class MiniApp:
                     self.api,
                 ),
                 web.get("/mini/oauth/superjob", self.superjob_callback),
+                web.get("/mini/oauth/habr", self.habr_callback),
                 web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
                     "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|"
                     "hh-mode|hh-resumes|hh-browser|superjob|preferences|locate|route|"
-                    "search-start|auto-settings|resume-studio|ai-consent|hh-editor|hh-check}",
+                    "search-start|auto-settings|resume-studio|ai-consent|hh-editor|hh-check|habr|hub}",
                     self.api,
                 ),
             ]
@@ -157,17 +168,25 @@ class MiniApp:
         location = "/mini/oauth/finished" + ("?connected=1" if success else "")
         raise web.HTTPSeeOther(location=location, headers=HEADERS)
 
+    async def habr_callback(self, request):
+        success = await self.habr.connect(request.query)
+        location = "/mini/oauth/finished?provider=habr"
+        if success:
+            location += "&connected=1"
+        raise web.HTTPSeeOther(location=location, headers=HEADERS)
+
     async def oauth_finished(self, request):
+        name = "Хабр Карьера" if request.query.get("provider") == "habr" else "SuperJob"
         status = (
-            "SuperJob подключён."
+            "Профиль подтверждён."
             if request.query.get("connected") == "1"
-            else "SuperJob не подтвердил вход."
+            else "Вход не подтверждён."
         )
         return web.Response(
             text=f'<!doctype html><html lang="ru"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>SuperJob</title><link rel="stylesheet" href="/mini/app.css">'
-            f'<main class="oauth-result"><h1>{status}</h1>'
+            f'<title>{name}</title><link rel="stylesheet" href="/mini/app.css">'
+            f'<main class="oauth-result"><h1>{name}</h1><p>{status}</p>'
             f"<p>Вернитесь в Telegram и откройте раздел «Аккаунты».</p></main></html>",
             content_type="text/html",
             headers=HEADERS,
@@ -254,6 +273,18 @@ class MiniApp:
                 return self.json(self.state() | {"hh_access_restored": checked})
             if command == "hh-editor":
                 return await self.hh_editor_action(data)
+            if command == "hub":
+                self.hub.configure(data.get("source"), data.get("enabled"))
+                if data["enabled"]:
+                    await self.scheduler.start(self.bot)
+                return self.json(self.state())
+            if command == "habr":
+                if data.get("action") == "connect":
+                    return self.json({"url": self.habr.start()})
+                if data.get("action") == "disconnect" and data.get("confirm") is True:
+                    self.habr.disconnect()
+                    return self.json(self.state())
+                raise ValueError("Выберите действие для Хабр Карьеры.")
             if command == "hh-resumes":
                 if "url" in data:
                     await self.browser.refresh_resumes(data["url"])
@@ -367,7 +398,9 @@ class MiniApp:
             },
             "analysis_queue": {"pending": counts.get("queued", 0)}
             | self.scheduler.analysis_status(),
-            "hh_send": self.browser.available and self.config.persistent,
+            "hh_send": self.browser.available
+            and self.config.persistent
+            and not self.browser.access_barrier(),
             "hh_auto_allowed": self.browser.available
             and self.config.auto_send
             and self.config.persistent,
@@ -377,6 +410,8 @@ class MiniApp:
             "hh_scan_pending": len(self.db.get("browser_scan", {}).get("pending", [])),
             "hh_application": self.browser.application_status(),
             "hh_access_restricted": bool(self.browser.access_barrier()),
+            "hub": self.hub.state(),
+            "habr": self.habr.state(),
             "daily_limit": prefs["limit"],
             "summary": {
                 "total": sum(counts.values()),
@@ -398,6 +433,7 @@ class MiniApp:
         modes = {
             "hh": "browser" if self.browser.available else "link",
             "trudvsem": "public",
+            "habr": "habr",
             "superjob": (
                 "account"
                 if self.superjob.available
@@ -411,9 +447,15 @@ class MiniApp:
                 "id": key,
                 "name": info[0],
                 "url": source_url(key, prefs["query"], prefs),
+                "account_url": ACCOUNT_URLS[key],
                 "mode": modes.get(key, "link"),
-                "in_app_apply": (key == "hh" and self.browser.available)
-                or (key == "superjob" and self.superjob.available),
+                "in_app_search": (key == "hh" and self.browser.available)
+                or self.hub.available(key),
+                "in_app_apply": self.config.persistent
+                and (
+                    (key == "hh" and self.browser.available and not self.browser.access_barrier())
+                    or (key == "superjob" and self.superjob.available)
+                ),
             }
             for key, info in SOURCES.items()
         ]
@@ -1031,7 +1073,8 @@ class MiniApp:
         return self.state()
 
     async def import_job(self, raw):
-        title = text(raw.get("title"))
+        description = text(raw.get("description"), 5200)
+        title = text(raw.get("title")) or (text(description.splitlines()[0]) if description else "")
         url = raw.get("url")
         if (
             not title
@@ -1069,7 +1112,6 @@ class MiniApp:
             origin, url = "hh", f"{HH}/vacancy/{identifier}"
         except ValueError:
             pass
-        description = text(raw.get("description"), 5200)
         details = dict.fromkeys(URL_FIELDS, "")
         details.update(
             title=title,
@@ -1082,9 +1124,11 @@ class MiniApp:
         if self.db.add(identifier, details):
             if not description:
                 self.db.transition(identifier, ("queued",), "deferred")
-            else:
-                self.db.set("processing", True)
-                await self.scheduler.start(self.bot)
+        elif description:
+            self.db.add_vacancy_description(identifier, details)
+        if description and self.db.vacancy(identifier)["status"] == "queued":
+            self.db.set("processing", True)
+            await self.scheduler.start(self.bot)
         return {"job": self.saved(self.db.vacancy(identifier))}
 
     async def job_action(self, data):

@@ -11,6 +11,7 @@ from app.browser_workflow import BrowserWorkflow
 from app.diagnostics import resource_warning
 from app.gemini import Gemini
 from app.hh_browser import HHAccessBarrier, HHLoginRequired
+from app.job_hub import JobHub
 from app.services import (
     AI_PROVIDERS,
     AUTO_ANALYSIS_POLICY,
@@ -40,6 +41,7 @@ class Scheduler:
         self.providers = {"groq": self.groq, "gemini": Gemini(client, config)}
         self.ai_lock = asyncio.Lock()
         self.browser = BrowserWorkflow(config, db)
+        self.hub = JobHub(config, db, self.browser, client)
         self.task = None
         self.warning = None
 
@@ -61,7 +63,12 @@ class Scheduler:
 
     async def loop(self, bot):
         async with asyncio.TaskGroup() as workers:
-            for handler in (self.tick_reminders, self.tick_browser, self.tick_analysis):
+            for handler in (
+                self.tick_reminders,
+                self.tick_browser,
+                self.tick_analysis,
+                self.hub.tick,
+            ):
                 workers.create_task(self.run_worker(bot, handler))
 
     async def run_worker(self, bot, handler):
@@ -81,7 +88,10 @@ class Scheduler:
 
     async def tick(self, bot):
         await asyncio.gather(
-            self.tick_reminders(bot), self.tick_browser(bot), self.tick_analysis(bot)
+            self.tick_reminders(bot),
+            self.tick_browser(bot),
+            self.tick_analysis(bot),
+            self.hub.tick(bot),
         )
 
     async def tick_reminders(self, bot):

@@ -126,6 +126,19 @@ class Database:
                     return True
             return False
 
+    def add_vacancy_description(self, vacancy_id, details):
+        with self.connection() as db:
+            changed = db.execute(
+                """UPDATE vacancies SET details=?,status='queued',attempts=0,retry_at=0,error=NULL
+                   WHERE id=? AND status IN ('deferred','queued')
+                   AND COALESCE(json_extract(details, '$.description'), '')=''
+                   AND result IS NULL AND letter IS NULL AND sent_day IS NULL""",
+                (json.dumps(details), vacancy_id),
+            ).rowcount
+            if changed:
+                self.event(db, vacancy_id, "queued")
+            return bool(changed)
+
     @staticmethod
     def event(db, vacancy_id, action):
         db.execute(
