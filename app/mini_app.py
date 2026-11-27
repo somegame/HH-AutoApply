@@ -8,7 +8,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl
 from uuid import uuid4
 
 from aiohttp import web
@@ -24,7 +24,6 @@ from app.job_sources import (
     SEARCH_SOURCES,
     SOURCES,
     source_url,
-    source_vacancy_id,
     text,
 )
 from app.ranking import ORDERS, duplicate_key, mark_top, normalized, sort_ranked
@@ -32,7 +31,8 @@ from app.resume import checked
 from app.resume_studio import build_resume, has_resume_evidence
 from app.scheduler import local_day
 from app.services import ServiceError, ai_allowed, clean_text
-from app.vacancies import HH, URL_FIELDS, terms, vacancy_id
+from app.vacancies import HH, terms
+from app.vacancy_inbox import can_add_description, save_job
 
 STATIC = Path(__file__).with_name("mini_web")
 MAX_AGE = 3600
@@ -499,7 +499,7 @@ class MiniApp:
             "url": job["url"],
             "source": site if site in (*SOURCES, "external") else "hh",
             "status": row["status"],
-            "label": LABELS[row["status"]],
+            "label": "Нужно описание" if can_add_description(row, job) else LABELS[row["status"]],
             "letter": row["letter"] or "",
             **self.analysis_fields(row, result, resume),
             "can_edit": row["status"] in EDITABLE and bool(row["letter"]),
@@ -1098,63 +1098,11 @@ class MiniApp:
         return self.state()
 
     async def import_job(self, raw):
-        description = text(raw.get("description"), 5200)
-        title = text(raw.get("title")) or (text(description.splitlines()[0]) if description else "")
-        url = raw.get("url")
-        if (
-            not title
-            or not isinstance(url, str)
-            or not 0 < len(url) <= 600
-            or any(char.isspace() or ord(char) < 32 for char in url)
-            or "\\" in url
-        ):
-            raise ValueError("Укажите должность и HTTPS-ссылку на вакансию.")
-        parsed = urlsplit(url)
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or "." not in parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.port not in {None, 443}
-        ):
-            raise ValueError("Укажите обычную HTTPS-ссылку без логина и пароля.")
-        url = parsed._replace(fragment="").geturl()
-        site = parsed.hostname.removeprefix("www.")
-        origin = next(
-            (
-                key
-                for key, (_, href) in SOURCES.items()
-                if site == urlsplit(href).hostname.removeprefix("www.")
-            ),
-            "external",
-        )
-        identifier = source_vacancy_id(origin, parsed.path)
-        if not identifier:
-            identifier = "external:" + hashlib.sha256(url.encode()).hexdigest()[:32]
-        try:
-            identifier = vacancy_id(url)
-            origin, url = "hh", f"{HH}/vacancy/{identifier}"
-        except ValueError:
-            pass
-        details = dict.fromkeys(URL_FIELDS, "")
-        details.update(
-            title=title,
-            company=text(raw.get("company")) or site,
-            url=url,
-            description=description,
-            source=origin,
-            mini_filters={"region": "любой", "unknown_salary": True},
-        )
-        if self.db.add(identifier, details):
-            if not description:
-                self.db.transition(identifier, ("queued",), "deferred")
-        elif description:
-            self.db.add_vacancy_description(identifier, details)
-        if description and self.db.vacancy(identifier)["status"] == "queued":
+        row = save_job(self.db, raw)
+        if text(raw.get("description"), 5200) and row["status"] == "queued":
             self.db.set("processing", True)
             await self.scheduler.start(self.bot)
-        return {"job": self.saved(self.db.vacancy(identifier))}
+        return {"job": self.saved(row)}
 
     async def job_action(self, data):
         identifier, action = data.get("id"), data.get("action")

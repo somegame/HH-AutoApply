@@ -77,14 +77,15 @@ class Database:
     def settings(self, config):
         return config.defaults | self.get("settings", {})
 
-    def add(self, vacancy_id, details, review=False):
+    def add(self, vacancy_id, details, review=False, *, deferred=False):
+        status = "deferred" if deferred else "queued"
         with self.connection() as db:
             inserted = db.execute(
                 "INSERT OR IGNORE INTO vacancies(id,details,status,found_at) VALUES(?,?,?,?)",
-                (vacancy_id, json.dumps(details), "queued", int(time.time())),
+                (vacancy_id, json.dumps(details), status, int(time.time())),
             ).rowcount
             if inserted:
-                self.event(db, vacancy_id, "queued")
+                self.event(db, vacancy_id, status)
                 return True
             if review:
                 changed = db.execute(

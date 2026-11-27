@@ -393,6 +393,109 @@ def test_telegram_polling_owner_flow(config):
     assert not Database(config.data_dir).get("processing")
 
 
+def test_shared_hh_vacancy_reaches_ai_and_preserves_confirmed_status(config):
+    from telegram import Message
+
+    config = replace(config, login_public_url="https://bot.example.test")
+    db = Database(config.data_dir)
+    db.set_many({"resume": PROFESSIONAL, "groq_consent": True, "browser_auto_enabled": True})
+    requests = []
+    replies = []
+
+    def provider(request):
+        requests.append(request.url.path)
+        assert request.url.host == "api.groq.com"
+        assert b"hh.ru" not in request.content
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(RESULT)}}]})
+
+    async def reply(text, **options):
+        replies.append((text, options["reply_markup"]))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+            scheduler = Scheduler(config, db, client)
+            ui = TelegramUI(config, db, SimpleNamespace(start=scheduler.tick_analysis), client)
+            telegram = SimpleNamespace(send_message=reply_notice)
+
+            async def share(text, *, owner=config.owner, entities=()):
+                msg = Message.de_json(
+                    {
+                        "message_id": 1,
+                        "date": 1710000000,
+                        "text": text,
+                        "entities": list(entities),
+                        "chat": {"id": owner, "type": "private"},
+                        "from": {"id": owner, "is_bot": False, "first_name": "Пример"},
+                    },
+                    None,
+                )
+                update = SimpleNamespace(
+                    message=msg,
+                    effective_message=SimpleNamespace(reply_text=reply),
+                    effective_user=msg.from_user,
+                    effective_chat=msg.chat,
+                    callback_query=None,
+                    get_bot=lambda: telegram,
+                )
+                await ui.handle(update, None)
+                return update
+
+            url = "https://moscow.hh.ru/vacancy/01200?from=share"
+            await share(url, owner=98765)
+            assert not db.vacancy("1200")
+            await share("https://hh.ru.example.test/vacancy/1200")
+            await share("https://hh.ru:8080/vacancy/1200")
+            assert not db.vacancy("1200")
+            update = await share(url)
+            assert db.vacancy("1200")["status"] == "deferred"
+            assert not requests
+            keys = [key for row in replies[-1][1].inline_keyboard for key in row]
+            assert any(key.callback_data == "inbox:1200" for key in keys)
+            assert any(
+                key.web_app and key.web_app.url == "https://bot.example.test/mini?tab=jobs"
+                for key in keys
+            )
+            await ui.route(update, "inbox:1200")
+            await share("Текст слишком короткий")
+            assert not requests
+            await share(PROFESSIONAL)
+            draft = db.vacancy("1200")
+            assert draft["status"] == "draft"
+            assert draft["letter"] == RESULT["letter"]
+            details = json.loads(draft["details"])
+            assert details["url"] == "https://hh.ru/vacancy/1200"
+            assert details["source"] == "hh"
+            assert not details.get("auto_discovered")
+            db.transition("1200", ("draft",), "reported")
+            await share(url)
+            assert db.vacancy("1200")["status"] == "reported"
+            assert db.vacancy("1200")["letter"] == draft["letter"]
+
+            db.set("processing", False)
+            await share(
+                "Бухгалтер\n" + PROFESSIONAL,
+                entities=[
+                    {
+                        "type": "text_link",
+                        "offset": 0,
+                        "length": 9,
+                        "url": "https://hh.ru/vacancy/1300",
+                    }
+                ],
+            )
+            assert db.vacancy("1300")["status"] == "queued"
+            assert not db.get("processing")
+            assert json.loads(db.vacancy("1300")["details"])["description"] == PROFESSIONAL
+            await share(f"{PROFESSIONAL}\nhttps://hh.ru/vacancy/1400\nhttps://hh.ru/vacancy/1500")
+            assert all(db.vacancy(job)["status"] == "deferred" for job in ("1400", "1500"))
+
+    async def reply_notice(*args, **kwargs):
+        pass
+
+    asyncio.run(run())
+    assert requests == ["/openai/v1/chat/completions"]
+
+
 def test_pdf_text_layer():
     from pypdf import PdfWriter
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject

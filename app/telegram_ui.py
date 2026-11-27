@@ -4,16 +4,24 @@ import secrets
 import time
 from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, WebAppInfo
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    MessageEntity,
+    WebAppInfo,
+)
 from telegram.error import BadRequest
 
 from app.config import BOOLEANS, FIELDS, OPTIONAL, setting
 from app.database import ACTIVE, HISTORY, LABELS
 from app.diagnostics import report, resource_warning
+from app.job_sources import text as clean_field
 from app.resume import MAX_FILE, checked, read_upload
 from app.scheduler import local_day
 from app.services import ServiceError
 from app.vacancies import HH, TEMPLATE, parse_vacancy, search_links, terms, vacancy_id
+from app.vacancy_inbox import MIN_DESCRIPTION, can_add_description, save_job, shared_hh_jobs
 
 PREVIEW = LinkPreviewOptions(is_disabled=True)
 HH_RESUMES = HH + "/applicant/resumes"
@@ -54,6 +62,7 @@ COMMANDS = {
     "add": "Добавить выбранную вакансию",
 }
 PAGES = {"found": (), "drafts": ACTIVE, "history": HISTORY}
+SHARE_LIMIT = 8
 
 
 def allowed(update, owner):
@@ -346,6 +355,20 @@ class TelegramUI:
                 "со всем шаблоном, если оно длиннее лимита Telegram.",
             )
             await self.answer(update, TEMPLATE)
+        elif kind == "inbox":
+            row = self.db.vacancy(value)
+            if row and can_add_description(row, json.loads(row["details"])):
+                self.input = ("inbox", value)
+                await self.answer(
+                    update,
+                    "Скопируйте обязанности и требования из вакансии HH. "
+                    "Пришлите описание одним сообщением.",
+                    markup([[button("Отмена", f"v:{value}")]]),
+                )
+            elif row:
+                await self.card(update, value)
+            else:
+                await self.answer(update, "Карточка не найдена.", menu())
         elif kind in {
             "v",
             "approve",
@@ -362,10 +385,11 @@ class TelegramUI:
         }:
             await self.vacancy(update, kind, value, settings)
 
-    def mini_button(self):
+    def mini_button(self, *, journal=False):
+        path = "/mini?tab=jobs" if journal else "/mini"
         return InlineKeyboardButton(
-            "🔎 Открыть мини-приложение",
-            web_app=WebAppInfo(self.config.login_public_url + "/mini"),
+            "📨 Открыть журнал" if journal else "🔎 Открыть мини-приложение",
+            web_app=WebAppInfo(self.config.login_public_url + path),
         )
 
     @staticmethod
@@ -755,10 +779,32 @@ class TelegramUI:
         self.input = None
         await self.resume(update, "resume")
 
+    async def import_shared(self, update, jobs):
+        rows = [save_job(self.db, job) for job in jobs[:SHARE_LIMIT]]
+        if any(row["status"] == "queued" for row in rows) and self.db.get("processing", True):
+            await self.scheduler.start(update.get_bot())
+        if len(rows) == 1:
+            await self.card(update, rows[0]["id"])
+            return
+        controls = [[button(json.loads(row["details"])["title"], f"v:{row['id']}")] for row in rows]
+        if self.config.login_public_url:
+            controls.append([self.mini_button(journal=True)])
+        message = "Ссылки сохранены в журнале. Откройте карточку, чтобы добавить описание."
+        if len(jobs) > SHARE_LIMIT:
+            message += f" Сохранены первые {SHARE_LIMIT} ссылок. Остальные пришлите отдельно."
+        await self.answer(update, message, markup(controls))
+
     async def text(self, update, text=None):
+        if text is None and self.input is None:
+            message = update.message
+            links = [entity.url for entity in message.parse_entities([MessageEntity.TEXT_LINK])]
+            if jobs := shared_hh_jobs(message.text, links):
+                await self.import_shared(update, jobs)
+                return
         text = text if text is not None else update.message.text
         if (
-            (self.input is None or self.input[0] == "vacancy")
+            self.input
+            and self.input[0] == "vacancy"
             and text.startswith("https://")
             and "\n" not in text
         ):
@@ -780,6 +826,22 @@ class TelegramUI:
             await self.answer(update, "Выберите действие в меню.", menu())
             return
         action, value = self.input
+        if action == "inbox":
+            if len(clean_field(text, 5200)) < MIN_DESCRIPTION:
+                raise ValueError(
+                    f"Добавьте обязанности и требования. Нужно хотя бы {MIN_DESCRIPTION} символов."
+                )
+            row = self.db.vacancy(value)
+            self.input = None
+            if not row:
+                await self.answer(update, "Карточка не найдена.", menu())
+                return
+            details = json.loads(row["details"])
+            if can_add_description(row, details):
+                await self.import_shared(update, [details | {"description": text}])
+            else:
+                await self.card(update, value)
+            return
         if action == "resume":
             await self.save_resume(update, text)
             return
@@ -889,11 +951,14 @@ class TelegramUI:
         details = json.loads(row["details"])
         result = json.loads(row["result"] or "{}")
         status = row["status"]
+        needs_description = can_add_description(row, details)
         lines = [
             details["title"],
             f"{details['company']} · {details['region'] or 'регион не указан'}",
             details["salary"] or "Зарплата не указана",
-            LABELS[status],
+            "Ссылка сохранена. Для оценки и письма добавьте описание."
+            if needs_description
+            else LABELS[status],
         ]
         if "score" in result:
             provider = "Gemini" if result.get("analysis_provider") == "gemini" else "Groq"
@@ -914,6 +979,8 @@ class TelegramUI:
         if row["error"]:
             lines.append(row["error"])
         rows = [[link("Открыть на HH.ru", details["url"])]]
+        if needs_description:
+            rows.append([button("✍️ Добавить описание", f"inbox:{identifier}")])
         if status in {"draft", "deferred", "approved", "questions"} and row["letter"]:
             rows.append([button("Редактировать письмо", f"edit:{identifier}")])
         if status in {"draft", "deferred"} and row["letter"]:
@@ -940,5 +1007,7 @@ class TelegramUI:
             )
         if status == "error":
             rows.append([button("Повторить анализ", f"retry:{identifier}")])
+        if details.get("source") == "hh" and self.config.login_public_url:
+            rows.append([self.mini_button(journal=True)])
         rows.append([button("Очередь", "drafts"), button("Меню", "start")])
         await self.answer(update, "\n\n".join(lines), markup(rows))

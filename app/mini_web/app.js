@@ -150,7 +150,7 @@ function confirmAction(message) {
   return Promise.resolve(window.confirm(message));
 }
 
-function changeTab(tab) {
+function changeTab(tab, reload = true) {
   showError();
   showFeedback();
   selectedTab = tab;
@@ -162,7 +162,7 @@ function changeTab(tab) {
   }
   window.scrollTo(0, 0);
   if (tab === "search") renderSearch();
-  else return refresh().catch(error => showError(error.message));
+  else if (reload) return refresh().catch(error => showError(error.message));
 }
 
 function sourceName(key) {
@@ -1052,6 +1052,9 @@ function applyState(next, first = false) {
     }
     byId("launch").hidden = true;
     byId("navigation").hidden = byId("panel-search").hidden = false;
+    if (new URLSearchParams(window.location.search).get("tab") === "jobs") {
+      changeTab("jobs", false);
+    }
   }
   if (selectedTab === "jobs") renderJobs();
   if (selectedTab === "connections") renderConnections();
