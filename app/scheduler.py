@@ -8,7 +8,14 @@ from datetime import datetime
 from app.browser_workflow import BrowserWorkflow
 from app.diagnostics import resource_warning
 from app.hh_browser import HHLoginRequired
-from app.services import Groq, ServiceError, cache_key, prepared_input
+from app.services import (
+    AUTO_ANALYSIS_POLICY,
+    Groq,
+    ServiceError,
+    cache_key,
+    grounded_auto_letter,
+    prepared_input,
+)
 from app.vacancies import filter_reason
 
 log = logging.getLogger(__name__)
@@ -113,21 +120,37 @@ class Scheduler:
             return
         if result is None:
             return
+        if self.db.get("resume", "") != resume or not self.db.get("groq_consent", False):
+            return
         qualifies = result["score"] >= settings["score"] and bool(result["letter"].strip())
+        source = vacancy.get("source")
+        safe_letter = (
+            grounded_auto_letter(result, resume, vacancy, settings["score"])
+            if source == "browser"
+            else ""
+        )
+        if safe_letter:
+            result = result | {"letter": safe_letter}
         status = "draft" if qualifies else "filtered"
         if qualifies and (
-            settings["mode"] == "manual"
-            or (vacancy.get("source") == "browser" and self.db.get("browser_auto_enabled"))
+            settings["mode"] == "manual" or (safe_letter and self.db.get("browser_auto_enabled"))
         ):
             status = "approved"
-        if vacancy.get("source") in {"browser", "mini_hh"}:
+        if source in {"browser", "mini_hh"}:
             result = result | {"resume_hash": hashlib.sha256(resume.encode()).hexdigest()}
+        if source == "browser":
+            result = result | {"analysis_policy": AUTO_ANALYSIS_POLICY}
+            if safe_letter:
+                result["auto_policy"] = AUTO_ANALYSIS_POLICY
         self.db.finish_analysis(row["id"], status, result, result["letter"] if qualifies else None)
         from app.telegram_ui import button, markup
 
+        summary = "Письмо готово." if qualifies else "Вакансия не прошла условия."
+        if safe_letter and self.db.get("browser_auto_enabled"):
+            summary = "Письмо готово. Отклик в очереди."
         await bot.send_message(
             self.config.owner,
-            f"{vacancy['title']} · {result['score']}%. Анализ завершён.",
+            f"{vacancy['title']} · {result['score']}%. {summary}",
             reply_markup=markup([[button("Открыть карточку", f"v:{row['id']}")]]),
         )
 

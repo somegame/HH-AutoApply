@@ -103,6 +103,21 @@
     </header>
     <iframe id="hh-frame" title="Защищённое окно входа HH" referrerpolicy="no-referrer"></iframe>
   </dialog>
+  <dialog id="hh-resume-url-dialog" aria-labelledby="hh-resume-url-title">
+    <header class="dialog-head">
+      <h2 id="hh-resume-url-title">Резюме по ссылке</h2>
+      <button class="secondary" id="close-hh-resume-url" type="button">Закрыть</button>
+    </header>
+    <form id="hh-resume-url-form" class="dialog-form" autocomplete="off">
+      <label for="hh-resume-url">Ссылка на ваше резюме в HH</label>
+      <input id="hh-resume-url" name="url" type="url" required maxlength="1500" autofocus
+        autocapitalize="off" spellcheck="false" placeholder="https://hh.ru/resume/…"
+        aria-describedby="hh-resume-url-help">
+      <p id="hh-resume-url-help" class="muted">Скопируйте адрес карточки своего резюме из личного кабинета HH.</p>
+      <p id="hh-resume-url-error" class="form-error" role="alert" hidden></p>
+      <button class="primary" id="save-hh-resume-url" type="submit">Использовать резюме</button>
+    </form>
+  </dialog>
   <dialog id="job-dialog" aria-labelledby="job-dialog-title">
     <header class="dialog-head">
       <h2 id="job-dialog-title">Вакансия</h2>

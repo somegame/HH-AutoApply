@@ -228,7 +228,7 @@ def test_verified_hh_account_can_search_and_refresh_resumes_in_mini_app(mini_con
     async def run():
         config = replace(mini_config, browser_engine="chromium", groq_key="")
         db = Database(config.data_dir)
-        resumes = {"123456789abc": "Финансовый менеджер"}
+        resumes = {"123456789abc": "Финансовый менеджер", "abcdef012345": "Финансовый аналитик"}
         unavailable = hh_browser.HHResumeUnavailable("HH пока не показал список резюме.")
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(source_response)) as sources:

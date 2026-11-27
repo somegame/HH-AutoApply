@@ -4,11 +4,16 @@ const tg = window.Telegram?.WebApp;
 const auth = tg?.initData || "";
 const byId = id => document.getElementById(id);
 const notices = byId("notices");
+const hhDialog = byId("hh-dialog");
+const hhFrame = byId("hh-frame");
+const hhResumeUrlDialog = byId("hh-resume-url-dialog");
+const hhResumeUrlField = byId("hh-resume-url");
+const hhResumeBoundMessage = "Резюме HH загружено и привязано к профилю.";
 let state;
 let selectedTab = "search";
 let selectedFilter = "all";
 let pendingSuperjob = "";
-let hhLoginUrl = "";
+let hhWindow;
 let loadingHHResumes = false;
 let profileDirty = false;
 let searches = [];
@@ -237,34 +242,106 @@ function resumePicker(label, resumes, active, use) {
   return group;
 }
 
-function showHHLogin() {
-  byId("hh-frame").src = hhLoginUrl;
-  byId("hh-dialog").showModal();
+function hhDialogButton(id, label, dialog, open, primary = false) {
+  const button = action(label, open, primary);
+  button.id = id;
+  button.setAttribute("aria-haspopup", "dialog");
+  button.setAttribute("aria-controls", dialog.id);
+  return button;
 }
 
-async function openHH(fresh = false) {
-  hhLoginUrl = (await api("connect", { fresh })).url;
-  showHHLogin();
+function showHHWindow() {
+  const selecting = hhWindow.mode === "resume";
+  hhDialog.dataset.mode = hhWindow.mode;
+  byId("hh-dialog-title").textContent = selecting ? "Выбор резюме в HH" : "Подключение HH";
+  hhFrame.title = selecting ? "Защищённое окно выбора резюме HH" : "Защищённое окно входа HH";
+  hhFrame.src = hhWindow.url;
+  hhDialog.showModal();
+}
+
+async function openHHWindow(mode, fresh = false) {
+  const { url } = mode === "resume" ? await api("hh-browser", {}) : await api("connect", { fresh });
+  hhWindow = { url, mode };
+  showHHWindow();
   await refresh();
+}
+
+function showHHResumeUrlError(message = "") {
+  const error = byId("hh-resume-url-error");
+  error.textContent = message;
+  error.hidden = !message;
+  if (message) {
+    hhResumeUrlField.setAttribute("aria-invalid", "true");
+    hhResumeUrlField.setAttribute("aria-describedby", "hh-resume-url-help hh-resume-url-error");
+  } else {
+    hhResumeUrlField.removeAttribute("aria-invalid");
+    hhResumeUrlField.setAttribute("aria-describedby", "hh-resume-url-help");
+  }
+}
+
+function openHHResumeUrl() {
+  if (byId("save-hh-resume-url").disabled) return;
+  hhResumeUrlField.value = state.hh_resume_url || "";
+  showHHResumeUrlError();
+  hhResumeUrlDialog.showModal();
+  if (hhResumeUrlField.value) hhResumeUrlField.select();
+}
+
+function showHHResumeBound(next) {
+  profileDirty = false;
+  applyState(next);
+  showFeedback(hhResumeBoundMessage);
 }
 
 async function loadHHResumes() {
   if (loadingHHResumes) return;
+  const previous = state;
   loadingHHResumes = true;
   showFeedback("Загружаю резюме из HH…");
+  let next;
   try {
-    await api("hh-resumes", {});
+    next = await api("hh-resumes", {});
+  } catch (error) {
+    showFeedback();
+    throw error;
   } finally {
     loadingHHResumes = false;
-    showFeedback();
-    await refresh().catch(() => {});
+  }
+  if (next.hh_resume_id && (next.hh_resume_id !== previous.hh_resume_id || next.resume !== previous.resume)) {
+    showHHResumeBound(next);
+    return;
+  }
+  applyState(next);
+  showFeedback(Object.keys(next.resumes).length ? "Список резюме HH обновлён." :
+    "Откройте своё резюме в HH или вставьте ссылку на него.");
+}
+
+function renderHHAuto(card, operations) {
+  if (state.hh_auto || !state.hh_resume || !state.resume) return;
+  if (!state.consent) {
+    card.append(el("p", "Чтобы включить автоотклики, сохраните согласие на анализ опыта в профиле.", "muted"));
+    operations.append(action("Настроить письма", () => byId("consent").focus()));
+  } else if (!state.groq) {
+    card.append(el("p", "Для автооткликов нужно настроить ключ Groq.", "muted"));
+  } else if (!state.persistent) {
+    card.append(el("p", "Для автооткликов нужно постоянное хранилище Bothost.", "muted"));
+  } else if (!state.hh_auto_allowed) {
+    card.append(el("p", "Для автооткликов нужно включить AUTO_SEND в настройках бота.", "muted"));
+  } else {
+    operations.append(action("Включить автоотклики", async () => {
+      const message = "Разрешить отправлять резюме и письма работодателям HH? Лимит на день: " + state.daily_limit;
+      if (await confirmAction(message)) {
+        applyState(await api("hh-mode", { mode: "auto", confirm: true }));
+        showFeedback("Автоотклики HH включены.");
+      }
+    }));
   }
 }
 
 function renderHH(card, operations) {
   const connected = state.hh_connected;
   const hasResume = connected && state.hh_resume;
-  if (hasResume) card.append(el("p", state.hh_resume, "resume-name"));
+  if (hasResume) card.append(el("p", "Резюме для откликов: " + state.hh_resume, "resume-name"));
   if (connected && !hasResume) {
     card.append(el("p", state.hh_resumes_status || "Можно искать вакансии. Для откликов выберите резюме HH.", "muted"));
   } else if (connected && state.hh_resumes_status) {
@@ -279,17 +356,21 @@ function renderHH(card, operations) {
     card.append(el("p", state.hh_notice, "muted"));
   }
   if (state.hh_login_open) {
-    if (!byId("hh-dialog").open) {
-      if (hhLoginUrl) operations.append(action("Продолжить вход", showHHLogin, true));
-      operations.append(action("Отменить вход", async () => {
+    if (!hhDialog.open) {
+      if (hhWindow) operations.append(hhDialogButton("hh-continue",
+        hhWindow.mode === "resume" ? "Продолжить выбор резюме" : "Продолжить вход", hhDialog, showHHWindow, true));
+      const cancel = action(hhWindow?.mode === "login" ? "Отменить вход" : "Закрыть окно HH", async () => {
         await api("cancel", {});
-        hhLoginUrl = "";
+        hhWindow = undefined;
         await refresh();
-      }));
+      });
+      cancel.id = "hh-cancel";
+      operations.append(cancel);
     }
     return;
   }
-  if (!connected) operations.append(action("Подключить HH", () => openHH(), true));
+  if (!connected) operations.append(hhDialogButton("hh-connect", "Подключить HH", hhDialog,
+    () => openHHWindow("login"), true));
   if (connected && !state.hh_running) {
     operations.append(action("Включить фоновый поиск", async () => {
       await api("hh-mode", { mode: "search" });
@@ -298,38 +379,31 @@ function renderHH(card, operations) {
     }, true));
   }
   if (connected) {
-    const resumeButton = action(hasResume ? "Обновить резюме" : "Загрузить резюме", loadHHResumes);
+    operations.append(
+      hhDialogButton("hh-find-resume", "Найти резюме в HH", hhDialog, () => openHHWindow("resume")),
+      hhDialogButton("hh-resume-url-open", "Вставить ссылку на своё резюме", hhResumeUrlDialog, openHHResumeUrl)
+    );
+    const resumeButton = action("Загрузить список резюме", loadHHResumes);
     resumeButton.disabled = loadingHHResumes;
     operations.append(resumeButton);
   }
   if (connected || state.hh_has_session) {
-    operations.append(action("Сменить аккаунт", () => openHH(true)));
+    operations.append(hhDialogButton("hh-switch", "Сменить аккаунт", hhDialog,
+      () => openHHWindow("login", true)));
     operations.append(action("Отключить", async () => {
       if (await confirmAction("Закрыть сохранённую сессию HH?")) {
         await api("disconnect", { confirm: true });
-        hhLoginUrl = "";
+        hhWindow = undefined;
         await refresh();
       }
     }));
   }
   if (connected && Object.keys(state.resumes).length && (!hasResume || Object.keys(state.resumes).length > 1)) {
     card.append(resumePicker("Выберите резюме HH", state.resumes, state.hh_resume_id, async id => {
-      await api("resume", { id });
-      profileDirty = false;
-      await refresh();
+      showHHResumeBound(await api("resume", { id }));
     }));
   }
-  if (hasResume && state.consent && state.groq) {
-    if (state.hh_auto_allowed && !state.hh_auto) operations.append(action("Включить автоотклики", async () => {
-      const message = "Разрешить отправлять резюме и письма работодателям HH? Лимит на день: " + state.daily_limit;
-      if (await confirmAction(message)) {
-        await api("hh-mode", { mode: "auto", confirm: true });
-        await refresh();
-      }
-    }));
-  } else if (hasResume && !state.consent) {
-    operations.append(action("Настроить письма", () => byId("profile-form").scrollIntoView({ block: "start" })));
-  }
+  if (connected) renderHHAuto(card, operations);
   if (state.hh_running) operations.append(action("Остановить поиск", async () => {
     await api("hh-mode", { mode: "stop" });
     await refresh();
@@ -388,7 +462,7 @@ function renderConnections() {
   byId("profile-info").textContent = [
     state.hh_connected && state.hh_resume ? "Резюме HH уже в профиле." :
       state.resume ? "Резюме сохранено." :
-      state.hh_connected ? "Загрузите резюме HH для подготовки писем." : "Подключите HH, чтобы загрузить резюме из аккаунта.",
+      state.hh_connected ? "Выберите резюме HH для подготовки писем." : "Подключите HH, чтобы загрузить резюме из аккаунта.",
     !state.groq ? "Для писем нужно настроить Groq." : "",
     !state.persistent ? "Для отправки подключите постоянное хранилище Bothost." : "",
   ].filter(Boolean).join(" ");
@@ -398,11 +472,9 @@ function renderConnections() {
   }
 }
 
-async function refresh(first = false, unchanged = false) {
-  const next = await api("state");
-  if (unchanged && JSON.stringify(state) === JSON.stringify(next)) return;
+function applyState(next, first = false) {
   state = next;
-  if (!state.hh_login_open && !byId("hh-dialog").open) hhLoginUrl = "";
+  if (!state.hh_login_open && !hhDialog.open) hhWindow = undefined;
   const version = byId("app-version");
   version.hidden = !state.version;
   version.textContent = state.version ? "Версия " + state.version : "";
@@ -414,6 +486,12 @@ async function refresh(first = false, unchanged = false) {
   }
   if (selectedTab === "jobs") renderJobs();
   if (selectedTab === "connections") renderConnections();
+}
+
+async function refresh(first = false, unchanged = false) {
+  const next = await api("state");
+  if (unchanged && JSON.stringify(state) === JSON.stringify(next)) return;
+  applyState(next, first);
 }
 
 byId("search-form").addEventListener("submit", async event => {
@@ -492,6 +570,29 @@ byId("profile-form").addEventListener("submit", async event => {
   }
 });
 
+byId("hh-resume-url-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = byId("save-hh-resume-url");
+  if (button.disabled) return;
+  showHHResumeUrlError();
+  button.disabled = true;
+  button.textContent = "Проверяю резюме…";
+  hhResumeUrlField.readOnly = true;
+  try {
+    const next = await api("hh-resumes", { url: hhResumeUrlField.value.trim() });
+    if (hhResumeUrlDialog.open) hhResumeUrlDialog.close();
+    showHHResumeBound(next);
+  } catch (error) {
+    if (hhResumeUrlDialog.open) showHHResumeUrlError(error.message);
+    else showError(error.message);
+  } finally {
+    hhResumeUrlField.readOnly = false;
+    button.disabled = false;
+    button.textContent = "Использовать резюме";
+  }
+});
+hhResumeUrlField.addEventListener("input", () => showHHResumeUrlError());
+
 for (const button of document.querySelectorAll("#navigation button")) {
   button.addEventListener("click", () => changeTab(button.dataset.tab));
 }
@@ -507,27 +608,36 @@ for (const button of document.querySelectorAll("#jobs-filters button")) {
 byId("reload").addEventListener("click", () => {
   if (auth) refresh(!state).catch(error => showError(error.message));
 });
-const hhDialog = byId("hh-dialog");
-const hhFrame = byId("hh-frame");
 byId("close-hh").addEventListener("click", () => hhDialog.close());
+byId("close-hh-resume-url").addEventListener("click", () => hhResumeUrlDialog.close());
 byId("close-job").addEventListener("click", () => byId("job-dialog").close());
+hhResumeUrlDialog.addEventListener("close", () => byId("hh-resume-url-open")?.focus());
 hhDialog.addEventListener("close", async () => {
+  const selecting = hhDialog.dataset.mode === "resume";
   hhFrame.removeAttribute("src");
   try {
     await refresh();
   } catch (error) {
     showError(error.message);
   }
+  const target = byId("hh-continue") || byId("hh-cancel") ||
+    (selecting ? byId("hh-find-resume") : byId("hh-connect") || byId("hh-switch"));
+  target?.focus();
 });
 window.addEventListener("message", event => {
-  if (event.origin !== location.origin || event.source !== hhFrame.contentWindow) return;
+  if (event.origin !== location.origin || event.source !== hhFrame.contentWindow || !hhDialog.open) return;
+  const selecting = hhDialog.dataset.mode === "resume";
   if (event.data?.hhLogin === "done") {
-    hhLoginUrl = "";
+    hhWindow = undefined;
+    if (selecting) profileDirty = false;
     hhDialog.close();
-    showFeedback("Вход в HH подтверждён. Сессия сохранена.");
+    showFeedback(selecting ? hhResumeBoundMessage : "Вход в HH подтверждён. Сессия сохранена.");
   } else if (["blocked", "failed", "expired"].includes(event.data?.hhLogin)) {
-    hhLoginUrl = "";
-    refresh(false, true).catch(() => {});
+    hhWindow = undefined;
+    hhDialog.close();
+    showError(event.data.hhLogin === "expired" ? "Срок ссылки HH истёк. Откройте окно заново." :
+      selecting ? "Загрузка резюме HH не завершилась. Проверьте статус аккаунта." :
+        "Вход в HH не завершился. Проверьте статус аккаунта.");
   }
 });
 document.addEventListener("visibilitychange", () => {

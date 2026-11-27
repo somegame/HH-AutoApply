@@ -81,7 +81,7 @@ class MiniApp:
                 web.get("/mini/oauth/superjob", self.superjob_callback),
                 web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
-                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|hh-mode|hh-resumes|superjob}",
+                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|hh-mode|hh-resumes|hh-browser|superjob}",
                     self.api,
                 ),
             ]
@@ -155,8 +155,13 @@ class MiniApp:
             if command == "hh-mode":
                 return self.json(await self.change_hh_mode(data))
             if command == "hh-resumes":
-                await self.browser.refresh_resumes()
+                if "url" in data:
+                    await self.browser.refresh_resumes(data["url"])
+                else:
+                    await self.browser.refresh_resumes()
                 return self.json(self.state())
+            if command == "hh-browser":
+                return self.json({"url": await self.connect_hh(resume_mode=True)})
             if command == "superjob":
                 action = data.get("action")
                 if action == "connect":
@@ -227,6 +232,7 @@ class MiniApp:
             "resumes": self.db.get("hh_resume_choices", {}),
             "hh_resume": hh_resume.get("name", ""),
             "hh_resume_id": hh_resume.get("id", ""),
+            "hh_resume_url": f"{HH}/resume/{hh_resume['id']}" if hh_resume.get("id") else "",
             "hh_has_session": self.browser.provider.state.is_file() and not hh_needs_login,
             "hh_connected": self.browser.account_connected,
             "hh_resumes_status": self.db.get("hh_resumes_status", ""),
@@ -299,7 +305,7 @@ class MiniApp:
             "label": LABELS[row["status"]],
             "letter": row["letter"] or "",
             "score": result.get("score"),
-            "reason": result.get("reason") or row["error"] or "",
+            "reason": row["error"] or result.get("reason") or "",
             "can_edit": row["status"] in EDITABLE and bool(row["letter"]),
             "can_send": site in {"browser", "mini_hh", "superjob"}
             and row["status"] in {"draft", "approved"}
@@ -396,13 +402,16 @@ class MiniApp:
         self.db.set_many(values)
         return self.state()
 
-    async def connect_hh(self, *, fresh=False):
+    async def connect_hh(self, *, fresh=False, resume_mode=False):
         if not self.browser.available:
             raise ServiceError("На сервере не включён Chromium. Можно открыть HH на телефоне.")
 
         async def notify(result):
             if isinstance(result, ServiceError):
-                self.db.set("mini_hh_progress", str(result))
+                if resume_mode:
+                    self.db.set("hh_resumes_status", str(result))
+                else:
+                    self.db.set("mini_hh_progress", str(result))
             else:
                 selected = self.db.get("hh_selected_resume", {})
                 self.db.set(
@@ -414,8 +423,11 @@ class MiniApp:
                     else "Вход подтверждён. Выберите резюме.",
                 )
 
-        url = await self.browser.start_login(notify, in_mini=True, fresh=fresh)
-        self.db.set("mini_hh_progress", "Окно входа открыто.")
+        url = await self.browser.start_login(
+            notify, in_mini=True, fresh=fresh, resume_mode=resume_mode
+        )
+        if not resume_mode:
+            self.db.set("mini_hh_progress", "Окно входа открыто.")
         return url
 
     async def change_hh_mode(self, data):
