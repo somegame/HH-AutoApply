@@ -1,11 +1,14 @@
 import asyncio
+import json
 import re
 from contextlib import suppress
+from datetime import datetime
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from playwright.async_api import TimeoutError as BrowserTimeout
 
-from app.services import ServiceError
+from app.commute import point
+from app.services import ServiceError, clean_text
 from app.vacancies import HH, URL_FIELDS, vacancy_id
 
 DESCRIPTION = '[data-qa="vacancy-description"]'
@@ -270,6 +273,119 @@ async def visible_text(page, selector, limit=180):
     return (await node.inner_text()).strip()[:limit]
 
 
+def publication_date(value):
+    if not isinstance(value, str):
+        return ""
+    try:
+        return datetime.fromisoformat(value.strip()).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def office_address(value, *, with_point=False):
+    if not isinstance(value, str):
+        return ""
+    address = " ".join(clean_text(value[:280]).split())[:240]
+    if "[скрыто]" in address or not any(char.isalpha() for char in address):
+        return ""
+    if not with_point and not re.search(
+        r"(?<![\w-])\d{1,5}(?:[а-яa-z]\d{0,4}|[/-]\d{1,5})?(?=$|[\s,;.)])",
+        address,
+        flags=re.I,
+    ):
+        return ""
+    return address
+
+
+def office_location(lat, lon, address):
+    coords = point({"lat": lat, "lon": lon})
+    if coords and (coords["lat"] or coords["lon"]):
+        return coords | {"address": address}
+    return None
+
+
+def posting_metadata(payloads):
+    for raw in payloads:
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        graph = decoded.get("@graph") if isinstance(decoded, dict) else None
+        candidates = graph if isinstance(graph, list) else decoded
+        if not isinstance(candidates, list):
+            candidates = [candidates]
+        for item in candidates[:12]:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("@type")
+            if kind == "JobPosting" or isinstance(kind, list) and "JobPosting" in kind:
+                return item
+    return {}
+
+
+async def office_metadata(page, identifier):
+    scripts = await page.locator('script[type="application/ld+json"]').evaluate_all(
+        "(nodes) => nodes.slice(0, 8).map(node => node.textContent.slice(0, 120000))"
+    )
+    posting = posting_metadata(scripts)
+    published = publication_date(posting.get("datePosted"))
+    if not published:
+        dates = page.get_by_text(re.compile(r"^Вакансия опубликована")).locator("time[datetime]")
+        if await dates.count() == 1:
+            published = publication_date(await dates.first.get_attribute("datetime"))
+
+    places = posting.get("jobLocation")
+    if isinstance(places, list):
+        if len(places) > 1:
+            return {"published": published, "address": "", "location": None}
+        places = places[0] if places else None
+    place = places if isinstance(places, dict) else {}
+    postal = place.get("address")
+    address = ""
+    if isinstance(postal, dict):
+        street = office_address(postal.get("streetAddress"))
+        if street:
+            city = postal.get("addressLocality")
+            address = office_address(f"{city}, {street}") if isinstance(city, str) else street
+    if not address:
+        address = office_address(
+            await visible_text(page, '[data-qa="vacancy-view-raw-address"]', 240)
+        )
+
+    geo = place.get("geo")
+    location = (
+        office_location(geo.get("latitude"), geo.get("longitude"), address)
+        if isinstance(geo, dict)
+        else None
+    )
+    if not location:
+        marker = await page.locator("template#HH-Lux-InitialState").evaluate_all(
+            """(nodes, id) => {
+                const text = nodes[0]?.content?.textContent;
+                if (!text || text.length > 750000) return null;
+                try {
+                    const vacancy = JSON.parse(text).vacancyView?.vacancyFull?.vacancy;
+                    if (String(vacancy?.vacancyId) !== id) return null;
+                    const office = vacancy.address;
+                    return office?.marker ? {
+                        lat: office.marker.lat,
+                        lon: office.marker.lng,
+                        address: office.displayName,
+                    } : null;
+                } catch {
+                    return null;
+                }
+            }""",
+            identifier,
+        )
+        if marker:
+            pin_address = office_address(marker.get("address"), with_point=True) or address
+            location = office_location(marker.get("lat"), marker.get("lon"), pin_address)
+            if location:
+                address = pin_address
+    return {"published": published, "address": address, "location": location}
+
+
 async def search_ids(page, url):
     await open_page(page, url)
     links = page.locator('a[data-qa="serp-item__title"]')
@@ -326,6 +442,7 @@ async def read_vacancy(page, identifier):
         if not amount:
             return None
         values.update(amount)
+    values.update(await office_metadata(page, identifier))
     return values
 
 

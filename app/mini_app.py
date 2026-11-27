@@ -11,13 +11,15 @@ from aiohttp import web
 
 from app.config import VERSION, setting
 from app.database import LABELS
+from app.discovery import VacancyDiscovery, commute_limit, preferred_format
 from app.hh_browser import HHLoginRequired
 from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, source_vacancy_id, text
+from app.ranking import ORDERS, duplicate_key, mark_top, sort_ranked
 from app.resume import checked
 from app.scheduler import local_day
 from app.services import ServiceError
 from app.superjob import SuperJob
-from app.vacancies import HH, URL_FIELDS, vacancy_id
+from app.vacancies import HH, URL_FIELDS, terms, vacancy_id
 
 STATIC = Path(__file__).with_name("mini_web")
 MAX_AGE = 3600
@@ -28,7 +30,8 @@ HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": (
         "default-src 'none'; script-src 'self' https://telegram.org; "
-        "style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; "
+        "style-src 'self'; img-src 'self' data: https://tile.openstreetmap.org; "
+        "connect-src 'self'; frame-src 'self'; "
         "frame-ancestors 'self' https://web.telegram.org; base-uri 'none'; form-action 'none'"
     ),
 }
@@ -68,6 +71,7 @@ class MiniApp:
         self.browser = scheduler.browser
         self.sources = JobSources(config, self.browser, client)
         self.superjob = SuperJob(config, db, client)
+        self.discovery = VacancyDiscovery(config, db, client)
         self.bot = bot
         self.search_lock = asyncio.Lock()
         self.catalog = OrderedDict()
@@ -76,12 +80,13 @@ class MiniApp:
         app.add_routes(
             [
                 web.get("/mini", self.asset),
-                web.get("/mini/{asset:app\\.js|app\\.css}", self.asset),
+                web.get("/mini/{asset:(?:app|discovery|leaflet)\\.(?:js|css)}", self.asset),
                 web.get("/mini/api/{command:state|search|vacancy}", self.api),
                 web.get("/mini/oauth/superjob", self.superjob_callback),
                 web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
-                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|hh-mode|hh-resumes|hh-browser|superjob}",
+                    "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|"
+                    "hh-mode|hh-resumes|hh-browser|superjob|preferences|locate|route}",
                     self.api,
                 ),
             ]
@@ -89,15 +94,17 @@ class MiniApp:
 
     async def asset(self, request):
         file = request.match_info.get("asset", "index.html")
-        mime = {
-            "index.html": "text/html",
-            "app.js": "application/javascript",
-            "app.css": "text/css",
-        }
+        mime = {".html": "text/html", ".js": "application/javascript", ".css": "text/css"}
+        path = STATIC / file
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        headers = HEADERS
+        if file == "index.html":
+            headers = HEADERS | {"Referrer-Policy": "strict-origin-when-cross-origin"}
         return web.Response(
-            text=(STATIC / file).read_text(encoding="utf-8"),
-            content_type=mime[file],
-            headers=HEADERS,
+            text=path.read_text(encoding="utf-8"),
+            content_type=mime[path.suffix],
+            headers=headers,
         )
 
     def json(self, payload, status=200):
@@ -150,6 +157,22 @@ class MiniApp:
                 return self.json(await self.job_action(data))
             if command == "profile":
                 return self.json(self.save_profile(data))
+            if command == "preferences":
+                return self.json({"preferences": self.discovery.configure(data)})
+            if command == "locate":
+                point = await self.discovery.locate(data.get("address"))
+                if not point:
+                    raise ServiceError(
+                        "Карты не нашли адрес. Проверьте запрос или введите координаты."
+                    )
+                return self.json({"point": point})
+            if command == "route":
+                identifier = data.get("id")
+                job, analysis = self.vacancy_record(identifier)
+                opts = self.comparison_options(identifier)
+                return self.json(
+                    await self.discovery.refine(job, opts, self.db.get("resume", ""), analysis)
+                )
             if command == "import":
                 return self.json(await self.import_job(data))
             if command == "hh-mode":
@@ -221,12 +244,19 @@ class MiniApp:
         hh_resume = self.db.get("hh_selected_resume", {})
         hh_needs_login = self.db.get("hh_needs_login", False)
         hh_login_open = bool(self.browser.login_task and not self.browser.login_task.done())
+        options = self.discovery.preferences()
+        resume = self.db.get("resume", "")
+        jobs = [
+            self.saved(row, prefs | options, resume) for row in self.db.page((), 0, size=60)[:60]
+        ]
+        mark_top(jobs)
         return {
             "version": VERSION,
-            "defaults": {key: prefs[key] for key in ("query", "region", "salary")},
+            "preferences": options,
+            "defaults": {key: prefs[key] for key in ("query", "region", "salary", "use_related")},
             "sources": self.directory(prefs),
-            "jobs": [self.saved(row) for row in self.db.page((), 0, size=60)[:60]],
-            "resume": self.db.get("resume", ""),
+            "jobs": jobs,
+            "resume": resume,
             "consent": self.db.get("groq_consent", False),
             "groq": bool(self.config.groq_key),
             "resumes": self.db.get("hh_resume_choices", {}),
@@ -289,10 +319,14 @@ class MiniApp:
             for key, info in SOURCES.items()
         ]
 
-    def saved(self, row):
+    def saved(self, row, opts=None, resume=None):
         job = json.loads(row["details"])
         result = json.loads(row["result"] or "{}")
         site = job.get("source")
+        if opts is None:
+            opts = self.db.settings(self.config) | self.discovery.preferences()
+        if resume is None:
+            resume = self.db.get("resume", "")
         return {
             "id": row["id"],
             "title": job["title"],
@@ -310,20 +344,39 @@ class MiniApp:
             "can_send": site in {"browser", "mini_hh", "superjob"}
             and row["status"] in {"draft", "approved"}
             and bool(row["letter"]),
+            **self.discovery.enriched(job, opts, resume, result),
         }
 
-    def vacancy_details(self, identifier):
-        if not 1 <= len(identifier) <= 55:
+    def vacancy_record(self, identifier):
+        if not isinstance(identifier, str) or not 1 <= len(identifier) <= 55:
             raise ValueError("Выберите вакансию.")
         row = self.db.vacancy(identifier)
         entry = self.catalog.get(identifier)
+        live = entry[1] if entry and time.monotonic() - entry[0] <= 1800 else None
         if row:
             detail = json.loads(row["details"])
-        elif entry and time.monotonic() - entry[0] <= 1800:
-            detail = entry[1]
-        else:
-            raise ServiceError("Вакансия устарела. Обновите поиск.")
-        return {
+            if live:
+                detail |= {
+                    key: live[key]
+                    for key in ("location", "address", "format", "published")
+                    if live.get(key)
+                }
+            return detail, json.loads(row["result"] or "{}")
+        if live:
+            return live, None
+        raise ServiceError("Вакансия устарела. Обновите поиск.")
+
+    def comparison_options(self, identifier):
+        prefs = self.db.settings(self.config) | self.discovery.preferences()
+        entry = self.catalog.get(identifier)
+        if entry and time.monotonic() - entry[0] <= 1800:
+            prefs |= entry[3]
+        return prefs
+
+    def vacancy_details(self, identifier):
+        detail, analysis = self.vacancy_record(identifier)
+        opts = self.comparison_options(identifier)
+        fields = {
             key: detail.get(key, "")
             for key in (
                 "title",
@@ -335,6 +388,7 @@ class MiniApp:
                 "format",
             )
         }
+        return fields | self.discovery.enriched(detail, opts, self.db.get("resume", ""), analysis)
 
     async def search(self, query):
         prefs = self.db.settings(self.config)
@@ -345,6 +399,27 @@ class MiniApp:
         criteria["unknown_salary"] = criteria["salary"] == 0 or prefs["unknown_salary"]
         prefs |= criteria
         prefs["hh_title_only"] = query.get("hh_title_only", "true") == "true"
+        variants = [prefs["query"]]
+        seen_queries = {prefs["query"].casefold()}
+        if query.get("include_related", str(prefs["use_related"]).lower()) == "true":
+            for candidate in terms(prefs["related"]):
+                if candidate.casefold() not in seen_queries:
+                    variants.append(candidate)
+                    seen_queries.add(candidate.casefold())
+                if len(variants) == 3:
+                    break
+        prefs["search_queries"] = variants
+        options = prefs | self.discovery.preferences()
+        overrides = {"salary": criteria["salary"]}
+        if "preferred_format" in query:
+            overrides["preferred_format"] = preferred_format(query["preferred_format"])
+        if "max_commute" in query:
+            overrides["max_commute"] = commute_limit(query["max_commute"])
+        options |= overrides
+        order = query.get("sort", "best")
+        if order not in ORDERS:
+            raise ValueError("Выберите сортировку.")
+        include_unknown = query.get("include_unknown_commute", "true") == "true"
         source = query.get("source", "all")
         if source != "all" and source not in SOURCES:
             raise ValueError("Неизвестный источник.")
@@ -356,10 +431,12 @@ class MiniApp:
             keys = tuple(key for key in keys if key in applicable)
         async with self.search_lock:
             results = await asyncio.gather(
-                *(self.sources.search(prefs, key) for key in keys), return_exceptions=True
+                *(self.search_source(prefs, key) for key in keys), return_exceptions=True
             )
         jobs = []
         notices = []
+        seen = set()
+        resume = self.db.get("resume", "")
         for key, result in zip(keys, results, strict=True):
             if isinstance(result, BaseException):
                 message = (
@@ -370,23 +447,71 @@ class MiniApp:
                 notices.append({"source": key, "message": message})
                 continue
             for identifier, data in result:
-                self.catalog[identifier] = (time.monotonic(), data, criteria)
+                self.catalog[identifier] = (time.monotonic(), data, criteria, overrides)
                 self.catalog.move_to_end(identifier)
-                jobs.append(
-                    {
+                if identifier in seen:
+                    continue
+                seen.add(identifier)
+                row = self.db.vacancy(identifier)
+                analysis = json.loads(row["result"] or "{}") if row else None
+                meta = self.discovery.enriched(data, options, resume, analysis)
+                travel = meta["commute"]
+                limit = options["max_commute"]
+                if limit and (
+                    (not travel and not include_unknown)
+                    or (travel and travel["max_minutes"] > limit)
+                ):
+                    continue
+                job = (
+                    data
+                    | meta
+                    | {
                         "id": identifier,
-                        "title": data["title"],
-                        "company": data["company"],
-                        "region": data["region"],
-                        "salary": data["salary"],
-                        "url": data["url"],
                         "source": key,
-                        "saved": self.db.vacancy(identifier) is not None,
+                        "saved": row is not None,
+                        "status": row["status"] if row else None,
                     }
                 )
+                jobs.append(job)
         while len(self.catalog) > 150:
             self.catalog.popitem(last=False)
-        return {"jobs": jobs, "notices": notices, "sources": self.directory(prefs)}
+        unique = []
+        duplicate_keys = set()
+        for job in sort_ranked(jobs, "best"):
+            duplicate = duplicate_key(job)
+            if duplicate and duplicate in duplicate_keys:
+                continue
+            if duplicate:
+                duplicate_keys.add(duplicate)
+            unique.append(job)
+        top = mark_top(unique)
+        for job in unique:
+            job.pop("description", None)
+        return {
+            "jobs": sort_ranked(unique, order),
+            "notices": notices,
+            "sources": self.directory(prefs),
+            "stats": {
+                "salary_known": sum(bool(job["salary_max"]) for job in unique),
+                "commute_known": sum(job["commute"] is not None for job in unique),
+                "mapped": sum(bool(job["location"]) for job in unique),
+                "duplicates": len(jobs) - len(unique),
+                "top": top,
+            },
+        }
+
+    async def search_source(self, prefs, source):
+        variants = prefs["search_queries"]
+        if source == "hh" or len(variants) == 1:
+            return await self.sources.search(prefs, source)
+        batches = await asyncio.gather(
+            *(self.sources.search(prefs | {"query": value}, source) for value in variants),
+            return_exceptions=True,
+        )
+        healthy = [result for result in batches if not isinstance(result, BaseException)]
+        if not healthy:
+            raise batches[0]
+        return [job for batch in healthy for job in batch]
 
     def save_profile(self, data):
         resume, consent = data.get("resume"), data.get("consent")
@@ -508,7 +633,7 @@ class MiniApp:
                 entry = self.catalog.get(identifier)
                 if not entry or time.monotonic() - entry[0] > 1800:
                     raise ServiceError("Результаты устарели. Выполните поиск ещё раз.")
-                _, details, criteria = entry
+                _, details, criteria, _ = entry
                 if details["source"] == "browser":
                     details = details | {"source": "mini_hh"}
                 self.db.add(identifier, details | {"mini_filters": criteria})

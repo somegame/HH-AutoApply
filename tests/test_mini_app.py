@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -301,9 +302,28 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
     if not executable:
         pytest.skip("Chromium не установлен.")
 
+    def mapped_source(request):
+        response = source_response(request)
+        if not response.is_success:
+            return response
+        payload = response.json()
+        rows = payload["results"]["vacancies"]
+        first = rows[0]["vacancy"]
+        first["addresses"] = {
+            "address": [{"lat": 55.75, "lng": 37.62, "location": "Москва, улица Тестовая, 1"}]
+        }
+        second = first | {
+            "id": "01234567-c88d-11f1-999a-2f7506c6dfb2",
+            "job-name": "Финансовый аналитик",
+            "addresses": {
+                "address": [{"lat": 55.755, "lng": 37.625, "location": "Москва, улица Тестовая, 2"}]
+            },
+        }
+        return httpx.Response(200, json={"results": {"vacancies": [rows[0], {"vacancy": second}]}})
+
     async def run():
         db = Database(mini_config.data_dir)
-        async with httpx.AsyncClient(transport=httpx.MockTransport(source_response)) as sources:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(mapped_source)) as sources:
             scheduler = Scheduler(mini_config, db, sources)
             view = scheduler.browser.view
             view.mini_app = MiniApp(mini_config, db, scheduler, sources, SimpleNamespace())
@@ -318,6 +338,7 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     page = await browser.new_page(
                         viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True
                     )
+                    tile_requests = []
 
                     async def forward(route):
                         request = route.request
@@ -329,6 +350,15 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                                 + data
                                 + "}};",
                                 content_type="application/javascript",
+                            )
+                            return
+                        if url.hostname == "tile.openstreetmap.org":
+                            tile_requests.append(url.path)
+                            await route.fulfill(
+                                body=base64.b64decode(
+                                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+pU4sAAAAASUVORK5CYII="
+                                ),
+                                content_type="image/png",
                             )
                             return
                         result = await client.request(
@@ -347,10 +377,24 @@ def test_mini_app_mobile_search_and_prepare(mini_config):
                     await page.goto(PUBLIC_URL + "/mini")
                     await page.get_by_role("button", name="Найти", exact=False).click()
                     await page.get_by_role("heading", name="Финансовый менеджер").wait_for()
-                    await page.get_by_role("button", name="Описание").click()
+                    assert not tile_requests
+                    await page.get_by_role("button", name="Карта", exact=True).click()
+                    await page.locator("#job-map .office-pin").last.wait_for()
+                    assert await page.locator("#job-map .office-pin").count() == 2
+                    await page.locator("#job-map .leaflet-tile").first.wait_for()
+                    assert tile_requests
+                    await page.get_by_role("button", name="Список", exact=True).click()
+                    matches = page.locator("#results")
+                    for _ in range(2):
+                        await matches.get_by_role("button", name="К сравнению").first.click()
+                    await page.get_by_role("button", name="Сравнить", exact=True).click()
+                    assert await page.locator("#compare-dialog .compare-card").count() == 2
+                    await page.locator("#compare-close").click()
+                    card = matches.locator('[data-job-id="' + JOB_ID + '"]')
+                    await card.get_by_role("button", name="Описание").click()
                     await page.get_by_text("Работа с бюджетами", exact=False).wait_for()
                     await page.get_by_role("button", name="Закрыть", exact=True).click()
-                    await page.get_by_role("button", name="Сохранить вакансию", exact=True).click()
+                    await card.get_by_role("button", name="Сохранить вакансию", exact=True).click()
                     await page.get_by_text("Ожидает анализа").wait_for()
                     await (
                         page.get_by_role("navigation")
@@ -450,6 +494,143 @@ def test_superjob_authorization_and_real_status_in_the_journal(mini_config):
                         {"id_vacancy": number, "id_cv": "37", "comment": "Письмо аналитика"}
                         for number in ("70", "71")
                     ]
+            finally:
+                await view.shutdown()
+
+    asyncio.run(run())
+
+
+def test_discovery_preferences_rank_and_explicit_route(mini_config, monkeypatch):
+    from app.scheduler import local_day
+
+    config = replace(mini_config, ors_key="synthetic-routing-key")
+    resume = "Бюджетирование, финансовый анализ, подготовка отчётов, прогнозирование расходов."
+    origin = {"lat": 55.75, "lon": 37.62}
+    near = {"lat": 55.754, "lon": 37.625, "address": "Москва, улица Тестовая, 1"}
+    external_requests = []
+    searched = []
+
+    def external(request):
+        external_requests.append(request)
+        assert request.url.host == "api.heigit.org"
+        assert request.headers["Authorization"] == "synthetic-routing-key"
+        assert request.url.path.endswith("/driving-car/json")
+        assert json.loads(request.content)["coordinates"] == [
+            [origin["lon"], origin["lat"]],
+            [near["lon"], near["lat"]],
+        ]
+        return httpx.Response(
+            200, json={"routes": [{"summary": {"duration": 540, "distance": 4500}}]}
+        )
+
+    def vacancy(title, location):
+        job = dict.fromkeys(URL_FIELDS, "")
+        job.update(
+            title=title,
+            company="Пример",
+            region="Москва",
+            monthly=True,
+            salary="200 000 ₽",
+            salary_min=200000,
+            salary_max=200000,
+            currency="RUB",
+            address="Москва, улица Тестовая, 1" if location == near else "",
+            format="офис",
+            published=local_day(config),
+            location=location,
+            url="https://hh.ru/vacancy/1",
+            source="browser",
+            description="Работа с бюджетированием, финансовым анализом и расходами.",
+        )
+        return job
+
+    async def run():
+        db = Database(config.data_dir)
+        db.set("resume", resume)
+        close = vacancy("Финансовый аналитик", near)
+        db.add("1", close)
+        db.finish_analysis(
+            "1",
+            "draft",
+            {"score": 97, "resume_hash": hashlib.sha256(resume.encode()).hexdigest()},
+            "Текст письма",
+        )
+
+        async def sources(settings, source):
+            searched.append((source, settings["query"], len(settings["search_queries"])))
+            if source == "hh":
+                return [
+                    ("1", close),
+                    ("2", vacancy("Финансовый контролёр", {"lat": 57.1, "lon": 37.62})),
+                ]
+            if source == "trudvsem":
+                return [("trudvsem:1", close), ("trudvsem:2", vacancy("Экономист", None))]
+            return []
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(external)) as upstream:
+            scheduler = Scheduler(config, db, upstream)
+            view = scheduler.browser.view
+            view.mini_app = MiniApp(config, db, scheduler, upstream, SimpleNamespace())
+            monkeypatch.setattr(view.mini_app.sources, "search", sources)
+            await view.start()
+            try:
+                port = view.runner.addresses[0][1]
+                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+                    prefs = "/mini/api/preferences"
+                    assert (
+                        await client.post(prefs, headers={"Origin": PUBLIC_URL}, json=origin)
+                    ).status_code == 401
+                    headers = {
+                        "Authorization": "tma " + signed(int(time.time())),
+                        "Origin": PUBLIC_URL,
+                    }
+                    invalid = await client.post(
+                        prefs, headers=headers, json={"home": {"lat": 180, "lon": 0}}
+                    )
+                    assert invalid.status_code == 400
+                    saved = await client.post(
+                        prefs,
+                        headers=headers,
+                        json={
+                            "home": origin | {"address": "Личный адрес"},
+                            "travel_mode": "car",
+                            "preferred_format": "office",
+                        },
+                    )
+                    assert saved.json()["preferences"]["home"] == origin
+                    assert "Личный адрес" not in saved.text
+                    url = "/mini/api/search?include_related=true&sort=commute&max_commute=50&include_unknown_commute=false"
+                    response = await client.get(url, headers=headers)
+                    assert response.status_code == 200
+                    result = response.json()
+                    assert [job["id"] for job in result["jobs"]] == ["1"]
+                    job = result["jobs"][0]
+                    assert job["rank"]["fit"] == 97
+                    assert job["commute"]["kind"] == "estimate"
+                    assert job["top"] is True and result["stats"]["duplicates"] == 1
+                    assert (
+                        len(
+                            {
+                                query
+                                for key, query, count in searched
+                                if key == "trudvsem" and count == 3
+                            }
+                        )
+                        == 3
+                    )
+                    assert not external_requests
+
+                    routed = await client.post("/mini/api/route", headers=headers, json={"id": "1"})
+                    assert routed.json()["commute"]["kind"] == "routed"
+                    assert routed.json()["commute"]["minutes"] == 9
+                    assert len(external_requests) == 1
+                    repeated = await client.get(url, headers=headers)
+                    assert repeated.json()["jobs"][0]["commute"]["minutes"] == 9
+                    assert len(external_requests) == 1
+                    assert (
+                        await client.post(prefs, headers=headers, json={"home": None})
+                    ).status_code == 200
+                    assert db.get("vacancy_discovery")["home"] is None
             finally:
                 await view.shutdown()
 

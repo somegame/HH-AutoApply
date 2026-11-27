@@ -1,0 +1,59 @@
+.discovery-tools { display: grid; gap: 13px; margin-bottom: 13px; }
+.search-preferences { margin: 2px 0 8px; }
+.search-extra p { line-height: 1.3; }
+.search-insights { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-block: 1px solid var(--line); }
+.search-insights .named-metric { padding: 10px 8px; }
+.search-insights .named-metric + .named-metric { border-inline-start: 1px solid var(--line); }
+.named-metric { display: grid; min-width: 0; gap: 2px; }
+.named-metric strong { font-size: 1.13rem; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.named-metric span { color: var(--muted); font-size: .74rem; line-height: 1.3; }
+.result-toolbar { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: end; gap: 9px; }
+.view-switch { display: flex; flex: 0 0 auto; padding: 3px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.view-switch button { min-height: 40px; border: 0; border-radius: 8px; padding: 6px 10px; background: transparent; color: var(--muted); font-size: .83rem; font-weight: 700; }
+.view-switch button[aria-pressed="true"] { color: var(--accent); background: var(--soft); }
+.sort-control label { margin-bottom: 3px; color: var(--muted); }
+.sort-control select { font-size: .88rem; }
+.compare-toolbar { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 9px 7px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); }
+.compare-toolbar span { color: var(--muted); font-size: .88rem; }
+.card.recommended { border-color: var(--accent); border-inline-start-width: 4px; background: linear-gradient(170deg, var(--soft), var(--surface) 75%); }
+.top-label { color: var(--good); font-size: .81rem; font-weight: 730; }
+.discovery-assessment { display: grid; gap: 7px; min-width: 0; }
+.job-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; border-block: 1px solid var(--line); padding: 8px 0; }
+.job-metrics .named-metric + .named-metric { border-inline-start: 1px solid var(--line); padding-inline-start: 9px; }
+.job-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 9px; }
+.trip-chip { padding: 3px 7px; border-radius: 6px; background: var(--soft); color: var(--accent); font-size: .82rem; font-weight: 670; }
+.job-factors, .job-route { margin-top: 2px; border-top: 1px solid var(--line); }
+.job-factors summary, .job-route summary { cursor: pointer; padding: 6px 0; color: var(--accent); font-weight: 650; font-size: .87rem; }
+.job-route button { margin-top: 8px; }
+.factor-breakdown { display: grid; gap: 9px; padding-top: 7px; }
+.factor { display: grid; gap: 2px; }
+.factor-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 2px 8px; font-size: .84rem; }
+.factor-heading .muted, .factor p { font-size: .77rem; }
+.factor-meter { display: block; width: 100%; height: 12px; background: transparent; }
+.factor-meter::-webkit-meter-bar { height: 8px; background: var(--line); border: 0; border-radius: 6px; }
+.factor-meter::-webkit-meter-optimum-value { background: var(--accent); border-radius: 6px; }
+.factor-meter::-moz-meter-bar { background: var(--accent); border-radius: 6px; }
+.compare-select[aria-pressed="true"] { border-color: var(--accent); background: var(--soft); color: var(--accent); }
+.job-map-panel { display: grid; gap: 9px; }
+#job-map { min-height: 300px; height: clamp(300px, 55vh, 460px); border: 1px solid var(--line); border-radius: 14px; background: #edf3ef; isolation: isolate; }
+#job-map .leaflet-control-attribution { color: #193541; }
+#job-map .leaflet-control-attribution a { color: #064e60; }
+.office-pin { display: grid; place-items: center; border: 2px solid #fff; border-radius: 50%; background: #14374b; color: #fff; box-shadow: 0 2px 6px #182d3a59; font: 700 15px/1 system-ui, sans-serif; cursor: pointer; }
+.office-pin-top { background: #006d70; }
+.office-pin:focus-visible { outline: 3px solid #133b71; outline-offset: 2px; }
+.office-pin:hover { background: #21316c; }
+.travel-profile .actions { margin-top: 0; }
+.travel-fields > div, .search-preferences > div { min-width: 0; }
+.travel-profile button[type="submit"] { justify-self: start; }
+#travel-locate { display: grid; gap: 4px; }
+#travel-address { min-width: 0; }
+#compare-dialog { width: min(calc(100% - 20px), 760px); }
+.compare-grid { display: grid; gap: 10px; padding: 12px; }
+.compare-card { min-width: 0; display: grid; align-content: start; gap: 6px; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 13px; padding: 11px; background: var(--surface); }
+.compare-card h3 { font-size: 1rem; }
+@media (min-width: 640px) { .compare-grid { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); } }
+@media (max-width: 360px) {
+  .result-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .view-switch button { flex: 1 1 0; }
+  .travel-fields { grid-template-columns: minmax(0, 1fr); }
+}

@@ -6,7 +6,11 @@
   <meta name="theme-color" content="#f3f6f8">
   <title>Поиск работы</title>
   <link rel="stylesheet" href="/mini/app.css">
+  <link rel="stylesheet" href="/mini/leaflet.css">
+  <link rel="stylesheet" href="/mini/discovery.css">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script defer src="/mini/leaflet.js"></script>
+  <script defer src="/mini/discovery.js"></script>
   <script defer src="/mini/app.js"></script>
 </head>
 <body>
@@ -36,12 +40,57 @@
         <label class="checkbox"><input name="apply_only" type="checkbox" value="true"> Только с откликом в приложении</label>
         <details class="search-extra">
           <summary>Дополнительно</summary>
+          <div class="field-row search-preferences">
+            <div><label for="search-format">Предпочтительный формат</label>
+              <select id="search-format" name="preferred_format">
+                <option value="any">Любой формат</option>
+                <option value="remote">Удалённо</option>
+                <option value="hybrid">Гибрид</option>
+                <option value="office">В офисе</option>
+              </select>
+            </div>
+            <div><label for="search-commute">Время в пути, до минут</label>
+              <input id="search-commute" name="max_commute" type="number" min="0" max="180"
+                value="0" inputmode="numeric" aria-describedby="search-commute-help">
+            </div>
+          </div>
+          <p id="search-commute-help">0 — без ограничения времени.</p>
+          <label class="checkbox"><input name="include_unknown_commute" type="checkbox" value="true" checked> При лимите показывать вакансии без расчёта дороги</label>
+          <label class="checkbox"><input id="search-related" name="include_related" type="checkbox" value="true"> Искать также по смежным должностям</label>
           <label class="checkbox"><input name="hh_title_only" type="checkbox" value="true" checked> На HH искать по названию должности</label>
         </details>
       </form>
       <div class="section-title"><h2>Вакансии</h2><span id="result-count" class="counter"></span></div>
       <p id="search-status" class="empty" role="status">Нажмите «Найти», чтобы увидеть вакансии по вашим параметрам.</p>
+      <div id="discovery-tools" class="discovery-tools" hidden>
+        <div id="search-insights" class="search-insights" aria-label="Сводка по вакансиям"></div>
+        <div class="result-toolbar">
+          <div class="view-switch" role="group" aria-label="Вид результатов">
+            <button id="list-view" type="button" aria-pressed="true" aria-controls="results">Список</button>
+            <button id="map-view" type="button" aria-pressed="false" aria-controls="job-map-panel">Карта</button>
+          </div>
+          <div class="sort-control">
+            <label for="result-sort">Сортировка</label>
+            <select id="result-sort">
+              <option value="best">Лучшие по факторам</option>
+              <option value="fit">Соответствие резюме</option>
+              <option value="salary">По зарплате</option>
+              <option value="commute">По времени в пути</option>
+              <option value="fresh">Сначала новые</option>
+            </select>
+          </div>
+          <div id="compare-toolbar" class="compare-toolbar" hidden>
+            <span id="compare-count" role="status"></span>
+            <button id="compare-open" type="button" class="secondary" aria-haspopup="dialog">Сравнить</button>
+          </div>
+        </div>
+      </div>
       <div id="results" class="stack results"></div>
+      <section id="job-map-panel" class="job-map-panel" aria-label="Карта вакансий" hidden>
+        <p id="job-map-note" class="muted" role="status"></p>
+        <div id="job-map" aria-label="Адреса вакансий на карте" hidden></div>
+        <div id="job-map-office" class="stack"></div>
+      </section>
       <div id="notices" class="stack notices"></div>
     </section>
 
@@ -78,6 +127,49 @@
     <section id="panel-connections" hidden>
       <div class="section-title"><h2>Аккаунты</h2></div>
       <div id="connections" class="stack"></div>
+      <form id="travel-form" class="profile travel-profile" autocomplete="off">
+        <h3 id="travel-title">Дорога до работы</h3>
+        <p id="travel-status" class="muted"></p>
+        <p class="muted">Укажите точку рядом с домом. В профиле сохраняются только координаты.</p>
+        <div class="field-row travel-fields">
+          <div><label for="travel-lat">Широта</label><input id="travel-lat" inputmode="decimal" maxlength="16" placeholder="55.7558"></div>
+          <div><label for="travel-lon">Долгота</label><input id="travel-lon" inputmode="decimal" maxlength="16" placeholder="37.6173"></div>
+        </div>
+        <div class="actions">
+          <button id="travel-position" type="button" class="secondary" hidden>Использовать мою геопозицию</button>
+          <button id="travel-clear" type="button" class="secondary" hidden>Очистить точку</button>
+        </div>
+        <div id="travel-locate" hidden>
+          <label for="travel-address">Или найдите адрес</label>
+          <div class="field-row travel-fields">
+            <input id="travel-address" type="search" maxlength="180" aria-describedby="travel-locate-note"
+              placeholder="Москва, улица и номер дома">
+            <button id="travel-geocode" type="button" class="secondary">Найти адрес</button>
+          </div>
+          <p id="travel-locate-note" class="muted">По кнопке введённый адрес отправится в OpenRouteService. После поиска адрес очищается.</p>
+        </div>
+        <div class="field-row travel-fields">
+          <div><label for="travel-mode">Способ поездки</label>
+            <select id="travel-mode">
+              <option value="transit">Общественный транспорт</option>
+              <option value="car">На машине</option>
+              <option value="cycle">На велосипеде</option>
+              <option value="walk">Пешком</option>
+            </select>
+          </div>
+          <div><label for="travel-cap">Лимит пути, минуты</label>
+            <input id="travel-cap" type="number" min="0" max="180" value="0" inputmode="numeric">
+          </div>
+        </div>
+        <label for="travel-format">Предпочтительный формат работы</label>
+        <select id="travel-format">
+          <option value="any">Любой формат</option>
+          <option value="remote">Удалённо</option>
+          <option value="hybrid">Гибрид</option>
+          <option value="office">В офисе</option>
+        </select>
+        <button class="primary" type="submit">Сохранить настройки дороги</button>
+      </form>
       <form id="profile-form" class="profile" autocomplete="off">
         <h3>Профиль для писем</h3>
         <p id="profile-info" class="muted"></p>
@@ -124,6 +216,13 @@
       <button class="secondary" id="close-job" type="button">Закрыть</button>
     </header>
     <div id="job-description-body" class="job-body"></div>
+  </dialog>
+  <dialog id="compare-dialog" aria-labelledby="compare-title">
+    <header class="dialog-head">
+      <h2 id="compare-title">Сравнение вакансий</h2>
+      <button id="compare-close" type="button" class="secondary">Закрыть</button>
+    </header>
+    <div id="compare-body" class="compare-grid"></div>
   </dialog>
 </body>
 </html>

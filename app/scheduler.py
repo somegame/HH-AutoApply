@@ -136,8 +136,7 @@ class Scheduler:
             settings["mode"] == "manual" or (safe_letter and self.db.get("browser_auto_enabled"))
         ):
             status = "approved"
-        if source in {"browser", "mini_hh"}:
-            result = result | {"resume_hash": hashlib.sha256(resume.encode()).hexdigest()}
+        result = result | {"resume_hash": hashlib.sha256(resume.encode()).hexdigest()}
         if source == "browser":
             result = result | {"analysis_policy": AUTO_ANALYSIS_POLICY}
             if safe_letter:
