@@ -13,10 +13,11 @@ from uuid import uuid4
 
 from aiohttp import web
 
+from app import hh_resume_editor
 from app.config import VERSION, setting
 from app.database import LABELS
 from app.discovery import VacancyDiscovery, commute_limit, preferred_format
-from app.hh_browser import HHLoginRequired
+from app.hh_browser import HHAccessBarrier, HHLoginRequired
 from app.job_sources import SEARCH_SOURCES, SOURCES, JobSources, source_url, source_vacancy_id, text
 from app.ranking import ORDERS, duplicate_key, mark_top, normalized, sort_ranked
 from app.resume import checked
@@ -99,6 +100,8 @@ class MiniApp:
         self.catalog = OrderedDict()
         self.resume_task = None
         self.resume_error = ""
+        self.hh_editor_task = None
+        self.hh_editor_error = ""
 
     def add_routes(self, app):
         app.on_shutdown.append(self.shutdown)
@@ -107,14 +110,15 @@ class MiniApp:
                 web.get("/mini", self.asset),
                 web.get("/mini/{asset:(?:app|discovery|leaflet)\\.(?:js|css)}", self.asset),
                 web.get(
-                    "/mini/api/{command:state|search|search-status|vacancy|resume-studio}", self.api
+                    "/mini/api/{command:state|search|search-status|vacancy|resume-studio|hh-editor}",
+                    self.api,
                 ),
                 web.get("/mini/oauth/superjob", self.superjob_callback),
                 web.get("/mini/oauth/finished", self.oauth_finished),
                 web.post(
                     "/mini/api/{command:job|profile|connect|resume|cancel|disconnect|import|"
                     "hh-mode|hh-resumes|hh-browser|superjob|preferences|locate|route|"
-                    "search-start|auto-settings|resume-studio|ai-consent}",
+                    "search-start|auto-settings|resume-studio|ai-consent|hh-editor|hh-check}",
                     self.api,
                 ),
             ]
@@ -124,6 +128,8 @@ class MiniApp:
         tasks = [run.task for run in self.searches.values() if run.task and not run.task.done()]
         if self.resume_task and not self.resume_task.done():
             tasks.append(self.resume_task)
+        if self.hh_editor_task and not self.hh_editor_task.done():
+            tasks.append(self.hh_editor_task)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -194,6 +200,8 @@ class MiniApp:
                 return self.json(self.vacancy_details(request.query.get("id", "")))
             if command == "resume-studio" and request.method == "GET":
                 return self.json(self.resume_studio_state())
+            if command == "hh-editor" and request.method == "GET":
+                return self.json(self.hh_editor_state())
             data = await request.clone(client_max_size=100_000).json()
             if not isinstance(data, dict):
                 raise ValueError("Ожидались данные в виде объекта.")
@@ -241,6 +249,11 @@ class MiniApp:
                 return self.json(await self.import_job(data))
             if command == "hh-mode":
                 return self.json(await self.change_hh_mode(data))
+            if command == "hh-check":
+                checked = await self.browser.check_access()
+                return self.json(self.state() | {"hh_access_restored": checked})
+            if command == "hh-editor":
+                return await self.hh_editor_action(data)
             if command == "hh-resumes":
                 if "url" in data:
                     await self.browser.refresh_resumes(data["url"])
@@ -292,6 +305,9 @@ class MiniApp:
             return self.json(self.state())
         except json.JSONDecodeError:
             return self.json({"error": "Некорректные данные."}, 400)
+        except HHAccessBarrier as exc:
+            self.browser.record_access_barrier(exc)
+            return self.json({"error": str(exc)}, 403)
         except HHLoginRequired as exc:
             self.db.set("hh_needs_login", True)
             self.browser.pause("Нужно снова подключить HH.")
@@ -327,6 +343,7 @@ class MiniApp:
             "resume": resume,
             "consent": self.db.get("groq_consent", False),
             **self.resume_studio_state(),
+            **self.hh_editor_state(),
             "groq": bool(self.config.groq_key),
             "gemini": bool(self.config.gemini_key),
             "gemini_consent": self.db.get("gemini_consent", False),
@@ -359,6 +376,7 @@ class MiniApp:
             "hh_notice": self.db.get("browser_notice", ""),
             "hh_scan_pending": len(self.db.get("browser_scan", {}).get("pending", [])),
             "hh_application": self.browser.application_status(),
+            "hh_access_restricted": bool(self.browser.access_barrier()),
             "daily_limit": prefs["limit"],
             "summary": {
                 "total": sum(counts.values()),
@@ -735,6 +753,101 @@ class MiniApp:
             "resume_studio": draft,
             "resume_studio_status": {"status": status, "message": self.resume_error},
         }
+
+    def hh_editor_state(self):
+        selected = self.db.get("hh_selected_resume", {}).get("id")
+        plan = self.db.get("hh_editor", {})
+        if not selected or plan.get("resume_id") != selected:
+            plan = {}
+        return {
+            "hh_editor": plan or None,
+            "hh_editor_pending": bool(self.hh_editor_task and not self.hh_editor_task.done()),
+            "hh_editor_error": self.hh_editor_error,
+        }
+
+    async def hh_editor_action(self, data):
+        command = data.get("action")
+        identifier = self.browser.editor_resume()
+        if command == "prepare":
+            if not ai_allowed(self.config, self.db):
+                raise ServiceError("Разрешите Groq или Gemini обработать опыт из резюме.")
+            if not self.hh_editor_task or self.hh_editor_task.done():
+                self.hh_editor_error = ""
+                self.hh_editor_task = asyncio.create_task(self.prepare_hh_editor(identifier))
+            return self.json(self.hh_editor_state(), 202)
+        plan = self.hh_editor_state()["hh_editor"]
+        if not plan or data.get("revision") != plan["revision"]:
+            raise ServiceError("Подготовьте актуальные изменения для выбранного резюме HH.")
+        if command == "open":
+            return self.json({"url": await self.browser.open_editor(identifier)})
+        if command == "fill" and data.get("kind") in ("skills", "duties"):
+            await self.browser.edit_resume_fields(plan, data["kind"], data.get("index"))
+            return self.json({"filled": True})
+        if command == "verify" and data.get("saved") is True:
+            plan["verified"] = await self.browser.verify_editor_changes(plan)
+            self.db.set("hh_editor", plan)
+            return self.json(self.hh_editor_state())
+        raise ValueError("Выберите действие с изменениями резюме.")
+
+    async def prepare_hh_editor(self, identifier):
+        try:
+            snapshot = await self.browser.read_editor_sections(identifier)
+            if not snapshot["jobs"]:
+                raise ServiceError(
+                    "HH не показал заполненные обязанности по местам работы. "
+                    "Проверьте раздел «Опыт работы» в самом HH."
+                )
+            target = self.db.settings(self.config)["query"]
+            source = {
+                "target": clean_text(target),
+                "skills": [clean_text(skill) for skill in snapshot["skills"]],
+                "jobs": [job | {"job": index} for index, job in enumerate(snapshot["jobs"])],
+                "vacancies": self.resume_vacancy_sample(target),
+            }
+
+            async def complete(provider):
+                return await provider.complete(
+                    hh_resume_editor.PROMPT,
+                    source,
+                    response_schema=hh_resume_editor.SCHEMA,
+                    max_tokens=4200,
+                )
+
+            async with asyncio.timeout(60):
+                async with self.scheduler.ai_lock:
+                    delay = self.scheduler.ai_request_delay(int(time.time()))
+                    if 0 < delay <= 12:
+                        await asyncio.sleep(delay)
+                    response = await self.scheduler.try_ai(complete, int(time.time()))
+            if not response:
+                raise ServiceError("Модели временно недоступны. Повторите анализ после паузы.")
+            if self.db.get("hh_selected_resume", {}).get("id") != identifier:
+                raise ServiceError("Выбранное резюме изменилось. Запустите анализ заново.")
+            provider, result = response
+            plan = hh_resume_editor.proposals(result, snapshot)
+            self.db.set(
+                "hh_editor",
+                plan
+                | {
+                    "name": snapshot["name"],
+                    "jobs": snapshot["jobs"],
+                    "resume_id": identifier,
+                    "revision": uuid4().hex,
+                    "provider": provider,
+                },
+            )
+        except HHAccessBarrier as exc:
+            self.browser.record_access_barrier(exc)
+            self.hh_editor_error = "HH ограничил доступ к резюме. Откройте карточку на hh.ru."
+        except HHLoginRequired as exc:
+            self.db.set("hh_needs_login", True)
+            self.browser.pause("Нужно снова подключить HH.")
+            self.hh_editor_error = str(exc)
+        except (ServiceError, TimeoutError) as exc:
+            self.hh_editor_error = str(exc) or "Подготовка изменений заняла слишком много времени."
+        except Exception as exc:
+            log.warning("Сбой подготовки правок HH (%s)", type(exc).__name__)
+            self.hh_editor_error = "Не удалось подготовить изменения резюме."
 
     def resume_studio_action(self, data):
         action = data.get("action")

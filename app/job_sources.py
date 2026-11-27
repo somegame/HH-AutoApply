@@ -268,6 +268,8 @@ class JobSources:
 
     async def search_hh(self, settings):
         self.browser.require_browser()
+        if self.browser.access_barrier():
+            raise ServiceError("Доступ из браузера бота ограничен. Поиск можно открыть на HH.")
         requested = settings.get("search_queries")
         related = requested[:3] if isinstance(requested, list) else []
         queries = list(

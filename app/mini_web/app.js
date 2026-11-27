@@ -22,6 +22,7 @@ let lastSearchQuery;
 let searchTimer;
 let startingSearch = false;
 let skillsDirty = false;
+let hhEditorTimer;
 const resumeStudio = {
   initialized: false,
   starting: false,
@@ -453,9 +454,16 @@ function hhDialogButton(id, label, dialog, open, primary = false) {
 
 function showHHWindow() {
   const selecting = hhWindow.mode === "resume";
+  const editing = hhWindow.mode === "edit";
   hhDialog.dataset.mode = hhWindow.mode;
-  byId("hh-dialog-title").textContent = selecting ? "Выбор резюме в HH" : "Подключение HH";
-  hhFrame.title = selecting ? "Защищённое окно выбора резюме HH" : "Защищённое окно входа HH";
+  byId("hh-dialog-title").textContent = editing ? "Редактирование резюме HH" :
+    selecting ? "Выбор резюме в HH" : "Подключение HH";
+  hhFrame.title = byId("hh-dialog-title").textContent;
+  byId("hh-edit-tools").hidden = !editing;
+  if (editing) {
+    statusText("hh-edit-status", "");
+    setHHEditHelp();
+  }
   hhFrame.src = hhWindow.url;
   hhDialog.showModal();
 }
@@ -524,7 +532,7 @@ function renderHHAuto() {
   const persistent = state.storage_persistent ?? state.persistent;
   const status = byId("hh-auto-state");
   const operations = byId("hh-auto-controls");
-  status.textContent = state.hh_auto ? "Включены" : "Выключены";
+  status.textContent = state.hh_access_restricted ? "Доступ ограничен" : state.hh_auto ? "Включены" : "Выключены";
   status.className = state.hh_auto ? "status good" : "status";
   if (!skillsDirty) byId("hh-skills-score").value = state.auto_settings.skills_score;
   byId("hh-skills-help").textContent = "Анализ сверяет навыки с резюме. Для автоотклика также нужны " +
@@ -540,7 +548,17 @@ function renderHHAuto() {
   statusText("hh-auto-help", state.hh_application?.message || "");
   activityList("hh-auto-blockers", blockers);
   operations.replaceChildren();
-  if (state.hh_auto) {
+  if (state.hh_access_restricted) {
+    operations.append(action("Проверить доступ HH", async () => {
+      const next = await api("hh-check", {});
+      applyState(next);
+      showFeedback(next.hh_access_restored ?
+        "Страница открывается. Теперь можно включить автоотклики." :
+        "HH по-прежнему ограничивает доступ из браузера бота.");
+    }, true));
+    const source = state.sources.find(item => item.id === "hh");
+    if (source) operations.append(action("Открыть вакансии на HH", () => external(source.url)));
+  } else if (state.hh_auto) {
     operations.append(action("Оставить только поиск", async () => {
       applyState(await api("hh-mode", { mode: "search" }));
       showFeedback("Автоотклики выключены. Поиск продолжается.");
@@ -816,6 +834,99 @@ function renderConnections() {
     "После вашего разрешения Gemini сможет обрабатывать профессиональные сведения для анализа, писем и резюме.";
   byId("gemini-consent").textContent = state.gemini_consent ? "Отозвать разрешение Gemini" : "Разрешить Gemini";
   renderResumeStudio();
+  renderHHEditor();
+}
+
+function hhEditLabel(kind, item) {
+  return kind === "skills" ? item.name : [item.role, item.company].filter(Boolean).join(" · ");
+}
+
+function setHHEditHelp() {
+  const skill = byId("hh-edit-change").value.startsWith("skills:");
+  byId("hh-edit-help").textContent = skill ?
+    "В блоке «Навыки» нажмите пустое поле, заполните его и выберите подсказку HH. Сохраните изменения на сайте." :
+    "Откройте указанное место работы и нажмите поле «Обязанности и достижения». После заполнения сохраните изменения на HH.";
+}
+
+function renderHHEditor() {
+  const section = byId("hh-resume-editor");
+  section.hidden = !state.hh_resume_id;
+  if (section.hidden) return;
+  const plan = state.hh_editor;
+  const busy = state.hh_editor_pending;
+  byId("hh-editor-resume").textContent = state.hh_resume;
+  const prepare = byId("hh-editor-prepare");
+  prepare.disabled = Boolean(busy || !state.hh_connected || state.hh_access_restricted || !aiReady());
+  statusText("hh-editor-status", busy ? "Читаю опыт на HH и подбираю правки…" :
+    state.hh_editor_error ||
+    (state.hh_access_restricted ? "Проверьте доступ или откройте карточку на самом HH." :
+      !aiReady() ? "Разрешите анализ в Groq или Gemini." :
+      plan ? "Проверьте предложения и выберите правку для вашего резюме HH." : ""));
+  const changes = byId("hh-editor-changes");
+  changes.replaceChildren();
+  if (plan) {
+    for (const [kind, title] of [["skills", "Ключевые навыки"], ["duties", "Обязанности по местам работы"]]) {
+      if (!plan[kind]?.length) continue;
+      changes.append(el("h4", title));
+      plan[kind].forEach((item, index) => {
+        const verified = plan.verified?.[kind]?.includes(index);
+        const block = el("details", "", "hh-edit-proposal card");
+        block.append(el("summary", hhEditLabel(kind, item) + (verified ? " · Сохранено на HH" : "")));
+        const value = kind === "skills" ? item.name : item.text;
+        block.append(el("p", value));
+        if (kind === "skills" && plan.jobs?.[item.job]) {
+          block.append(el("p", hhEditLabel("duties", plan.jobs[item.job]), "muted"));
+        }
+        const proof = kind === "skills" ? [item.quote] : item.proof.map(point => point.quote);
+        block.append(el("p", "Из исходных обязанностей\n" + proof.join("\n"), "muted"));
+        const buttons = el("div", "", "actions");
+        if (!verified && !busy && state.hh_connected && !state.hh_access_restricted) {
+          buttons.append(action("Открыть поле на HH", () => openHHEditor(kind, index), true));
+        }
+        if (navigator.clipboard) buttons.append(action("Скопировать", async () => {
+          await navigator.clipboard.writeText(value);
+          showFeedback("Правка скопирована.");
+        }));
+        block.append(buttons);
+        changes.append(block);
+      });
+    }
+    if (!changes.childElementCount) changes.append(el("p", "По этому опыту модель не нашла подтверждённых дополнений.", "muted"));
+  }
+  if (busy && !hhEditorTimer) hhEditorTimer = window.setTimeout(pollHHEditor, 1700);
+}
+
+async function pollHHEditor() {
+  window.clearTimeout(hhEditorTimer);
+  hhEditorTimer = undefined;
+  try {
+    const next = await api("hh-editor");
+    if (!next.hh_editor_pending) await refresh();
+    else {
+      Object.assign(state, next);
+      renderHHEditor();
+    }
+  } catch (error) {
+    statusText("hh-editor-status", error.message);
+    byId("hh-editor-prepare").disabled = false;
+  }
+}
+
+async function openHHEditor(kind, index) {
+  const plan = state.hh_editor;
+  const { url } = await api("hh-editor", { action: "open", revision: plan.revision });
+  const select = byId("hh-edit-change");
+  select.replaceChildren();
+  for (const field of ["skills", "duties"]) {
+    plan[field].forEach((item, position) => {
+      const option = el("option", hhEditLabel(field, item));
+      option.value = field + ":" + position;
+      select.append(option);
+    });
+  }
+  select.value = kind + ":" + index;
+  hhWindow = { url, mode: "edit", revision: plan.revision };
+  showHHWindow();
 }
 
 function applyState(next, first = false) {
@@ -1059,8 +1170,53 @@ byId("gemini-consent").addEventListener("click", async event => {
 });
 
 byId("resume-studio-jump").addEventListener("click", () => {
-  byId("resume-studio-title").focus({ preventScroll: true });
-  byId("resume-studio").scrollIntoView({ block: "start" });
+  dataAccessSection(state.hh_resume_id ? "hh-editor-title" : "resume-studio-title");
+});
+byId("hh-editor-native").addEventListener("click", () => external(state.hh_resume_url));
+byId("hh-editor-prepare").addEventListener("click", async () => {
+  const button = byId("hh-editor-prepare");
+  button.disabled = true;
+  try {
+    Object.assign(state, await api("hh-editor", { action: "prepare" }));
+    renderHHEditor();
+  } catch (error) {
+    statusText("hh-editor-status", error.message);
+    button.disabled = false;
+  }
+});
+byId("hh-edit-change").addEventListener("change", setHHEditHelp);
+byId("hh-edit-fill").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const [kind, index] = byId("hh-edit-change").value.split(":");
+    await api("hh-editor", { action: "fill", revision: hhWindow.revision, kind, index: Number(index) });
+    statusText("hh-edit-status", kind === "skills" ?
+      "Название внесено в поле. Выберите навык из подсказки HH и сохраните." :
+      "Поле заполнено. Проверьте его и нажмите «Сохранить» на HH.");
+  } catch (error) {
+    statusText("hh-edit-status", error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+byId("hh-edit-verify").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  if (!await confirmAction("Вы уже нажали «Сохранить» на HH? Проверка повторно откроет карточку.")) return;
+  button.disabled = true;
+  try {
+    const next = await api("hh-editor", { action: "verify", revision: hhWindow.revision, saved: true });
+    Object.assign(state, next);
+    const confirmed = next.hh_editor?.verified;
+    const count = (confirmed?.skills.length || 0) + (confirmed?.duties.length || 0);
+    statusText("hh-edit-status", count ? "Найдено сохранённых правок: " + count + ". Резюме для анализа обновлено." :
+      "В карточке HH пока нет этих правок. Проверьте сохранение на сайте.");
+    renderHHEditor();
+  } catch (error) {
+    statusText("hh-edit-status", error.message);
+  } finally {
+    button.disabled = false;
+  }
 });
 byId("resume-studio-gemini-jump").addEventListener("click", () => dataAccessSection("gemini-title"));
 byId("resume-studio-check").addEventListener("click", checkResumeStudio);
@@ -1229,14 +1385,19 @@ byId("close-job").addEventListener("click", () => byId("job-dialog").close());
 hhResumeUrlDialog.addEventListener("close", () => byId("hh-resume-url-open")?.focus());
 hhDialog.addEventListener("close", async () => {
   const selecting = hhDialog.dataset.mode === "resume";
+  const editing = hhDialog.dataset.mode === "edit";
   hhFrame.removeAttribute("src");
   try {
+    if (editing) {
+      hhWindow = undefined;
+      await api("cancel", {});
+    }
     await refresh();
   } catch (error) {
     showError(error.message);
   }
   const target = byId("hh-continue") || byId("hh-cancel") ||
-    (selecting ? byId("hh-find-resume") : byId("hh-connect") || byId("hh-switch"));
+    (editing ? byId("hh-editor-title") : selecting ? byId("hh-find-resume") : byId("hh-connect") || byId("hh-switch"));
   target?.focus();
 });
 window.addEventListener("message", event => {

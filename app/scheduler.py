@@ -10,7 +10,7 @@ from datetime import datetime
 from app.browser_workflow import BrowserWorkflow
 from app.diagnostics import resource_warning
 from app.gemini import Gemini
-from app.hh_browser import HHLoginRequired
+from app.hh_browser import HHAccessBarrier, HHLoginRequired
 from app.services import (
     AI_PROVIDERS,
     AUTO_ANALYSIS_POLICY,
@@ -104,6 +104,10 @@ class Scheduler:
             await self.browser.tick(bot, self.db.settings(self.config), local_day(self.config))
         except ServiceError as exc:
             notice = str(exc)
+            if isinstance(exc, HHAccessBarrier):
+                self.browser.record_access_barrier(exc)
+                await bot.send_message(self.config.owner, self.db.get("browser_notice"))
+                return
             if isinstance(exc, HHLoginRequired):
                 self.db.set("hh_needs_login", True)
             if not exc.retry:
