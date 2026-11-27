@@ -43,6 +43,7 @@ def build(config, db, client, *, telegram_request=None):
             or db.get("processing", True)
             or db.get("reminders", False)
             or any(db.get("hub_sources", {}).values())
+            or db.get("superjob_auto_enabled")
         ):
             await scheduler.start(app.bot)
 

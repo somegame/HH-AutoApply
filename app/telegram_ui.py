@@ -293,6 +293,7 @@ class TelegramUI:
         elif kind == "stop":
             self.db.set_many({"reminders": False, "processing": False})
             self.scheduler.browser.pause("")
+            self.scheduler.superjob.pause_auto("Автоотклики остановлены владельцем.")
             self.auto_prompt = None
             await self.scheduler.shutdown()
             await self.scheduler.browser.cancel_login()

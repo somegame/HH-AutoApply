@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 from app.local_browser import public_login_url
 
-VERSION = "6.6.0"
+VERSION = "6.7.0"
 DEFAULT_GROQ_DAILY_LIMIT = 50
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_DAILY_LIMIT = 50

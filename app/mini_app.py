@@ -32,7 +32,6 @@ from app.resume import checked
 from app.resume_studio import build_resume, has_resume_evidence
 from app.scheduler import local_day
 from app.services import ServiceError, ai_allowed, clean_text
-from app.superjob import SuperJob
 from app.vacancies import HH, URL_FIELDS, terms, vacancy_id
 
 STATIC = Path(__file__).with_name("mini_web")
@@ -101,7 +100,7 @@ class MiniApp:
         self.browser = scheduler.browser
         self.hub = scheduler.hub
         self.sources = self.hub.sources
-        self.superjob = SuperJob(config, db, client)
+        self.superjob = scheduler.superjob
         self.habr = HabrAccount(config, db, client)
         self.discovery = VacancyDiscovery(config, db, client)
         self.bot = bot
@@ -269,7 +268,11 @@ class MiniApp:
             if command == "hh-mode":
                 return self.json(await self.change_hh_mode(data))
             if command == "hh-check":
-                checked = await self.browser.check_access()
+                checked = (
+                    await self.browser.check_resume_access()
+                    if data.get("scope") == "resume"
+                    else await self.browser.check_access()
+                )
                 return self.json(self.state() | {"hh_access_restored": checked})
             if command == "hh-editor":
                 return await self.hh_editor_action(data)
@@ -301,6 +304,15 @@ class MiniApp:
                     self.superjob.disconnect()
                 elif action == "resume":
                     self.superjob.select(data.get("id"))
+                elif action == "auto" and data.get("enabled") is False:
+                    self.superjob.pause_auto("Автоотклики на SuperJob остановлены.")
+                elif (
+                    action == "auto" and data.get("enabled") is True and data.get("confirm") is True
+                ):
+                    await self.superjob.enable_auto()
+                    self.hub.configure("superjob", True)
+                    self.db.set("processing", True)
+                    await self.scheduler.start(self.bot)
                 else:
                     raise ValueError("Выберите действие для SuperJob.")
                 return self.json(self.state())
@@ -358,6 +370,8 @@ class MiniApp:
         resumes = self.db.get("superjob_resumes", {})
         hh_resume = self.db.get("hh_selected_resume", {})
         hh_needs_login = self.db.get("hh_needs_login", False)
+        hh_barrier = self.browser.access_barrier()
+        resume_barrier = self.browser.resume_access_barrier()
         hh_login_open = bool(self.browser.login_task and not self.browser.login_task.done())
         options = self.discovery.preferences()
         resume = self.db.get("resume", "")
@@ -400,7 +414,7 @@ class MiniApp:
             | self.scheduler.analysis_status(),
             "hh_send": self.browser.available
             and self.config.persistent
-            and not self.browser.access_barrier(),
+            and not (hh_barrier or resume_barrier),
             "hh_auto_allowed": self.browser.available
             and self.config.auto_send
             and self.config.persistent,
@@ -409,7 +423,10 @@ class MiniApp:
             "hh_notice": self.db.get("browser_notice", ""),
             "hh_scan_pending": len(self.db.get("browser_scan", {}).get("pending", [])),
             "hh_application": self.browser.application_status(),
-            "hh_access_restricted": bool(self.browser.access_barrier()),
+            "hh_access_restricted": bool(hh_barrier),
+            "hh_resume_access_restricted": bool(resume_barrier),
+            "hh_can_check_resume": resume_barrier.get("status") == 403
+            and resume_barrier.get("step") == "resume",
             "hub": self.hub.state(),
             "habr": self.habr.state(),
             "daily_limit": prefs["limit"],
@@ -426,6 +443,10 @@ class MiniApp:
                 "selected": self.db.get("superjob_resume_id", ""),
                 "status": self.db.get("superjob_status", ""),
                 "send": self.superjob.available and self.config.persistent,
+                "auto_allowed": self.superjob.auto_allowed,
+                "auto_enabled": self.db.get("superjob_auto_enabled", False),
+                "auto_resume": bool(self.superjob.snapshot()),
+                "auto_notice": self.db.get("superjob_auto_notice", ""),
             },
         }
 
@@ -468,6 +489,7 @@ class MiniApp:
             opts = self.db.settings(self.config) | self.discovery.preferences()
         if resume is None:
             resume = self.db.get("resume", "")
+        resume = self.scheduler.resume_for(job, resume)
         return {
             "id": row["id"],
             "title": job["title"],
@@ -528,7 +550,7 @@ class MiniApp:
                 "format",
             )
         }
-        resume = self.db.get("resume", "")
+        resume = self.scheduler.resume_for(detail)
         return (
             fields
             | self.discovery.enriched(detail, opts, resume, analysis)
@@ -699,7 +721,8 @@ class MiniApp:
                 seen.add(identifier)
                 row = rows.get(identifier)
                 analysis = self.current_analysis(row)
-                meta = self.discovery.enriched(data, options, resume, analysis)
+                matching_resume = self.scheduler.resume_for(data, resume)
+                meta = self.discovery.enriched(data, options, matching_resume, analysis)
                 travel = meta["commute"]
                 limit = options["max_commute"]
                 if limit and (
@@ -710,7 +733,7 @@ class MiniApp:
                 job = (
                     data
                     | meta
-                    | self.analysis_fields(row, analysis, resume)
+                    | self.analysis_fields(row, analysis, matching_resume)
                     | {
                         "id": identifier,
                         "source": key,
@@ -741,7 +764,9 @@ class MiniApp:
             "analysis_pending": pending,
             "analysis_queue": {"pending": pending} | self.scheduler.analysis_status(),
             "analysis_running": bool(
-                resume and ai_allowed(self.config, self.db) and self.db.get("processing", True)
+                (resume or ("superjob" in run.sources and self.superjob.snapshot()))
+                and ai_allowed(self.config, self.db)
+                and self.db.get("processing", True)
             ),
             "stats": {
                 "salary_known": sum(bool(job["salary_max"]) for job in unique),

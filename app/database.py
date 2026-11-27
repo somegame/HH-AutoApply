@@ -167,12 +167,13 @@ class Database:
                 (*statuses, size + 1, page * size),
             ).fetchall()
 
-    def pending(self):
+    def pending(self, *, source=None):
         with self.connection() as db:
             return db.execute(
                 """SELECT * FROM vacancies WHERE status='queued' AND retry_at<=?
+                   AND (? IS NULL OR json_extract(details, '$.source')=?)
                    ORDER BY found_at,id LIMIT 1""",
-                (int(time.time()),),
+                (int(time.time()), source, source),
             ).fetchone()
 
     def finish_analysis(self, vacancy_id, status, result, letter, *, expected_details=None):
@@ -246,11 +247,11 @@ class Database:
                 self.event(db, vacancy_id, status)
             return "ok" if changed else "stale"
 
-    def browser_candidates(self, *, policy, resume_hash, min_score, min_skills):
+    def browser_candidates(self, *, policy, resume_hash, min_score, min_skills, source="browser"):
         with self.connection() as db:
             yield from db.execute(
                 """SELECT * FROM vacancies WHERE status IN ('draft', 'approved')
-                   AND sent_day IS NULL AND json_extract(details, '$.source')='browser'
+                   AND sent_day IS NULL AND json_extract(details, '$.source')=?
                    AND json_extract(result, '$.auto_policy')=?
                    AND json_extract(result, '$.resume_hash')=?
                    AND json_type(result, '$.score')='integer'
@@ -259,7 +260,7 @@ class Database:
                    AND json_extract(result, '$.skills_score')>=?
                    AND letter=json_extract(result, '$.letter')
                    ORDER BY found_at,id""",
-                (policy, resume_hash, min_score, min_skills),
+                (source, policy, resume_hash, min_score, min_skills),
             )
 
     def next_browser_application(self, *, policy=None, resume_hash=None, min_score=0, min_skills=0):
@@ -276,11 +277,12 @@ class Database:
                    ORDER BY found_at,id LIMIT 1"""
             ).fetchone()
 
-    def refresh_auto_drafts(self, policy, resume_hash, *, min_score=None):
+    def refresh_auto_drafts(self, policy, resume_hash, *, min_score=None, source="browser"):
         with self.connection() as db:
             rows = db.execute(
                 """SELECT id FROM vacancies WHERE status IN ('draft', 'approved', 'filtered')
-                   AND json_extract(details, '$.source')='browser'
+                   AND json_extract(details, '$.source')=:source
+                   AND (:source='browser' OR json_extract(details, '$.auto_discovered')=1)
                    AND found_at>=:recent AND sent_day IS NULL
                    AND (
                        (status IN ('draft','approved') AND letter=json_extract(result, '$.letter')
@@ -300,6 +302,7 @@ class Database:
                     "policy": policy,
                     "digest": resume_hash,
                     "min_score": min_score,
+                    "source": source,
                 },
             ).fetchall()
             for row in rows:
@@ -366,6 +369,19 @@ class Database:
                             "browser_notice",
                             json.dumps(
                                 "После перезапуска проверьте результат незавершённого отклика HH."
+                            ),
+                        ),
+                    ),
+                )
+            if any(row["source"] == "superjob" for row in rows):
+                db.executemany(
+                    "INSERT OR REPLACE INTO state VALUES (?,?)",
+                    (
+                        ("superjob_auto_enabled", json.dumps(False)),
+                        (
+                            "superjob_auto_notice",
+                            json.dumps(
+                                "Проверьте незавершённый отклик в личном кабинете SuperJob."
                             ),
                         ),
                     ),

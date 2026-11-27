@@ -24,6 +24,7 @@ from app.services import (
     prepared_input,
     provider_allowed,
 )
+from app.superjob import SuperJob
 from app.vacancies import filter_reason
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class Scheduler:
         self.ai_lock = asyncio.Lock()
         self.browser = BrowserWorkflow(config, db)
         self.hub = JobHub(config, db, self.browser, client)
+        self.superjob = SuperJob(config, db, client)
         self.task = None
         self.warning = None
 
@@ -68,6 +70,7 @@ class Scheduler:
                 self.tick_browser,
                 self.tick_analysis,
                 self.hub.tick,
+                self.tick_superjob,
             ):
                 workers.create_task(self.run_worker(bot, handler))
 
@@ -92,7 +95,16 @@ class Scheduler:
             self.tick_browser(bot),
             self.tick_analysis(bot),
             self.hub.tick(bot),
+            self.tick_superjob(bot),
         )
+
+    async def tick_superjob(self, _bot):
+        await self.superjob.auto_tick(local_day(self.config))
+
+    def resume_for(self, vacancy, default=None):
+        if vacancy.get("source") == "superjob" and (resume := self.superjob.snapshot()):
+            return resume
+        return self.db.get("resume", "") if default is None else default
 
     async def tick_reminders(self, bot):
         now = int(time.time())
@@ -158,6 +170,8 @@ class Scheduler:
 
     async def tick_analysis(self, bot):
         row = self.db.pending()
+        if row and not self.db.get("resume", "") and self.superjob.snapshot():
+            row = self.db.pending(source="superjob")
         if not (row and self.db.get("processing", True)):
             return
         vacancy = json.loads(row["details"])
@@ -170,7 +184,7 @@ class Scheduler:
                 row["id"], "filtered", {"reason": reason}, None, expected_details=row["details"]
             )
             return
-        resume = self.db.get("resume", "")
+        resume = self.resume_for(vacancy)
         if not resume or not ai_allowed(self.config, self.db):
             return
         try:
@@ -184,16 +198,19 @@ class Scheduler:
             return
         if result is None:
             return
-        if self.db.get("resume", "") != resume or not provider_allowed(
+        if self.resume_for(vacancy) != resume or not provider_allowed(
             self.config, self.db, result.get("analysis_provider", "groq")
         ):
             return
         qualifies = (
             not reason and result["score"] >= settings["score"] and bool(result["letter"].strip())
         )
+        auto_source = source == "browser" or (
+            source == "superjob" and vacancy.get("auto_discovered") and self.superjob.snapshot()
+        )
         safe_letter = (
             grounded_auto_letter(result, resume, vacancy, settings["score"], skills_threshold=0)
-            if source == "browser" and qualifies
+            if auto_source and qualifies
             else ""
         )
         if safe_letter:
@@ -202,14 +219,16 @@ class Scheduler:
         auto_queued = (
             safe_letter
             and result["skills_score"] >= settings["skills_score"]
-            and self.db.get("browser_auto_enabled")
+            and self.db.get(
+                "superjob_auto_enabled" if source == "superjob" else "browser_auto_enabled"
+            )
         )
         if qualifies and (settings["mode"] == "manual" or auto_queued):
             status = "approved"
         result = result | {"resume_hash": hashlib.sha256(resume.encode()).hexdigest()}
         if reason:
             result["filter_reason"] = reason
-        if source == "browser":
+        if auto_source:
             result = result | {
                 "analysis_policy": AUTO_ANALYSIS_POLICY,
                 "analysis_threshold": settings["score"],
